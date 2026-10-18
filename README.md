@@ -1,0 +1,226 @@
+# 🥷 NULLVEIL RECON
+
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 1.0.0 · **License:** MIT
+
+A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 10 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
+
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║       ███╗   ██╗██╗   ██╗██╗     ██╗     ██╗   ██╗███████╗██╗██╗            ║
+║       ████╗  ██║██║   ██║██║     ██║     ██║   ██║██╔════╝██║██║            ║
+║       ██╔██╗ ██║██║   ██║██║     ██║     ██║   ██║█████╗  ██║██║            ║
+║       ██║╚██╗██║██║   ██║██║     ██║     ╚██╗ ██╔╝██╔══╝  ██║██║            ║
+║       ██║ ╚████║╚██████╔╝██║     ██║      ╚████╔╝ ███████╗██║██║            ║
+║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
+║                   R E C O N N A I S S A N C E   S U I T E                   ║
+║                                                                              ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 1.0.0   Status: OPERATIONAL   ║
+║                 Licensed use only — authorized targets only                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+---
+
+## ⚠️ Disclaimer
+
+This tool is for **education, bug bounty, and authorized security testing ONLY**.
+
+- Only scan targets **you own** or have **written permission** to test.
+- Scanning systems without authorization is illegal in most countries.
+- The authors are not responsible for misuse. **You are responsible for how you use this tool.**
+
+By using NULLVEIL Recon you agree to these terms.
+
+---
+
+## ✨ Features — 10 Attack Modules
+
+| # | Module | What it does |
+|---|--------|--------------|
+| 1 | **DNS Record Recon** | A / AAAA / CNAME / MX / NS / TXT / SOA / SRV / CAA records |
+| 2 | **Subdomain Enumeration** | 230+ wordlist (330+ in deep) + SSL certificate SAN resolve |
+| 3 | **Port Scanning** | Async TCP scan — 61 ports (140+ in deep) |
+| 4 | **HTTP Analysis** | Server, headers, security header audit, tech stack |
+| 5 | **SSL Certificate** | Issuer, subject, SANs, expiry date, days left |
+| 6 | **Content Leakage** | Emails, IPs, phones, HTML comments, **API keys / secrets** |
+| 7 | **Robots & Sitemap** | robots.txt + sitemap parsing (disallowed paths auto-queued) |
+| 8 | **Path / Admin Discovery** | 80+ paths (180+ in deep): `.env`, `.git`, backups, swagger |
+| 9 | **User Enumeration** | WordPress REST API, `?author=`, oEmbed |
+| 10 | **API & Full Site Intel** | **Swagger/OpenAPI docs, JS endpoint extraction, forms, cookies, JSON-LD, 35+ tech fingerprint** |
+
+**Plus:**
+- 🎨 Premium ASCII banner + live progress bar
+- 📊 Exposure Risk Meter (0–100 score)
+- 🎯 Selectable modules — run only what you need
+- 💾 JSON export for reports
+- 🌐 Async & concurrent (fast on slow networks)
+
+---
+
+## 📦 Installation
+
+**Requirements:** Python **3.9+**
+
+```bash
+# 1. Clone
+git clone https://github.com/NULLVEIL/nullveil-recon.git
+cd nullveil-recon
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Run
+python3 nullveil_recon.py example.com
+```
+
+### Optional: install as a `nullveil` command
+
+```bash
+chmod +x nullveil_recon.py
+ln -s "$(pwd)/nullveil_recon.py" ~/.local/bin/nullveil
+# then anywhere:
+nullveil example.com
+```
+
+Or with a virtualenv:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## 🚀 Usage
+
+```bash
+python3 nullveil_recon.py TARGET [options]
+```
+
+### Examples
+
+```bash
+# Full scan (all 10 modules)
+python3 nullveil_recon.py example.com
+
+# Interactive attack menu — pick modules by number
+python3 nullveil_recon.py example.com -m
+
+# Only DNS + SSL
+python3 nullveil_recon.py example.com -a 1,5
+
+# By module name
+python3 nullveil_recon.py example.com -a dns,ssl,api
+
+# Deep mode (bigger wordlists, more ports, more paths, more JS)
+python3 nullveil_recon.py example.com --deep
+
+# Save JSON report
+python3 nullveil_recon.py example.com -o report.json
+
+# Custom ports + timeout
+python3 nullveil_recon.py http://192.168.1.10:8080 -p 80,443,8080 -t 15
+
+# List all attack modules
+python3 nullveil_recon.py -l
+```
+
+### All Options
+
+| Flag | Description |
+|------|-------------|
+| `-m`, `--menu` | Interactive attack selection menu |
+| `-a`, `--attack LIST` | Comma-separated modules: `1,2,5` or `dns,ssl` or `all` |
+| `-l`, `--list-attacks` | Show all attack modules |
+| `-d`, `--deep` | Deep mode: bigger wordlists, more ports & paths |
+| `-t`, `--timeout N` | HTTP/DNS timeout in seconds (default: 10) |
+| `-c`, `--concurrency N` | Max concurrent requests (default: 100) |
+| `-p`, `--ports LIST` | Custom ports, e.g. `80,443,8080` |
+| `-o`, `--output FILE` | Save JSON report to file |
+| `-q`, `--quiet` | Suppress console output |
+| `-V`, `--version` | Show version |
+
+---
+
+## 📖 Sample Output
+
+```
+      Target: example.com   Mode: NORMAL   Started: 2026-10-19 01:10:21
+      Attacks: dns, sub  (2/10 modules)
+
+╔══════════════════════════════ ◈ RECON REPORT ◈ ══════════════════════════════╗
+║                                 example.com                                  ║
+║        Scanned: 2026-10-19 01:10:33   Duration: 11.6s   Mode: NORMAL         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+╭───────────────────────────── ◈ EXPOSURE LEVEL ◈ ─────────────────────────────╮
+│ ███████░░░░░░░░░░░░░  36/100 — CAUTION                                       │
+│   Risk Level: MEDIUM   Secrets: 0   Flagged Paths: 0   Missing Headers: 9    ╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+### API Discovery example
+
+Against an API-first site (e.g. Swagger Petstore):
+
+```
+╔═══════════ ◈ API DOCUMENT FOUND: Swagger Petstore - OpenAPI 3.0 ◈ ═══════════╗
+║   Source: /api/v3/openapi.json                                               ║
+║   Title:  Swagger Petstore - OpenAPI 3.0  v1.0.27                            ║
+║   Endpoints: 13                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+   1   /pet            2   /store/order        3   /user/login
+   4   /pet/{petId}    5   /user/{username}    ...
+```
+
+---
+
+## 💾 JSON Report
+
+```bash
+python3 nullveil_recon.py example.com -o report.json
+```
+
+```json
+{
+  "tool": "NULLVEIL Recon",
+  "owner": "NULLVEIL",
+  "version": "1.0.0",
+  "summary": { "dns_records": 3, "api_endpoints": 16, "...": "..." },
+  "dns": [...],
+  "subdomains": [...],
+  "open_ports": [...],
+  "paths": [...],
+  "secrets": [...],
+  "api": {
+    "documents": [...],
+    "live_endpoints": [...],
+    "paths_in_source": [...],
+    "forms": [...],
+    "cookies": [...],
+    "metadata": {...}
+  }
+}
+```
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] HTML report export
+- [ ] WAF detection
+- [ ] Email security (SPF / DKIM / DMARC) check
+- [ ] Custom wordlist support (`-w wordlist.txt`)
+- [ ] Resume / scan history
+- [ ] Nuclei template integration
+
+Contributions welcome — open an issue or PR.
+
+---
+
+## 📜 License
+
+MIT © NULLVEIL — see [LICENSE](LICENSE).
+
+---
+
+**Use responsibly. Authorized targets only.** 🥷
