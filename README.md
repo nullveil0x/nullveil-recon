@@ -1,6 +1,6 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 1.0.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 1.1.0 · **License:** MIT
 
 A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 10 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 1.0.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 1.1.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -47,13 +47,17 @@ By using NULLVEIL Recon you agree to these terms.
 | 8 | **Path / Admin Discovery** | 80+ paths (180+ in deep): `.env`, `.git`, backups, swagger |
 | 9 | **User Enumeration** | WordPress REST API, `?author=`, oEmbed |
 | 10 | **API & Full Site Intel** | **Swagger/OpenAPI docs, JS endpoint extraction, forms, cookies, JSON-LD, 35+ tech fingerprint** |
+| 11 | **WAF / CDN Detection** | Cloudflare, Akamai, AWS WAF, Sucuri, Imperva, F5, ModSecurity + block-page probe |
+| 12 | **Email Security** | SPF, DKIM (15+ selectors), DMARC, MTA-STS, BIMI + policy audit & findings |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
 - 📊 Exposure Risk Meter (0–100 score)
 - 🎯 Selectable modules — run only what you need
-- 💾 JSON export for reports
+- 💾 JSON export + **standalone HTML report** (dark theme, shareable)
+- 📝 **Custom subdomain wordlist** (`-w wordlist.txt`)
 - 🌐 Async & concurrent (fast on slow networks)
+- 🛡 DNS-over-HTTPS fallback — works even when TCP/53 is blocked
 
 ---
 
@@ -119,6 +123,15 @@ python3 nullveil_recon.py example.com --deep
 # Save JSON report
 python3 nullveil_recon.py example.com -o report.json
 
+# Save standalone HTML report (dark theme — open in any browser)
+python3 nullveil_recon.py example.com -H report.html
+
+# Custom subdomain wordlist
+python3 nullveil_recon.py example.com -w mysubs.txt
+
+# WAF + Email security audit only
+python3 nullveil_recon.py example.com -a waf,email
+
 # Custom ports + timeout
 python3 nullveil_recon.py http://192.168.1.10:8080 -p 80,443,8080 -t 15
 
@@ -138,6 +151,8 @@ python3 nullveil_recon.py -l
 | `-c`, `--concurrency N` | Max concurrent requests (default: 100) |
 | `-p`, `--ports LIST` | Custom ports, e.g. `80,443,8080` |
 | `-o`, `--output FILE` | Save JSON report to file |
+| `-H`, `--html FILE` | Save standalone HTML report (open in browser) |
+| `-w`, `--wordlist FILE` | Custom subdomain wordlist (one per line) |
 | `-q`, `--quiet` | Suppress console output |
 | `-V`, `--version` | Show version |
 
@@ -184,7 +199,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -206,12 +221,14 @@ python3 nullveil_recon.py example.com -o report.json
 
 ## 🗺️ Roadmap
 
-- [ ] HTML report export
-- [ ] WAF detection
-- [ ] Email security (SPF / DKIM / DMARC) check
-- [ ] Custom wordlist support (`-w wordlist.txt`)
+- [x] HTML report export (`-H report.html`)
+- [x] WAF detection (`-a waf`)
+- [x] Email security (SPF / DKIM / DMARC / MTA-STS / BIMI) (`-a email`)
+- [x] Custom wordlist support (`-w wordlist.txt`)
 - [ ] Resume / scan history
 - [ ] Nuclei template integration
+- [ ] Screenshot capture
+- [ ] Crawler (multi-page JS/API discovery)
 
 Contributions welcome — open an issue or PR.
 
