@@ -29,6 +29,7 @@ import re
 import json
 import sys
 import argparse
+import base64
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 from collections import defaultdict
@@ -57,7 +58,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -255,6 +256,7 @@ ATTACK_MODULES = [
     ("api", 10, "API & Full Site Intel", "API discovery, JS endpoints, swagger, forms, tech fingerprint"),
     ("waf", 11, "WAF / CDN Detection", "Cloudflare, Akamai, Sucuri, Imperva, AWS WAF fingerprint"),
     ("email", 12, "Email Security", "SPF, DKIM, DMARC, MTA-STS, BIMI records + policy audit"),
+    ("audit", 13, "API Security Audit", "OWASP API Top 10: CORS, auth, verbose errors, rate limit, JWT, data exposure"),
 ]
 
 MAX_MODULE = len(ATTACK_MODULES)
@@ -438,6 +440,7 @@ class WebsiteRecon:
             (":link: API & Full Site Intel", self.api_recon, 10),
             (":shield: WAF / CDN Detection", self.waf_detect, 11),
             (":envelope: Email Security Audit", self.email_security, 12),
+            (":test_tube: API Security Audit", self.api_audit, 13),
         ]
         # Filter by attack set and create coroutines only for selected
         modules = []
@@ -1362,6 +1365,271 @@ class WebsiteRecon:
         # ---------- Extra suspicious TXT (BIMI/other) ----------
         self.results['email_findings'] = sorted(findings, key=lambda x: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}.get(x[0], 5))
 
+    # ---------------------------------------------------------- API Security Audit
+    # Sensitive JSON keys we flag (names only — values never printed)
+    SENSITIVE_KEY_RE = re.compile(
+        r'(?i)^(pass(word|wd|phrase)?|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|'
+        r'auth|authorization|ssn|social[_-]?security|credit[_-]?card|card[_-]?num|cvv|'
+        r'private[_-]?key|client[_-]?secret|session[_-]?id|otp|pin|balance|salary|'
+        r'email|phone|dob|date[_-]?of[_-]?birth|address|answer|security[_-]?question)$')
+    VERBOSE_ERROR_RE = re.compile(
+        r'(?i)(traceback \(most recent call last\)|stack trace|exception in thread|'
+        r'sql syntax.*error|mysql_fetch|ora-\d{5}|pdoexception|postgresql.*error|'
+        r'microsoft\.oledb|system\.nullreferenceexception|undefined method|'
+        r'\bexception thrown\b|at [\w.$]+\([\w.]+:\d+\)|line \d+ of [\w/.]+\.|'
+        r'kingbase|syntax error at or near)')
+
+    async def api_audit(self):
+        """Defensive API security audit (OWASP API Security Top 10).
+
+        Reports misconfigurations & risks — never exploits them:
+        CORS reflection, verbose errors, missing auth, rate limiting,
+        sensitive data exposure (key names only), HTTP methods, JWT config.
+        """
+        findings = []          # (severity, check, detail)
+        endpoint_rows = []
+
+        # ---------- gather endpoints to audit ----------
+        candidates = []
+        for ep in self.results.get('api_endpoints', []):
+            if isinstance(ep, dict) and ep.get('path'):
+                candidates.append(ep['path'])
+        for p in self.results.get('api_endpoints_found', []):
+            if isinstance(p, str) and p.startswith('/') and '{' not in p:
+                candidates.append(p)
+        for doc in self.results.get('api_docs', []):
+            for ep in doc.get('endpoints', []):
+                if isinstance(ep, str) and ep.startswith('/') and '{' not in ep:
+                    candidates.append(ep)
+        # de-dup, keep discovered first
+        seen, ordered = set(), []
+        for c in candidates:
+            c = c.split('?')[0]
+            if c not in seen and len(c) < 100:
+                seen.add(c)
+                ordered.append(c)
+        # Fallback / supplement with common API paths
+        default_audit = ["/api", "/api/v1", "/api/users", "/api/user", "/api/login",
+                         "/api/auth", "/api/health", "/api/config", "/graphql", "/api/docs"]
+        if not ordered:
+            ordered = default_audit
+        elif self.deep:
+            ordered = ordered + [p for p in default_audit if p not in ordered]
+        audit_targets = ordered[:20] if self.deep else ordered[:12]
+
+        ORIGIN = "https://nullveil-audit.probe"
+
+        # ---------- per-endpoint checks ----------
+        async def audit_endpoint(path):
+            url = urljoin(self.base_url + "/", path.lstrip('/'))
+            row = {"path": path, "status": None, "auth": "-", "cors": "-", "methods": "",
+                   "verbose_error": False, "sensitive_keys": []}
+            # GET with foreign Origin (CORS reflection test)
+            try:
+                async with self.sem:
+                    r = await self.client.get(url, headers={
+                        "Accept": "application/json, */*",
+                        "Origin": ORIGIN,
+                        "X-Nullveil-Audit": "1",
+                    })
+            except Exception:
+                endpoint_rows.append(row)
+                return
+            row['status'] = r.status_code
+
+            # --- auth requirement ---
+            if r.status_code in (401, 403):
+                row['auth'] = "REQUIRED"
+            elif r.status_code in (200, 201, 204):
+                row['auth'] = "none"
+
+            # --- CORS misconfig ---
+            acao = r.headers.get('access-control-allow-origin', '')
+            acac = r.headers.get('access-control-allow-credentials', '').lower()
+            if acao:
+                if acao == ORIGIN and acac == 'true':
+                    row['cors'] = "REFLECTED+CRED"
+                    findings.append(("CRITICAL", "CORS",
+                                     f"{path}: origin reflected WITH credentials — any website can read this API with user cookies"))
+                elif acao == ORIGIN:
+                    row['cors'] = "REFLECTED"
+                    findings.append(("HIGH", "CORS",
+                                     f"{path}: foreign origin reflected in ACAO — cross-origin reads allowed"))
+                elif acao == "*":
+                    row['cors'] = "*"
+                    if acac == 'true':
+                        findings.append(("HIGH", "CORS", f"{path}: ACAO '*' with Allow-Credentials (browsers block it, but intent is unsafe)"))
+                    else:
+                        findings.append(("INFO", "CORS", f"{path}: ACAO '*' — public API (OK if intended)"))
+                elif acac == 'true':
+                    row['cors'] = "CRED"
+                    findings.append(("MEDIUM", "CORS", f"{path}: Allow-Credentials true with origin {acao[:60]}"))
+
+            # --- verbose error leak (only on error responses or leak patterns) ---
+            body = r.text[:300_000] if 'json' in r.headers.get('content-type', '') or r.status_code >= 500 else ""
+            m = self.VERBOSE_ERROR_RE.search(r.text[:300_000])
+            if m:
+                row['verbose_error'] = True
+                findings.append(("MEDIUM", "Verbose Errors",
+                                 f"{path}: stack/DB error leaked — '{m.group(0)[:50]}' (info disclosure)"))
+
+            # --- sensitive data exposure (KEY NAMES ONLY, values never stored) ---
+            if body:
+                try:
+                    data = r.json()
+                except Exception:
+                    data = None
+                if isinstance(data, (dict, list)):
+                    keys = []
+                    def walk(o):
+                        if isinstance(o, dict):
+                            for k, v in o.items():
+                                if isinstance(k, str) and self.SENSITIVE_KEY_RE.match(k.strip()):
+                                    keys.append(k)
+                                walk(v)
+                        elif isinstance(o, list):
+                            for v in o[:50]:
+                                walk(v)
+                    walk(data)
+                    if keys:
+                        uniq = sorted(set(keys))
+                        row['sensitive_keys'] = uniq[:12]
+                        if any(re.search(r'(?i)pass|secret|token|key|cvv|card|ssn', k) for k in uniq):
+                            findings.append(("HIGH", "Data Exposure",
+                                             f"{path}: sensitive field(s) in unauthenticated response: {', '.join(uniq[:6])} (values not collected)"))
+                        else:
+                            findings.append(("MEDIUM", "Data Exposure",
+                                             f"{path}: PII field(s) exposed: {', '.join(uniq[:6])}"))
+
+            # --- allowed methods (OPTIONS preflight) ---
+            try:
+                async with self.sem:
+                    o = await self.client.request("OPTIONS", url, headers={
+                        "Origin": ORIGIN,
+                        "Access-Control-Request-Method": "GET, POST, PUT, DELETE",
+                    })
+                allow = o.headers.get('allow', '')
+                if allow:
+                    row['methods'] = allow
+                    risky = [mth.strip().upper() for mth in allow.split(',')
+                             if mth.strip().upper() in ('PUT', 'DELETE', 'PATCH', 'TRACE')]
+                    if risky:
+                        findings.append(("LOW", "HTTP Methods",
+                                         f"{path}: state-changing methods allowed: {', '.join(risky)} — verify they need auth"))
+                    if 'TRACE' in allow.upper():
+                        findings.append(("MEDIUM", "HTTP Methods", f"{path}: TRACE enabled — XST risk"))
+            except Exception:
+                pass
+
+            endpoint_rows.append(row)
+
+        await asyncio.gather(*[audit_endpoint(p) for p in audit_targets])
+
+        # ---------- missing-auth check on JSON endpoints ----------
+        for row in endpoint_rows:
+            if (row['status'] in (200, 201) and row['auth'] == "none"
+                    and re.search(r'(?i)/(users?|accounts?|orders?|admin|config|internal|search|list)', row['path'])):
+                findings.append(("HIGH", "Broken Auth",
+                                 f"{row['path']}: returned HTTP {row['status']} WITHOUT authentication on a data-like endpoint"))
+
+        # ---------- rate limiting test (gentle: 10 rapid requests) ----------
+        rate_result = {"tested": False, "limited": False, "detail": ""}
+        rl_target = next((r for r in endpoint_rows if r['auth'] == "none" and r['status'] in (200, 401, 403, 404)), None)
+        probe_path = (rl_target['path'] if rl_target else "/") + "?nullveil_ratetest=1"
+        probe_url = urljoin(self.base_url + "/", probe_path.lstrip('/'))
+        try:
+            async def one():
+                try:
+                    async with self.sem:
+                        resp = await self.client.get(probe_url, headers={"Accept": "application/json"})
+                    return resp.status_code, dict(resp.headers)
+                except Exception:
+                    return None, {}
+            codes, hdrs_list = [], []
+            for _ in range(10):
+                c, h = await one()
+                codes.append(c)
+                hdrs_list.append(h)
+            rate_result['tested'] = True
+            limited = (429 in codes) or any('retry-after' in h for h in hdrs_list) or \
+                      any('x-ratelimit-remaining' in h and h.get('x-ratelimit-remaining') == '0' for h in hdrs_list)
+            rate_result['limited'] = bool(limited)
+            if limited:
+                rate_result['detail'] = "Rate limit active (HTTP 429 / Retry-After observed) ✅"
+                findings.append(("INFO", "Rate Limiting", "Rate limiting is active — brute-force is throttled"))
+            else:
+                rate_result['detail'] = f"No 429 in 10 rapid requests ({', '.join(str(c) for c in codes)})"
+                findings.append(("MEDIUM", "Rate Limiting",
+                                 "No rate limiting observed in 10 rapid requests — credential/endpoint brute-force possible"))
+        except Exception as e:
+            rate_result['detail'] = f"test failed: {e}"
+
+        # ---------- JWT analysis (passive decode — never forged) ----------
+        jwt_findings = []
+        jwt_re = re.compile(r'eyJ[A-Za-z0-9_\-]{4,}\.eyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}')
+        # search sources already collected
+        search_blobs = []
+        for h in (self.scalar_results.get('http_headers') or {}).items():
+            search_blobs.append(f"{h[0]}:{h[1]}")
+        search_blobs.append(" ".join(self.results.get('cookies', [])))
+        search_blobs.append(" ".join(self.results.get('api_endpoints_found', [])))
+        for c in self.results.get('cookies', []):
+            search_blobs.append(c)
+        # also scan homepage + API snippets collected by api module
+        for ep in self.results.get('api_endpoints', [])[:20]:
+            if isinstance(ep, dict):
+                search_blobs.append(ep.get('snippet', ''))
+
+        jwts = set()
+        for blob in search_blobs:
+            if blob:
+                for m in jwt_re.finditer(str(blob)):
+                    jwts.add(m.group(0))
+
+        def b64url_decode(seg):
+            seg += '=' * (-len(seg) % 4)
+            return base64.urlsafe_b64decode(seg.encode()).decode(errors='replace')
+
+        for token in list(jwts)[:5]:
+            try:
+                header = json.loads(b64url_decode(token.split('.')[0]))
+                payload = json.loads(b64url_decode(token.split('.')[1]))
+            except Exception:
+                continue
+            alg = str(header.get('alg', '?'))
+            entry = {"alg": alg, "kid": header.get('kid', ''), "claims": sorted(payload.keys())[:15]}
+            jwt_findings.append(entry)
+            if alg.lower() == 'none':
+                findings.append(("CRITICAL", "JWT", "alg=none accepted in a token — signature can be bypassed (auth bypass risk)"))
+            elif alg.startswith('HS'):
+                findings.append(("INFO", "JWT", f"Token uses {alg} — ensure public key is not used as HMAC secret (confusion attack)"))
+            elif alg.startswith('RS') is False and alg != 'none':
+                findings.append(("MEDIUM", "JWT", f"Uncommon JWT alg: {alg}"))
+            if 'exp' not in payload:
+                findings.append(("MEDIUM", "JWT", "Token has no 'exp' claim — never expires (session fixation risk)"))
+            else:
+                try:
+                    exp_left = int(payload['exp']) - int(datetime.now().timestamp())
+                    if exp_left > 60 * 60 * 24 * 400:
+                        findings.append(("LOW", "JWT", f"Very long token lifetime (~{exp_left // 86400} days)"))
+                except Exception:
+                    pass
+            if not any(k in payload for k in ('iss', 'aud')):
+                findings.append(("LOW", "JWT", "Token lacks 'iss'/'aud' claims — replay across services possible"))
+            if not header.get('kid'):
+                findings.append(("LOW", "JWT", "No 'kid' in header — key rotation/selection is ambiguous"))
+
+        if not jwts:
+            jwt_findings.append({"alg": "-", "kid": "", "claims": []})
+
+        # ---------- store ----------
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        self.results['api_audit_findings'] = sorted(findings, key=lambda x: sev_rank.get(x[0], 5))
+        self.results['api_audit_endpoints'] = endpoint_rows
+        self.results['api_audit_ratelimit'] = rate_result
+        self.results['api_audit_jwt'] = jwt_findings
+
+
 
     # ---------------------------------------------------------- Report
     def print_report(self):
@@ -1416,6 +1684,7 @@ class WebsiteRecon:
             ("Forms", len(self.results.get('forms', []))),
             ("WAF / CDN", len(self.results.get('waf', []))),
             ("Email Issues", len([f for f in self.results.get('email_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')])),
+            ("Audit Issues", len([f for f in self.results.get('api_audit_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')])),
         ]
         for label, count in summary_rows:
             flag = "[bold red] ⚠[/]" if ("Secret" in label and count) else ""
@@ -1502,6 +1771,64 @@ class WebsiteRecon:
                 fb = "\n".join(f"  [{sev_col.get(s, 'white')}]{'◈ ' + s:<11}[/] {m}" for s, m in findings)
                 console.print(Panel(fb, title="[bold magenta]◈ EMAIL SECURITY FINDINGS ◈[/]",
                                     border_style="magenta", box=rbox.ROUNDED))
+
+        # --- API Security Audit ---
+        audit_f = self.results.get('api_audit_findings', [])
+        audit_eps = self.results.get('api_audit_endpoints', [])
+        if audit_f or audit_eps:
+            # findings table
+            if audit_f:
+                sev_col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "cyan", "INFO": "dim"}
+                at = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_red",
+                           title="[bold red]◈ API SECURITY FINDINGS ◈[/]")
+                at.add_column("Severity", justify="center")
+                at.add_column("Check", style="bold")
+                at.add_column("Detail")
+                for sev, chk, det in audit_f[:40]:
+                    at.add_row(f"[{sev_col.get(sev, 'white')}]{sev}[/]", chk, det[:120])
+                console.print(at)
+            # endpoint classification
+            if audit_eps:
+                et = Table(box=rbox.SIMPLE, header_style="bold bright_cyan",
+                           title="[bold bright_cyan]◈ ENDPOINT CLASSIFICATION ◈[/]")
+                et.add_column("Path")
+                et.add_column("Status", justify="right")
+                et.add_column("Auth", justify="center")
+                et.add_column("CORS", justify="center")
+                et.add_column("Methods")
+                et.add_column("Flags", style="dim")
+                for r in audit_eps[:30]:
+                    st = r['status']
+                    st_col = "green" if st in (200, 201) else ("yellow" if st in (401, 403, 404, 405, 500) else "white")
+                    auth_col = "bold red" if r['auth'] == "none" and re.search(r'(?i)/(users?|accounts?|admin|config)', r['path']) else ("green" if r['auth'] == "REQUIRED" else "dim")
+                    cors_col = {"REFLECTED+CRED": "bold red", "REFLECTED": "red", "*": "yellow"}.get(r['cors'], "dim")
+                    flags = []
+                    if r['verbose_error']:
+                        flags.append("[red]ERR-LEAK[/]")
+                    if r['sensitive_keys']:
+                        flags.append(f"[yellow]{len(r['sensitive_keys'])} sensitive keys[/]")
+                    et.add_row(r['path'], f"[bold {st_col}]{st}[/]",
+                               f"[{auth_col}]{r['auth']}[/]", f"[{cors_col}]{r['cors']}[/]",
+                               (r['methods'] or '-')[:28], " ".join(flags) or "-")
+                console.print(et)
+            # rate limit
+            rl = self.results.get('api_audit_ratelimit', {})
+            if rl.get('tested'):
+                col = "green" if rl['limited'] else "yellow"
+                console.print(Panel(f"  [bold {col}]{rl['detail']}[/]",
+                                    title="[bold yellow]◈ RATE LIMITING TEST (10 requests) ◈[/]",
+                                    border_style="yellow", box=rbox.ROUNDED))
+            # JWT
+            jwts = self.results.get('api_audit_jwt', [])
+            if jwts and jwts[0].get('alg') != '-':
+                body = "\n".join(
+                    f"  [dim]alg:[/] [bold cyan]{j['alg']}[/]   "
+                    f"[dim]kid:[/] {j['kid'] or '[dim]none[/]'}   "
+                    f"[dim]claims:[/] [white]{', '.join(j['claims'])}[/]"
+                    for j in jwts)
+                console.print(Panel(body, title="[bold magenta]◈ JWT ANALYSIS ◈[/]",
+                                    border_style="magenta", box=rbox.ROUNDED))
+
 
         # --- WAF / CDN ---
         if self.results.get('waf') or self.results.get('cdn'):
@@ -1712,6 +2039,7 @@ class WebsiteRecon:
                 "forms": len(self.results.get('forms', [])),
                 "waf": self.results.get('waf', []),
                 "email_issues": len([f for f in self.results.get('email_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
+                "audit_issues": len([f for f in self.results.get('api_audit_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
             },
             "http": {k: v for k, v in self.scalar_results.items() if k != 'http_headers'},
             "headers": self.scalar_results.get('http_headers', {}),
@@ -1759,6 +2087,13 @@ class WebsiteRecon:
                 "mta_sts": self.results.get('mta_sts', ''),
                 "bimi": self.results.get('bimi', ''),
                 "findings": [{"severity": s, "message": m} for s, m in self.results.get('email_findings', [])],
+            },
+            "api_audit": {
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('api_audit_findings', [])],
+                "endpoints": self.results.get('api_audit_endpoints', []),
+                "rate_limit": self.results.get('api_audit_ratelimit', {}),
+                "jwt": self.results.get('api_audit_jwt', []),
             },
             "errors": self.results['errors'],
         }
@@ -1846,6 +2181,37 @@ class WebsiteRecon:
                                  tbl(["Severity", "Finding"],
                                      [[f"<span class='chip {'red' if f['severity'] in ('CRITICAL','HIGH') else 'yellow'}'>{_e(f['severity'])}</span>",
                                        _e(f['message'])] for f in fnd]), "#eab308"))
+        # API Security Audit
+        aud = d.get('api_audit', {})
+        if aud:
+            af = aud.get('findings', [])
+            if af:
+                parts.append(sec("API Security Findings",
+                                 tbl(["Severity", "Check", "Detail"],
+                                     [[f"<span class='chip {'red' if f['severity'] in ('CRITICAL','HIGH') else 'yellow'}'>{_e(f['severity'])}</span>",
+                                       _e(f['check']), _e(f['detail'])] for f in af]), "#ef4444"))
+            aeps = aud.get('endpoints', [])
+            if aeps:
+                parts.append(sec("Endpoint Classification",
+                                 tbl(["Path", "Status", "Auth", "CORS", "Methods", "Flags"],
+                                     [[_e(str(r.get('path'))), r.get('status'),
+                                       _e(str(r.get('auth'))), _e(str(r.get('cors'))),
+                                       _e(str(r.get('methods') or '-')),
+                                       _e(', '.join((r.get('verbose_error') and ['ERR-LEAK'] or []) +
+                                                    (r.get('sensitive_keys') or ['sensitive keys'] if r.get('sensitive_keys') else [])) or '-')]
+                                      for r in aeps[:40]]), "#ef4444"))
+            rl = aud.get('rate_limit', {})
+            if rl.get('tested'):
+                parts.append(sec("Rate Limiting Test",
+                                 f"<p><span class='chip {'green' if rl.get('limited') else 'yellow'}'>"
+                                 f"{'LIMITED ✅' if rl.get('limited') else 'NO LIMIT'}</span> "
+                                 f"{_e(str(rl.get('detail', '')))}</p>", "#eab308"))
+            jwts = [j for j in aud.get('jwt', []) if j.get('alg') != '-']
+            if jwts:
+                parts.append(sec("JWT Analysis",
+                                 tbl(["Alg", "kid", "Claims"],
+                                     [[_e(str(j['alg'])), _e(str(j.get('kid') or '-')),
+                                       _e(', '.join(j.get('claims', [])))] for j in jwts]), "#a78bfa"))
         # Content / leaks
         for key, title, accent in (("emails", "Emails Found", "#f59e0b"), ("ips", "IP Addresses", "#f59e0b"),
                                    ("users", "Users / Authors", "#f59e0b"), ("secrets", "Secrets / Leaks", "#ef4444"),
@@ -2005,7 +2371,7 @@ def main():
     parser.add_argument("-p", "--ports", type=str, help="Custom comma-separated ports (e.g. 80,443,8080)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Less console output")
     parser.add_argument("-a", "--attack", metavar="LIST", default=None,
-                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email or 'all'")
+                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit or 'all'")
     parser.add_argument("-m", "--menu", action="store_true", help="Interactive attack selection menu")
     parser.add_argument("-l", "--list-attacks", action="store_true", help="List available attack modules")
     parser.add_argument("-V", "--version", action="version", version=f"NULLVEIL Recon v{__version__} | Owner: NULLVEIL | Engine: DeepHat")

@@ -1,6 +1,6 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 1.1.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 1.2.0 · **License:** MIT
 
 A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 10 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 1.1.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 1.2.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -49,6 +49,7 @@ By using NULLVEIL Recon you agree to these terms.
 | 10 | **API & Full Site Intel** | **Swagger/OpenAPI docs, JS endpoint extraction, forms, cookies, JSON-LD, 35+ tech fingerprint** |
 | 11 | **WAF / CDN Detection** | Cloudflare, Akamai, AWS WAF, Sucuri, Imperva, F5, ModSecurity + block-page probe |
 | 12 | **Email Security** | SPF, DKIM (15+ selectors), DMARC, MTA-STS, BIMI + policy audit & findings |
+| 13 | **API Security Audit** | OWASP API Top 10: CORS reflection, missing auth, verbose errors, rate limiting, sensitive data exposure (names only), HTTP methods, JWT config analysis |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
@@ -132,6 +133,9 @@ python3 nullveil_recon.py example.com -w mysubs.txt
 # WAF + Email security audit only
 python3 nullveil_recon.py example.com -a waf,email
 
+# API security audit (CORS, auth, rate limit, JWT checks)
+python3 nullveil_recon.py example.com -a api,audit
+
 # Custom ports + timeout
 python3 nullveil_recon.py http://192.168.1.10:8080 -p 80,443,8080 -t 15
 
@@ -199,7 +203,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -225,6 +229,7 @@ python3 nullveil_recon.py example.com -o report.json
 - [x] WAF detection (`-a waf`)
 - [x] Email security (SPF / DKIM / DMARC / MTA-STS / BIMI) (`-a email`)
 - [x] Custom wordlist support (`-w wordlist.txt`)
+- [x] API security audit (OWASP API Top 10) (`-a audit`)
 - [ ] Resume / scan history
 - [ ] Nuclei template integration
 - [ ] Screenshot capture
