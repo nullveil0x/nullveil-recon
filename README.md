@@ -1,6 +1,6 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 1.2.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 2.0.0 · **License:** MIT
 
 A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 10 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 1.2.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 2.0.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -33,7 +33,7 @@ By using NULLVEIL Recon you agree to these terms.
 
 ---
 
-## ✨ Features — 10 Attack Modules
+## ✨ Features — 17 Attack Modules
 
 | # | Module | What it does |
 |---|--------|--------------|
@@ -50,6 +50,10 @@ By using NULLVEIL Recon you agree to these terms.
 | 11 | **WAF / CDN Detection** | Cloudflare, Akamai, AWS WAF, Sucuri, Imperva, F5, ModSecurity + block-page probe |
 | 12 | **Email Security** | SPF, DKIM (15+ selectors), DMARC, MTA-STS, BIMI + policy audit & findings |
 | 13 | **API Security Audit** | OWASP API Top 10: CORS reflection, missing auth, verbose errors, rate limiting, sensitive data exposure (names only), HTTP methods, JWT config analysis |
+| 14 | **External Intelligence** | **crt.sh certificate transparency subdomains, Wayback Machine history (old URLs / params / sensitive paths), dangling subdomain takeover check (35+ services)** |
+| 15 | **CVE & Misconfig Scan** | **Version fingerprint (headers / meta / JS) → CVE correlation, exposed `.git` / `.env` / actuator / heapdump / phpinfo / server-status probes** |
+| 16 | **Deep Crawler & Params** | **Multi-page BFS crawl, query + form parameter inventory, JS endpoint discovery, reflection detection (report-only)** |
+| 17 | **TLS Deep Analysis** | **TLS 1.0–1.3 + cipher matrix, weak/legacy cipher flags, RSA/EC key size, OCSP stapling, HSTS audit** |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
@@ -136,6 +140,9 @@ python3 nullveil_recon.py example.com -a waf,email
 # API security audit (CORS, auth, rate limit, JWT checks)
 python3 nullveil_recon.py example.com -a api,audit
 
+# Advanced: CT logs + CVE scan + crawler + TLS audit
+python3 nullveil_recon.py example.com -a ext,cve,crawl,tls
+
 # Custom ports + timeout
 python3 nullveil_recon.py http://192.168.1.10:8080 -p 80,443,8080 -t 15
 
@@ -203,7 +210,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -217,7 +224,11 @@ python3 nullveil_recon.py example.com -o report.json
     "forms": [...],
     "cookies": [...],
     "metadata": {...}
-  }
+  },
+  "external_intel": { "ct_subdomains": [...], "wayback": {...}, "takeover_risks": [...] },
+  "cve": { "versions": [...], "findings": [...] },
+  "crawler": { "pages": [...], "parameters": [...], "forms": [...] },
+  "tls": { "matrix": [...], "certificate": {...}, "findings": [...] }
 }
 ```
 
@@ -230,10 +241,13 @@ python3 nullveil_recon.py example.com -o report.json
 - [x] Email security (SPF / DKIM / DMARC / MTA-STS / BIMI) (`-a email`)
 - [x] Custom wordlist support (`-w wordlist.txt`)
 - [x] API security audit (OWASP API Top 10) (`-a audit`)
+- [x] External intel — crt.sh CT logs + Wayback history + subdomain takeover (`-a ext`)
+- [x] CVE correlation + misconfig scan (`-a cve`)
+- [x] Deep crawler + parameter inventory (`-a crawl`)
+- [x] TLS version / cipher deep analysis (`-a tls`)
 - [ ] Resume / scan history
 - [ ] Nuclei template integration
 - [ ] Screenshot capture
-- [ ] Crawler (multi-page JS/API discovery)
 
 Contributions welcome — open an issue or PR.
 
