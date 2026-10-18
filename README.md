@@ -2,7 +2,7 @@
 
 > **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 2.0.0 · **License:** MIT
 
-A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 10 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
+A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 17 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -72,7 +72,7 @@ By using NULLVEIL Recon you agree to these terms.
 
 ```bash
 # 1. Clone
-git clone https://github.com/NULLVEIL/nullveil-recon.git
+git clone https://github.com/nullveil0x/nullveil-recon.git
 cd nullveil-recon
 
 # 2. Install dependencies
@@ -110,7 +110,7 @@ python3 nullveil_recon.py TARGET [options]
 ### Examples
 
 ```bash
-# Full scan (all 10 modules)
+# Full scan (all 17 modules)
 python3 nullveil_recon.py example.com
 
 # Interactive attack menu — pick modules by number
@@ -173,7 +173,7 @@ python3 nullveil_recon.py -l
 
 ```
       Target: example.com   Mode: NORMAL   Started: 2026-10-19 01:10:21
-      Attacks: dns, sub  (2/10 modules)
+      Attacks: dns, sub  (2/17 modules)
 
 ╔══════════════════════════════ ◈ RECON REPORT ◈ ══════════════════════════════╗
 ║                                 example.com                                  ║
