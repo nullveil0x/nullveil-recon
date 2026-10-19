@@ -10,3 +10,5 @@ venv/
 
 # Scan output / evidence — never commit target screenshots or reports
 nullveil_shots/
+nullveil-exec-*.html
+nullveil-exec-*.pdf

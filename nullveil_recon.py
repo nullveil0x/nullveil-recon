@@ -5240,8 +5240,9 @@ class WebsiteRecon:
                 out.append((sev, chk, f"{det}  (×{count})", src))
             else:
                 out.append((sev, chk, det, src))
-        self.results['dedupe_stats'] = {"before": len(norm_findings), "after": len(out),
-                                        "removed": removed}
+        if getattr(self, "results", None) is not None:
+            self.results['dedupe_stats'] = {"before": len(norm_findings),
+                                            "after": len(out), "removed": removed}
         return out
 
     # ======================================================== AI Patch / Remediation (35)
@@ -5457,13 +5458,28 @@ class WebsiteRecon:
         }
 
     # ======================================================== Webhook Notify (37)
+    def _alert_severity_counts(self, report):
+        """Count severities across the whole report (for alert severity)."""
+        F = self._collect_findings_from_report(report)
+        return {k: len([f for f in F if f[0] == k])
+                for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+
     def _notification_payload(self, report):
         s = report.get("summary", {})
         diff = report.get("scan_diff", {}) or {}
+        sev = self._alert_severity_counts(report)
+        crit, high = sev["CRITICAL"], sev["HIGH"]
+        if crit:
+            head = f"🚨 *NULLVEIL CRITICAL ALERT* 🚨 — `{report.get('target', '')}`"
+        elif high:
+            head = f"⚠️ *NULLVEIL HIGH-RISK ALERT* — `{report.get('target', '')}`"
+        else:
+            head = f"🔔 *NULLVEIL Recon complete* — `{report.get('target', '')}`"
         lines = [
-            f"*NULLVEIL Recon* — `{report.get('target', '')}`",
+            head,
             f"version {report.get('version', '')} · mode {report.get('mode', '')} · {report.get('duration_s', 0)}s",
             "",
+            f"• Severity: 🔴 {crit} critical · 🟠 {high} high · 🟡 {sev['MEDIUM']} medium · 🔵 {sev['LOW']} low",
             f"• Subdomains: {s.get('subdomains', 0)}  • Open ports: {s.get('open_ports', 0)}",
             f"• Secrets: {s.get('secrets', 0)}  • API endpoints: {s.get('api_endpoints', 0)}",
             f"• CVE issues: {s.get('cve_issues', 0)}  • Admin-API: {s.get('admin_api_findings', 0)}",
@@ -5471,24 +5487,40 @@ class WebsiteRecon:
         ]
         if diff.get("available"):
             lines.append(f"• Change verdict: {diff.get('verdict', '')}")
+        # surface the single most severe finding (redacted detail)
+        F = self._collect_findings_from_report(report)
+        if F and F[0][0] in ("CRITICAL", "HIGH"):
+            lines += ["", f"Top risk — *{F[0][1]}*: {F[0][2][:180]}"]
+        lines += ["", "_Counts only — no secret values included._"]
         return "\n".join(lines)
 
-    async def webhook_notify(self):
-        """Module 37 — push a concise scan summary to Slack/Telegram/Discord/Teams.
+    @staticmethod
+    def _md_escape(t):
+        """Escape text for Telegram MarkdownV2."""
+        return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", str(t))
 
-        Uses any available HTTP client (httpx already a dependency). If no
-        webhook target is configured the module reports gracefully. Secrets are
-        never included — only counts and the target name."""
+    async def webhook_notify(self):
+        """Module 37 — push an instant scan alert to Slack/Telegram/Discord/Teams.
+
+        Fires as soon as the scan finishes (module runs at the end of the pipeline).
+        Uses httpx (already a dependency). Graceful when nothing is configured or a
+        channel rejects the message. Alert content is **counts + the target name
+        only** — secret values are never included. A CRITICAL/HIGH finding changes
+        the alert headline and Telegram parse mode is crash-safe (MarkdownV2)."""
         cfg = dict(getattr(self, "webhooks", {}) or {})
         targets = {k: v for k, v in cfg.items() if v}
-        out = {"channels": sorted(targets.keys()), "sent": [], "failed": [], "note": ""}
+        out = {"channels": sorted(targets.keys()), "sent": [], "failed": [],
+               "note": "", "severity": {}}
         if not targets:
             out["note"] = ("no webhook configured — pass --webhook-slack / --webhook-telegram "
                            "(TOKEN:CHATID) / --webhook-discord / --webhook-teams")
             self.results['notify'] = out
             return
 
-        text = self._notification_payload(self.export_dict())
+        report = self.export_dict()
+        plain = self._notification_payload(report)
+        out["severity"] = self._alert_severity_counts(report)
+
         async def _send(name, url, payload):
             try:
                 async with self.sem:
@@ -5504,28 +5536,91 @@ class WebsiteRecon:
 
         for name, url in targets.items():
             if name == "slack":
-                await _send(name, url, {"text": text})
+                await _send(name, url, {"text": plain})
             elif name == "discord":
-                await _send(name, url, {"content": text[:1900]})
+                await _send(name, url, {"content": plain[:1900]})
             elif name == "teams":
-                await _send(name, url, {"text": text})
+                await _send(name, url, {"text": plain})
             elif name == "telegram":
-                # url format: TOKEN:CHATID
+                # url format: TOKEN:CHATID  (chat id may be negative, e.g. -100123…)
                 if ":" in url:
                     token, chat = url.split(":", 1)
                     api = f"https://api.telegram.org/bot{token}/sendMessage"
-                    await _send(name, api, {"chat_id": chat, "text": text,
-                                            "parse_mode": "Markdown",
-                                            "disable_web_page_preview": True})
+                    # MarkdownV2 needs escaping; fall back to plain text if it still fails
+                    md = self._md_escape(plain)
+                    ok = await self._tg_send(name, api, chat, md, out)
+                    if not ok:
+                        await self._tg_send(name, api, chat, plain, out, plain_mode=True)
                 else:
                     out["failed"].append({"channel": name,
                                           "error": "expected TOKEN:CHATID"})
         self.results['notify'] = out
 
+    async def _tg_send(self, name, api, chat, text, out, plain_mode=False):
+        """Send one Telegram message; return True on success (and record result)."""
+        payload = {"chat_id": chat, "text": text[:4000],
+                   "disable_web_page_preview": True}
+        if not plain_mode:
+            payload["parse_mode"] = "MarkdownV2"
+        try:
+            async with self.sem:
+                r = await self.client.post(api, json=payload, timeout=10,
+                                           follow_redirects=True)
+            if 200 <= r.status_code < 300:
+                out["sent"].append({"channel": name, "status": r.status_code})
+                return True
+            # record only the final failure (avoid duplicate entries on retry)
+            if plain_mode:
+                out["failed"].append({"channel": name, "status": r.status_code,
+                                      "body": (r.text or "")[:200]})
+            return False
+        except Exception as e:
+            if plain_mode:
+                out["failed"].append({"channel": name,
+                                      "error": f"{type(e).__name__}: {e}"})
+            return False
+
     # ======================================================== Executive report (39)
+    def _collect_findings_from_report(self, report):
+        """Rebuild ``[(sev, check, detail, source), ...]`` from an exported report
+        dict (used when rendering the executive report/dashboard PDF from a saved
+        history entry, where ``self.results`` is not populated)."""
+        r = (report or {}).get("report", report) or {}
+        F = []
+
+        def add(sev, chk, det, src):
+            det = re.sub(r"\s+", " ", str(det or "")).strip()[:400]
+            F.append((str(sev or "INFO").upper(), str(chk or ""), det, src))
+
+        # dict sections that carry a "findings" list of {severity, message|detail, ...}
+        for key, src in (("email_security", "email"), ("external_intel", "ext"),
+                         ("cve", "cve"), ("tls", "tls"), ("supply_chain", "supply"),
+                         ("breach", "breach"), ("scan_diff", "diff"),
+                         ("admin_api", "auth"), ("burp_caido", "burp"),
+                         ("nuclei", "nuclei"), ("threat_intel", "intel"),
+                         ("correlation", "correlate"), ("compliance", "comp"),
+                         ("anomaly", "anomaly")):
+            blob = r.get(key)
+            if not isinstance(blob, dict):
+                continue
+            for f in (blob.get("findings") or []):
+                if isinstance(f, dict):
+                    add(f.get("severity"), f.get("id") or f.get("check") or f.get("title") or src,
+                        f.get("detail") or f.get("message") or f.get("desc") or "", src)
+                elif isinstance(f, (list, tuple)) and len(f) >= 3:
+                    add(f[0], f[1], f[2], src)
+                elif isinstance(f, (list, tuple)) and len(f) == 2:
+                    add(f[0], src, f[1], src)
+        F.sort(key=lambda t: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2,
+                              "LOW": 3, "INFO": 4}.get(t[0], 5))
+        return F
+
     def _exec_metrics(self, report):
         s = report.get("summary", {})
-        F = self._dedupe_findings(self._collect_findings())
+        live = self._collect_findings() if getattr(self, "results", None) else []
+        if not live:
+            live = self._collect_findings_from_report(report)
+        F = self._dedupe_findings(live)
         sev_count = {k: len([f for f in F if f[0] == k])
                      for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
         crit, high, med = sev_count["CRITICAL"], sev_count["HIGH"], sev_count["MEDIUM"]
@@ -5567,7 +5662,7 @@ class WebsiteRecon:
         prio = "".join(
             f"<li><b>{_e(p['title'])}</b> <span class='chip b'>{_e(p['severity'])}</span>"
             f"<div class='det'>{_e(p['check'])} — {_e(p['finding'][:160])}</div></li>"
-            for p in (self.results.get('patch', {}) or {}).get('patches', [])[:10])
+            for p in (((getattr(self, "results", None) or {}).get('patch', {}) or {}).get('patches', [])[:10]))
         comp = m["compliance"]
         fw = "".join(f"<tr><td>{_e(k)}</td><td>{_e(str(v))}</td></tr>"
                      for k, v in (comp.get("frameworks") or {}).items()) or \
@@ -7345,6 +7440,11 @@ class WebsiteRecon:
                 body = f"  channels: [bold]{', '.join(ntf.get('channels', []))}[/]  ·  " \
                        f"[green]{len(ntf.get('sent', []))} sent[/]  ·  " \
                        f"[red]{len(ntf.get('failed', []))} failed[/]\n"
+                sv = ntf.get('severity') or {}
+                if sv:
+                    body += (f"  alert severity: [bold red]CRITICAL {sv.get('CRITICAL', 0)}[/] · "
+                             f"[red]HIGH {sv.get('HIGH', 0)}[/] · "
+                             f"[yellow]MEDIUM {sv.get('MEDIUM', 0)}[/]\n")
                 for x in ntf.get('failed', [])[:10]:
                     body += f"  [red]•[/] {x.get('channel')}: {x.get('status', '')} {x.get('error') or x.get('body', '')}\n"
                 console.print(Panel(body, title="[bold green]◈ WEBHOOK NOTIFICATIONS ◈[/]",
@@ -8471,6 +8571,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="grow"></div>
   <input id="q" placeholder="filter findings…" style="width:230px">
   <button id="refresh">↻ Refresh</button>
+  <button id="dl-pdf" title="Download the executive PDF (module 39) for the selected scan">⬇ Executive PDF</button>
 </header>
 <div class="layout">
   <aside id="list"></aside>
@@ -8548,7 +8649,11 @@ function render(d){
       <div class="score" style="color:${color}">${score}<span class="mut" style="font-size:16px">/100</span></div></div>
       <div style="text-align:right"><div class="tag">Target</div>
         <div style="font-weight:700;font-size:16px">${e(d.target)}</div>
-        <div class="mut" style="font-size:12px">${e((d.started||'').slice(0,19).replace('T',' '))} · v${e(d.version)} · ${e(d.mode)}</div></div></div>
+        <div class="mut" style="font-size:12px">${e((d.started||'').slice(0,19).replace('T',' '))} · v${e(d.version)} · ${e(d.mode)}</div>
+        <div style="margin-top:8px">
+          <button onclick="window.location='/api/exec-pdf?id='+encodeURIComponent(d.__id)">⬇ Executive PDF</button>
+          <button onclick="window.location='/api/exec-pdf?id='+encodeURIComponent(d.__id)+'&format=html'">⬇ HTML</button>
+        </div></div></div>
     <div class="track"><i style="width:${score}%;background:${color}"></i></div>
     <div style="margin-top:6px;font-weight:700;color:${color}">${verdict}</div>
   </div>
@@ -8656,6 +8761,10 @@ function renderFindings(F){
     ||'<tr><td colspan="4" class="mut">no findings</td></tr>'}</tbody></table></div>`;
 }
 document.getElementById('refresh').onclick=loadScans;
+document.getElementById('dl-pdf').onclick=()=>{
+  if(!DATA||!DATA.__id){alert('Select a scan first.');return;}
+  window.location='/api/exec-pdf?id='+encodeURIComponent(DATA.__id);
+};
 loadScans();
 setInterval(loadScans,30000);
 </script>
@@ -8731,6 +8840,61 @@ def serve_dashboard(port=8899, open_browser=True, host="127.0.0.1"):
                 if not x:
                     return self._json({"error": "scan not found"}, 404)
                 return self._json(x.get("report", {}))
+            if u.path == "/api/exec-pdf":
+                # 1-click executive report from a history entry (module 39)
+                x = _load_entry((qs.get("id") or [""])[0])
+                if not x:
+                    return self._json({"error": "scan not found"}, 404)
+                report = x.get("report", {}) or {}
+                try:
+                    recon = WebsiteRecon.__new__(WebsiteRecon)
+                    recon.domain = str(report.get("target") or x.get("domain") or "target")
+                    recon.base_url = recon.domain
+                    # seed results so patch/remediation sections render from the saved report
+                    from collections import defaultdict as _dd
+                    recon.results = _dd(list)
+                    recon.results['patch'] = {"patches": report.get("remediation", {}).get("patches", [])}
+                    recon.no_dedupe = False
+                except Exception:
+                    return self._json({"error": "cannot build executive report"}, 500)
+                fmt = (qs.get("format") or ["pdf"])[0].lower()
+                safe = _re.sub(r"[^A-Za-z0-9._-]", "_",
+                               str(report.get("target") or x.get("domain") or "scan"))
+                if fmt == "html":
+                    html_doc = recon.build_executive_html(report)
+                    return self._send(
+                        200, html_doc, "text/html; charset=utf-8")
+                # render PDF to a temp file, then stream it back
+                import tempfile
+                tmp = os.path.join(tempfile.gettempdir(),
+                                   f"nullveil-exec-{safe}-{x.get('id', 'scan')}.pdf")
+                got, engine = recon.export_executive_pdf(report, tmp)
+                if got and os.path.isfile(got):
+                    try:
+                        with open(got, "rb") as fh:
+                            data = fh.read()
+                    finally:
+                        try:
+                            os.remove(got)
+                        except Exception:
+                            pass
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/pdf")
+                    self.send_header("Content-Disposition",
+                                     f'attachment; filename="nullveil-exec-{safe}.pdf"')
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except Exception:
+                        pass
+                    return
+                # PDF engines unavailable → serve the print-ready HTML instead
+                console.print("[yellow]Dashboard PDF: no PDF engine "
+                              "(weasyprint/reportlab/playwright) — serving HTML[/]")
+                html_doc = recon.build_executive_html(report)
+                return self._send(200, html_doc, "text/html; charset=utf-8")
             if u.path == "/api/shot":
                 x = _load_entry((qs.get("id") or [""])[0])
                 try:

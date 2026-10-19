@@ -87,7 +87,7 @@ By using NULLVEIL Recon you agree to these terms.
 | 34 | **Burp / Caido Traffic Bridge** | **Two-way intercepting-proxy integration: `--proxy` routes the *entire* scan (shared httpx client + katana/ffuf/nuclei subprocesses) through Burp Suite / Caido so automated traffic lands in their HTTP history for manual follow-up — module verifies the listener is live; `--har` imports HAR captures exported from Burp (Save items → HAR) or Caido (Export HAR), parsing every entry for endpoints, query/body params, cookies, auth-header names and secrets in responses — all fed into the unified API pool so ffuf/auth/smartfuzz analyze captured traffic too** |
 | 35 | **AI Patch & Remediation Generator** | **Offline, template + heuristic engine (no AI key needed) that turns each finding into copy-paste remediation — nginx security-header blocks, Cloudflare WAF/rate-limit rules, CSP/CORS/TLS configs, secret rotation steps, admin/IP allow-listing and more, ranked by severity** |
 | 36 | **Read-Only PoC Verification Generator** | **Non-destructive verification commands (`curl` HEAD/GET, `dig`, `openssl s_client`, `nc -z`) that *demonstrate a finding exists* for CRITICAL/HIGH/MEDIUM issues — no exploit payloads, no writes, no brute-force; policy printed with every report** |
-| 37 | **Multi-Channel Webhook Notifications** | **Push a concise scan summary (counts, change verdict, admin-API hits) to Slack / Telegram / Discord / Teams via `--webhook-slack` / `--webhook-telegram TOKEN:CHATID` / `--webhook-discord` / `--webhook-teams` — redaction-aware (no secret values), graceful when unconfigured** |
+| 37 | **Multi-Channel Webhook Notifications** | **Instant scan alert to Slack / Telegram / Discord / Teams via `--webhook-slack` / `--webhook-telegram TOKEN:CHATID` / `--webhook-discord` / `--webhook-teams` — a CRITICAL/HIGH finding changes the headline (🚨 CRITICAL ALERT), severity counts included, redaction-aware (no secret values), Telegram is MarkdownV2-safe with a plain-text fallback, graceful when unconfigured** |
 | 39 | **Executive Report Exporter** | **C-level HTML report (`--exec-report`) + best-effort PDF (`--exec-pdf`; weasyprint → reportlab → playwright): exposure score, severity mix, KPIs, top risks, PCI-DSS/ISO 27001/SOC 2 compliance snapshot and a prioritised remediation plan — print-ready** |
 
 **Plus:**
@@ -99,7 +99,7 @@ By using NULLVEIL Recon you agree to these terms.
 - 🔁 **Scan-diff change tracking** — new subdomains / ports / paths / APIs surfaced vs the previous scan
 - 💾 JSON export + **standalone HTML report** (dark theme, shareable)
 - 📄 **Client-ready PDF report** (`--pdf`, headless Chromium, paginated A4)
-- 🖥 **Local web dashboard** (`--dashboard`) — live charts, findings search, screenshot gallery — offline, stdlib-only, localhost-only
+- 🖥 **Local web dashboard** (`--dashboard`) — live charts, findings search, screenshot gallery, **1-click Executive PDF/HTML download** — offline, stdlib-only, localhost-only
 - 💾 **Scan history + resume** — every scan auto-saves; `Ctrl+C` keeps partial results; `--resume` runs only what's missing
 - 📝 **Custom subdomain wordlist** (`-w wordlist.txt`)
 - 🌐 Async & concurrent (fast on slow networks)
@@ -385,7 +385,7 @@ python3 nullveil_recon.py example.com --dashboard 9000     # custom port
 python3 nullveil_recon.py --dashboard
 ```
 
-**What you get:** exposure score + severity charts · findings with search/filter · screenshot gallery · per-module breakdown · clickable scan list.
+**What you get:** exposure score + severity charts · findings with search/filter · screenshot gallery · per-module breakdown · clickable scan list · **1-click Executive PDF / HTML download** (module 39) for any past scan.
 
 | Thing to know | Detail |
 |---|---|
@@ -503,6 +503,8 @@ Compliance output is **evidence-based partial mapping**, never a certification c
 - **Scan-diff change tracking** is automatic — every scan is compared against the newest previous scan for the same target, surfacing **new subdomains / ports / paths / APIs** with a 0–100 drift score and verdict.
 - **Smart deduplication** collapses redundant and near-identical findings (repeated INFO items become one entry marked `(×N)`, paths/numbers are normalised) — disable with `--no-dedupe`.
 - **Strict per-module timeouts** guarantee the scan never hangs: `180s` for normal modules and `300s` for crawl/fuzz modules, tunable via `--module-timeout` / `--module-timeout-heavy`.
+- **1-click Executive PDF from the dashboard** — every past scan in the local web dashboard has `⬇ Executive PDF` (and `⬇ HTML`) buttons that stream the module-39 report straight from `/api/exec-pdf?id=…`. No CLI re-run needed; if no PDF engine is installed the endpoint transparently serves the print-ready HTML instead. The history-entry id is regex-validated, so path traversal is rejected (404).
+- **Instant alert headline** — module 37 now leads with a severity verdict (`🚨 CRITICAL ALERT` / `⚠️ HIGH-RISK ALERT` / `🔔 Recon complete`), adds a 🔴/🟠/🟡/🔵 severity line and the single top risk; Telegram uses crash-safe **MarkdownV2** with an automatic **plain-text fallback** when escaping still fails.
 
 ### v3.5.0 notes (Burp Suite / Caido traffic bridge)
 
