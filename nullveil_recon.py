@@ -3,23 +3,56 @@
 NULLVEIL Recon - Website & Domain Reconnaissance Tool
 Owner/Author: NULLVEIL
 Engine: DeepHat
-Version: 1.0.0
+Version: 3.6.0
 
-Features:
-  - DNS Records (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV)
-  - Subdomain Enumeration (wordlist + SSL SAN)
-  - Port Scanning (Top 100 TCP ports, async)
+Features (38 attack modules):
+  Recon & discovery
+  - DNS Records (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA) + DoH fallback
+  - Subdomain Enumeration (wordlist + SSL SAN + crt.sh CT logs)
+  - Port Scanning (async TCP, top ports + deep set)
   - HTTP Analysis (headers, security headers, tech stack)
-  - SSL/TLS Certificate Analysis
+  - SSL/TLS Certificate Analysis + TLS 1.0-1.3 cipher deep audit
   - Content & Data Leakage Analysis (emails, IPs, phones, comments, secrets)
   - Robots.txt & Sitemap.xml parsing
   - Hidden Path / Admin Panel Discovery
-  - User/Author Enumeration (REST API + pages)
-  - JSON Report Export
+  - User/Author Enumeration (WP REST API, ?author=, oEmbed)
+  - WAF / CDN Detection, Email Security (SPF/DKIM/DMARC/MTA-STS/BIMI)
+  - External Intelligence (CT logs, Wayback, subdomain takeover)
+  - CVE & Misconfig Scan, Supply Chain / third-party risk mapping
+  - Asset Criticality scoring, ML Anomaly Detection
+  - Threat Intel feeds, Breach monitoring, Compliance mapping
+  - Attack Path Graph, multi-target correlation
+  - Scan-diff change tracking (new subdomains / ports / paths / APIs vs last scan)
+
+  API discovery & exploitation surface (report-only)
+  - API & Full Site Intel (Swagger/OpenAPI probe + parse, JS endpoints, forms)
+  - API Security Audit (OWASP API Top 10)
+  - Deep Crawler & Params, Screenshot capture, Nuclei template scan
+  - Authenticated scan + role diff + backend/admin API audit (session injection)
+
+  Remediation & delivery
+  - AI Patch & Remediation Generator (nginx / Cloudflare WAF / code-level fixes)
+  - Read-Only PoC Verification Generator (non-destructive curl/dig/openssl)
+  - Multi-Channel Webhook Notifications (Slack / Telegram / Discord / Teams)
+  - Executive C-Level Report Exporter (HTML + PDF, compliance highlights)
+  - Smart deduplication + strict per-module timeouts
+
+  External tool integrations (graceful degradation when absent)
+  - Katana crawler       (ProjectDiscovery)  -> URL/JS/endpoint harvesting
+  - LinkFinder           (JS analysis)       -> hidden API endpoints
+  - FFUF                 (fuzzing)           -> content/API brute-force
+  - Nuclei               (templates)         -> vuln template engine
+  - Burp Suite / Caido   (traffic bridge)    -> --proxy routing + --har import
+  - interactsh-client    (OOB)               -> out-of-band SSRF callbacks
+
+  Output
+  - JSON report, standalone HTML report, client-ready PDF, evidence/repro pack
+  - Executive report, local web dashboard, scan history + resume (Ctrl+C-safe)
 
 Usage:
-  python3 kundo_recon.py example.com
-  python3 kundo_recon.py example.com --deep --timeout 15 --output report.json
+  python3 nullveil_recon.py example.com
+  python3 nullveil_recon.py example.com --deep --timeout 15 --output report.json
+  python3 nullveil_recon.py example.com -m
 """
 
 import asyncio
@@ -37,6 +70,7 @@ import ipaddress
 import os
 import time
 import math
+import tempfile
 import hashlib
 import statistics
 
@@ -63,7 +97,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.2.2"
+__version__ = "3.6.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -180,6 +214,146 @@ DEEP_EXTRA_PORTS = [
     11211, 15672, 16379, 18080, 27017, 27018, 28017, 50000, 50070
 ]
 
+# Curated API/endpoint fuzzing wordlist for ffuf (-a ffuf). Focused on hidden
+# API routes, versioned REST/GraphQL, admin/debug surfaces & framework tells.
+FFUF_API_WORDLIST = [
+    # --- API roots & versioning ---
+    "api", "api/", "api/v1", "api/v1/", "api/v2", "api/v2/", "api/v3", "api/v3/",
+    "v1", "v1/", "v2", "v2/", "v3", "v3/", "rest", "rest/", "rest/v1", "rest/v2",
+    "graphql", "graphql/", "graphiql", "graphql/console", "gql", "api/graphql",
+    "v1/graphql", "v2/graphql", "playground", "altair", "graphql/v1",
+    "soap", "wsdl", "rpc", "xmlrpc", "jsonrpc", "api/rpc", "api/soap",
+    "api-docs", "api/docs", "docs", "docs/", "redoc", "api/explorer",
+    "v2/api-docs", "v3/api-docs", "swagger", "swagger/", "swagger.json",
+    "swagger/v1/swagger.json", "openapi", "openapi.json", "openapi.yaml",
+    "api/openapi.json", "api/swagger.json", "swagger-ui", "swagger-resources",
+    "api/swagger", "api/swagger-ui", "swagger-initializer.js",
+    "api/v1/openapi.json", "api/v2/openapi.json", "api/v3/openapi.json",
+    # --- Auth / identity ---
+    "auth", "auth/", "api/auth", "api/auth/", "api/auth/login", "api/auth/register",
+    "api/auth/refresh", "api/auth/token", "api/auth/logout", "api/auth/me",
+    "login", "login/", "api/login", "logout", "register", "signup", "signin",
+    "oauth", "oauth/", "oauth/authorize", "oauth/token", "oauth/callback",
+    "api/oauth", "api/oauth/token", "sso", "sso/saml", "sso/oidc",
+    "token", "api/token", "api/token/refresh", "jwt", "api/jwt/verify",
+    "session", "api/session", "api/session/active", "me", "api/me", "user",
+    "api/user", "users", "api/users", "api/users/", "api/v1/users",
+    "api/v1/users/", "account", "api/account", "accounts", "api/accounts",
+    "profile", "api/profile", "api/me/profile", "whoami", "api/whoami",
+    "password/reset", "api/password/reset", "mfa", "api/mfa/verify", "otp",
+    "api/otp", "api/otp/verify", "captcha", "api/captcha",
+    # --- Common REST resources ---
+    "products", "api/products", "api/products/", "api/v1/products",
+    "orders", "api/orders", "api/orders/", "api/v1/orders",
+    "customers", "api/customers", "api/customers/", "api/v1/customers",
+    "items", "api/items", "api/items/", "carts", "api/carts",
+    "payments", "api/payments", "api/payments/", "api/v1/payments",
+    "invoices", "api/invoices", "api/v1/invoices", "billing", "api/billing",
+    "subscriptions", "api/subscriptions", "api/v1/subscriptions",
+    "posts", "api/posts", "api/posts/", "api/v1/posts", "pages", "api/pages",
+    "comments", "api/comments", "api/v1/comments", "tags", "api/tags",
+    "categories", "api/categories", "media", "api/media", "files", "api/files",
+    "upload", "api/upload", "uploads", "api/uploads", "download", "api/download",
+    "search", "api/search", "api/v1/search", "api/query", "api/filter",
+    "reports", "api/reports", "api/v1/reports", "analytics", "api/analytics",
+    "stats", "api/stats", "metrics", "api/metrics", "prometheus", "metrics/",
+    "notifications", "api/notifications", "api/v1/notifications",
+    "messages", "api/messages", "api/v1/messages", "events", "api/events",
+    "webhooks", "api/webhooks", "api/v1/webhooks", "api/webhooks/",
+    "inventory", "api/inventory", "api/v1/inventory", "stock", "api/stock",
+    "reviews", "api/reviews", "api/v1/reviews", "ratings", "api/ratings",
+    "transactions", "api/transactions", "api/v1/transactions",
+    "refunds", "api/refunds", "coupons", "api/coupons", "discounts",
+    "api/discounts", "shipping", "api/shipping", "api/v1/shipping",
+    "locations", "api/locations", "api/v1/locations", "stores", "api/stores",
+    "branches", "api/branches", "employees", "api/employees",
+    "api/v1/employees", "staff", "api/staff", "api/v1/staff",
+    "tickets", "api/tickets", "api/v1/tickets", "support", "api/support",
+    "chats", "api/chats", "api/v1/chats", "api/chat", "api/v1/chat",
+    "contacts", "api/contacts", "api/v1/contacts", "leads", "api/leads",
+    "api/v1/leads", "deals", "api/deals", "api/v1/deals",
+    # --- Admin / management ---
+    "admin", "admin/", "admin/login", "administrator", "admin/dashboard",
+    "admin/api", "admin/users", "admin/config", "admin/settings",
+    "dashboard", "dashboard/", "api/dashboard", "panel", "backend",
+    "manage", "management", "console", "api/console", "controlpanel",
+    "cpanel", "wp-admin", "phpmyadmin", "pma", "adminer",
+    "manager", "api/manager", "moderator", "api/moderator",
+    # --- Debug / internal / dev ---
+    "debug", "debug/", "api/debug", "api/debug/", "api/v1/debug",
+    "trace", "api/trace", "dump", "api/dump", "test", "test/", "api/test",
+    "dev", "dev/", "api/dev", "staging", "api/staging", "sandbox",
+    "api/sandbox", "internal", "api/internal", "private", "api/private",
+    "hidden", "api/hidden", "secret", "api/secret", "backup", "backups",
+    "api/backup", "api/backups", "old", "api/old", "legacy", "api/legacy",
+    "tmp", "temp", "api/tmp", "api/temp", "logs", "api/logs", "log",
+    "api/log", "error", "api/error", "errors", "api/errors", "exception",
+    "api/exception", "trace.axd", "elmah", "elmah.axd", "debug/default/view",
+    "_profiler", "_profiler/phpinfo", "server-status", "server-info",
+    "phpinfo", "phpinfo.php", "info.php", "test.php", "debug.php",
+    "actuator", "actuator/", "actuator/health", "actuator/info",
+    "actuator/env", "actuator/metrics", "actuator/mappings",
+    "actuator/beans", "actuator/configprops", "actuator/dump",
+    "actuator/trace", "actuator/loggers", "actuator/threaddump",
+    "jolokia", "jolokia/list", "hawtio", "console/login",
+    "manage/env", "management/health", "management/env",
+    # --- Config / secrets exposure ---
+    ".env", ".env.local", ".env.production", ".env.backup", ".env.bak",
+    "config", "config/", "config.json", "config.js", "config.yml",
+    "config.yaml", "config.xml", "config.php", "config.bak", "config.old",
+    "settings", "settings.json", "appsettings.json", "app.config",
+    "web.config", "appsettings.Development.json", "local_settings.py",
+    "credentials", "credentials.json", "secrets", "secrets.json",
+    "service-account.json", "key.json", "private.pem", "private.key",
+    "id_rsa", ".git/HEAD", ".git/config", ".gitignore", ".svn/entries",
+    ".hg/hgrc", ".DS_Store", ".idea/workspace.xml", ".vscode/settings.json",
+    "package.json", "package-lock.json", "composer.json", "composer.lock",
+    "yarn.lock", "Gemfile", "Gemfile.lock", "requirements.txt",
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml", ".dockerenv",
+    "Makefile", "pom.xml", "build.gradle", "Cargo.toml", "go.mod",
+    ".travis.yml", ".gitlab-ci.yml", "Jenkinsfile", ".github/workflows",
+    # --- Framework / CMS endpoints ---
+    "wp-json", "wp-json/", "wp-json/wp/v2", "wp-json/wp/v2/users",
+    "wp-json/wp/v2/posts", "wp-json/wp/v2/pages", "wp-login.php",
+    "xmlrpc.php", "jsonapi", "jsonapi/", "graphql/wp",
+    "_next/data", "api/next", "__nextjs_original-stack-frame",
+    "api/auth/[...nextauth]", "api/trpc", "trpc", "api/flags",
+    "_nuxt", "api/nuxt", "__webpack_hmr",
+    ".well-known/openid-configuration", ".well-known/oauth-authorization-server",
+    ".well-known/security.txt", ".well-known/assetlinks.json",
+    ".well-known/apple-app-site-association", ".well-known/change-password",
+    ".well-known/creditcard", "sitemap.xml", "robots.txt", "crossdomain.xml",
+    "clientaccesspolicy.xml", "browserlink", "elmah.axd",
+    # --- Data / feeds ---
+    "feed", "rss", "rss.xml", "atom.xml", "feed.json", "news.json",
+    "data", "data.json", "api/data", "api/v1/data", "export", "api/export",
+    "import", "api/import", "api/v1/import", "report.json", "index.json",
+    "listing.json", "manifest.json", "site.webmanifest", "routes.json",
+    "sitemap_index.xml", "opensearch.xml",
+    # --- Health / ops ---
+    "health", "health/", "api/health", "api/health/", "api/v1/health",
+    "healthz", "readyz", "livez", "ping", "api/ping", "status", "status/",
+    "api/status", "api/status/", "api/v1/status", "version", "api/version",
+    "api/version/", "api/v1/version", "info", "api/info", "api/info/",
+    "api/system", "api/system/info", "api/config", "api/config/",
+    "api/settings", "api/settings/", "api/v1/settings", "time", "api/time",
+    "echo", "api/echo", "api/echo/", "api/reflect", "api/whois",
+    # --- Upload / file managers ---
+    "uploads/", "files/", "media/", "assets/", "static/", "public/",
+    "storage/", "storage/uploads", "var/www", "backup.zip", "backup.tar.gz",
+    "site.zip", "www.zip", "dump.sql", "database.sql", "db.sql",
+    "export.csv", "users.csv", "data.csv", "backup.sql",
+    # --- Method-ish probes & misc API tricks ---
+    "api/v1/", "api/v2/", "api/v3/", "api/beta", "api/canary", "api/experimental",
+    "api/partner", "api/partners", "api/public", "api/external",
+    "api/gateway", "api/proxy", "api/redirect", "api/fetch", "api/request",
+    "api/v1/login", "api/v1/register", "api/v1/token", "api/v1/me",
+    "api/v1/auth/login", "api/v1/auth/register", "api/v2/auth/login",
+    "api/v1/search", "api/v2/search", "api/v1/config", "api/v2/config",
+    "api-docs.json", "swagger.yaml", "openapi.yml", "api/schema",
+    "schema.json", "api/schema.json", "api/types", "api/models",
+]
+
 TECH_PATTERNS = {
     "WordPress": [r"wp-content", r"wp-includes", r"wp-json"],
     "Shopify": [r"cdn.shopify.com", r"Shopify.theme"],
@@ -276,22 +450,46 @@ ATTACK_MODULES = [
     ("correlate", 25, "Target Correlation", "Multi-target/tenant correlation: shared NS/MX/IP/CDN, --correlate list"),
     ("shot", 26, "Screenshot Capture", "Headless browser page snapshots (needs optional playwright)"),
     ("nuclei", 27, "Nuclei Template Scan", "ProjectDiscovery nuclei integration — 9000+ vuln templates (needs nuclei binary)"),
+    ("katana", 28, "Katana Crawler (API)", "ProjectDiscovery katana — deep crawl, JS discovery, endpoint harvesting (needs katana binary)"),
+    ("linkfinder", 29, "LinkFinder JS Endpoints", "Extract hidden API endpoints from every JS bundle (needs linkfinder)"),
+    ("ffuf", 30, "FFUF API Fuzzing", "Content/API brute-force with curated API wordlist + discovered endpoints (needs ffuf binary)"),
+    ("auth", 31, "Authenticated API Scan", "Login engine + session injection + role-diff probe — finds auth-gated / role-hidden APIs"),
+    ("ssrf", 32, "SSRF & Internal Pivot", "IP-bypass header fuzz, cloud metadata probing, interactsh OOB callbacks (--oob)"),
+    ("smartfuzz", 33, "Smart Context Fuzz", "Context-aware wordlist generation + JS data-flow endpoint resolution + targeted fuzz"),
+    ("burp", 34, "Burp / Caido Traffic Bridge", "Import Burp/Caido HAR captures into the API pool + route the whole scan via --proxy for manual follow-up"),
+    ("patch", 35, "AI Patch & Remediation Generator", "Template-based, read-only fix suggestions — Nginx/Cloudflare WAF config + code-level remediation per finding"),
+    ("poc", 36, "Read-Only PoC Verification Generator", "Non-destructive curl/dig commands that demonstrate a finding exists — no exploit payloads, no active exploitation"),
+    ("notify", 37, "Multi-Channel Webhook Notifications", "Push scan summaries to Slack / Telegram / Discord / Teams (--webhook-*) — graceful without deps"),
+    ("exec", 39, "Executive Report Exporter", "C-level HTML/PDF report — exposure KPIs, top risks, PCI-DSS/ISO 27001/SOC 2 highlights, remediation priorities"),
 ]
 
 MAX_MODULE = len(ATTACK_MODULES)
+
+# Module numbers are not necessarily contiguous (the roadmap skips 38), so map
+# a module *number* to its registry entry instead of assuming list position.
+MODULE_BY_NUM = {num: (name, num, title, desc) for name, num, title, desc in ATTACK_MODULES}
+
+
+def module_entry(num):
+    """Return the registry tuple for a module number (safe against gaps)."""
+    return MODULE_BY_NUM.get(num)
+
+
+# All module *numbers* in registry order (module numbers are non-contiguous).
+ALL_MODULE_NUMS = sorted(MODULE_BY_NUM)
 
 
 def parse_attack_list(s: str):
     s = s.lower().strip()
     if s in ("all", "full", "*"):
-        return list(range(1, MAX_MODULE + 1))
+        return list(ALL_MODULE_NUMS)
     items = [x.strip().lower() for x in s.split(',') if x.strip()]
     res = set()
     unknown = []
     for it in items:
         if it.isdigit():
             m = int(it)
-            if 1 <= m <= MAX_MODULE:
+            if m in MODULE_BY_NUM:
                 res.add(m)
             else:
                 unknown.append(it)
@@ -330,13 +528,13 @@ def attack_menu(target):
             choice = console.input("\n[bold yellow]❯ Attack list [/][dim](default: all):[/] ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]Cancelled — running ALL modules.[/]")
-            return list(range(1, MAX_MODULE + 1))
+            return list(ALL_MODULE_NUMS)
         if not choice:
-            return list(range(1, MAX_MODULE + 1))
+            return list(ALL_MODULE_NUMS)
         parsed = parse_attack_list(choice)
         if parsed:
             sel = ", ".join(str(i) for i in parsed)
-            names = ", ".join(ATTACK_MODULES[i-1][2] for i in parsed)
+            names = ", ".join(module_entry(i)[2] for i in parsed if module_entry(i))
             console.print(f"[bold green]✓ Selected:[/] [cyan]{sel}[/] — {names}")
             return parsed
         console.print(f"[bold red]✗ Invalid:[/] [white]{choice}[/] — try 1,2,5 / dns,ssl / all")
@@ -383,6 +581,68 @@ def _section_header(title, icon, style="bright_cyan"):
     )
 
 
+def _norm_ports(v):
+    """Normalise a port collection to a clean list of ints (dashboard-safe).
+
+    Accepts ints, strings ("443", "443/tcp"), or dicts ({port, service} /
+    {number, name}) and dedupes while preserving numeric order."""
+    out = set()
+    for p in (v or []):
+        n = None
+        if isinstance(p, dict):
+            n = p.get("port", p.get("number"))
+        elif p is not None and str(p) != "":
+            n = str(p).split('/')[0].strip()
+        if n is None:
+            continue
+        try:
+            out.add(int(str(n).strip()))
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def _norm_paths(v):
+    """Normalise a path collection to a list of {'path','status','source'} dicts."""
+    out, seen = [], set()
+    for p in (v or []):
+        if isinstance(p, dict):
+            path = str(p.get("path") or p.get("url") or "").strip()
+            if not path:
+                continue
+            rec = {"path": path}
+            if p.get("status") is not None:
+                rec["status"] = p.get("status")
+            if p.get("flagged"):
+                rec["flagged"] = True
+            if p.get("source"):
+                rec["source"] = p.get("source")
+        else:
+            path = str(p).strip()
+            if not path:
+                continue
+            rec = {"path": path}
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(rec)
+    return out
+
+
+def _wrap(text, width):
+    """Wrap ``text`` to ``width`` characters (used by the reportlab PDF fallback)."""
+    words, lines, cur = str(text).split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
 def _risk_meter(secrets, missing_headers, flagged_paths):
     """Simple 0-100 exposure score based on findings."""
     score = min(100, len(secrets) * 15 + missing_headers * 4 + len(flagged_paths) * 6)
@@ -398,8 +658,9 @@ def _risk_meter(secrets, missing_headers, flagged_paths):
 
 
 class WebsiteRecon:
-    def __init__(self, url, deep=False, timeout=10, concurrency=100, ports=None, wordlist=None):
+    def __init__(self, url, deep=False, timeout=10, concurrency=100, ports=None, wordlist=None, proxy=None):
         url = url.strip()
+        self.proxy = (proxy or "").strip()
         self.url = url if url.startswith(('http://', 'https://')) else f'https://{url}'
         self.parsed = urlparse(self.url)
         # Keep non-standard port (e.g. site.com:8080) in netloc
@@ -433,12 +694,13 @@ class WebsiteRecon:
         self.results = defaultdict(list)
         self.scalar_results = {}
         self.scan_duration = 0.0
-        self.attack_set = list(range(1, MAX_MODULE + 1))  # all modules
+        self.attack_set = list(ALL_MODULE_NUMS)  # all modules
         self.client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=self.timeout,
             verify=False,  # recon: expired/self-signed certs still interesting
             http2=True,
+            proxy=self.proxy or None,   # Burp/Caido intercepting proxy (--proxy)
             # tuned pooling: fewer TCP/TLS handshakes under high concurrency
             limits=httpx.Limits(max_connections=max(concurrency, 100),
                                 max_keepalive_connections=40,
@@ -447,6 +709,11 @@ class WebsiteRecon:
                                    f"(KHTML, like Gecko) Chrome/124.0 Safari/537.36 NULLVEIL-Recon/{__version__}"}
         )
         self.sem = asyncio.Semaphore(concurrency)
+        # --- authenticated / OOB scanning state (CLI flags wired in main) ---
+        self.auth_cfg = {}     # --auth-* / --login-* / --role flags
+        self.oob_cfg = {}      # --oob / --oob-server / --oob-wait flags
+        self.roles = {}        # multi-role profiles (parsed during auth setup)
+        self._auth_cmd = []    # "Name: value" strings for subprocess tools
 
     # ---------------------------------------------------------- run
     async def run(self):
@@ -461,11 +728,11 @@ class WebsiteRecon:
                 self.scalar_results[k] = v
             done = set(entry.get("modules_run", []))
             missing = [i for i in self.attack_set
-                       if ATTACK_MODULES[i - 1][0] not in done]
+                       if (module_entry(i) or ("",))[0] not in done]
             skipped = len(self.attack_set) - len(missing)
             # keep the already-done selection so the final report shows the full picture
             self._resume_done = [i for i in self.attack_set
-                                 if ATTACK_MODULES[i - 1][0] in done]
+                                 if (module_entry(i) or ("",))[0] in done]
             self.attack_set = missing
             resume_note = (f"Resumed from scan [bold cyan]{entry.get('id')}[/] "
                            f"({entry.get('when', '')[:16]}) — {skipped} module(s) already done, "
@@ -473,7 +740,8 @@ class WebsiteRecon:
         print_banner()
         if resume_note:
             console.print(f"      {resume_note}")
-        module_names = ", ".join(ATTACK_MODULES[i - 1][0] for i in self.attack_set) if self.attack_set else "none"
+        module_names = ", ".join((module_entry(i) or ("",))[0]
+                                 for i in self.attack_set if module_entry(i)) if self.attack_set else "none"
         console.print(f"      [dim]Target:[/] [bold magenta]{self.domain}[/]   "
                       f"[dim]Mode:[/] [bold {'red' if self.deep else 'green'}]"
                       f"{'DEEP' if self.deep else 'NORMAL'}[/]   "
@@ -482,6 +750,13 @@ class WebsiteRecon:
                       f"[dim]({len(self.attack_set)}/{MAX_MODULE} modules)[/]\n")
         if self.wordlist_error:
             console.print(f"      [bold yellow]⚠ {self.wordlist_error}[/]\n")
+        # ---------- authenticated scanning: inject session & run login FIRST,
+        # so every module (httpx + katana/ffuf/nuclei subprocesses) shares it ----
+        if self.auth_cfg:
+            try:
+                await self._auth_setup()
+            except Exception as e:
+                self.results['errors'].append(f"auth setup failed: {type(e).__name__} — {e}")
 
         all_modules = [
             (":globe_with_meridians: DNS Records", self.dns_recon, 1),
@@ -511,11 +786,25 @@ class WebsiteRecon:
             (":arrows_counterclockwise: Target Correlation", self.correlate_targets, 25),
             (":camera: Screenshot Capture", self.screenshot_capture, 26),
             (":test_tube: Nuclei Template Scan", self.nuclei_scan, 27),
+            (":satellite: Katana Crawler (API)", self.katana_crawl, 28),
+            (":mag: LinkFinder JS Endpoints", self.linkfinder_scan, 29),
+            (":bomb: FFUF API Fuzzing", self.ffuf_fuzz, 30),
+            (":key: Authenticated API Scan", self.auth_scan, 31),
+            (":satellite: SSRF & Internal Pivot", self.ssrf_probe, 32),
+            (":crystal_ball: Smart Context Fuzz", self.smart_fuzz, 33),
+            (":briefcase: Burp / Caido Traffic Bridge", self.burp_bridge, 34),
+            (":wrench: AI Patch & Remediation Generator", self.patch_generator, 35),
+            (":safety_pin: Read-Only PoC Verification", self.poc_generator, 36),
+            (":bell: Multi-Channel Webhook Notifications", self.webhook_notify, 37),
+            (":bar_chart: Executive Report Exporter", self.executive_report, 39),
         ]
         # Filter by attack set and create coroutines only for selected
         # Modules that READ other modules' results must run sequentially AFTER the
-        # concurrent scan finishes (indices: 19 crit, 23 comp, 24 graph, 25 correlate).
-        DEFERRED = {19, 23, 24, 25}
+        # concurrent scan finishes (indices: 19 crit, 23 comp, 24 graph, 25 correlate,
+        # 29 linkfinder [reads katana js_files], 30 ffuf [reads api_pool],
+        # 31 auth [diffs discovered endpoints], 32 ssrf [needs api_pool],
+        # 33 smartfuzz [needs katana/linkfinder JS + api context]).
+        DEFERRED = {19, 23, 24, 25, 29, 30, 31, 32, 33, 35, 36, 37, 39}
         modules = []
         deferred = []
         for name, fn, idx in all_modules:
@@ -534,12 +823,31 @@ class WebsiteRecon:
 
         self._completed = []
 
+        # ---- strict per-module execution timeout (heavy crawl/fuzz get 300s) ----
+        HEAVY = {16, 20, 27, 28, 29, 30, 31, 32, 33}   # crawl / ML / subprocess / fuzz
+        def _module_timeout(idx):
+            heavy = float(getattr(self, "module_timeout_heavy", 300.0) or 300.0)
+            normal = float(getattr(self, "module_timeout", 180.0) or 180.0)
+            return heavy if idx in HEAVY else normal
+
+        async def _with_timeout(name, coro, idx):
+            t = _module_timeout(idx)
+            try:
+                return await asyncio.wait_for(coro, timeout=t)
+            except asyncio.TimeoutError:
+                self.results['errors'].append(
+                    f"{name}: exceeded {int(t)}s timeout — module aborted (partial results kept)")
+                raise
+
         async def runner(name, coro, tid, idx):
             try:
-                result = await coro
+                result = await _with_timeout(name, coro, idx)
                 progress.update(tid, completed=1, status="[bold green]✓ done[/]")
-                self._completed.append(ATTACK_MODULES[idx - 1][0])   # canonical name
+                self._completed.append((module_entry(idx) or ("",))[0])   # canonical name
                 return result
+            except asyncio.TimeoutError:
+                progress.update(tid, completed=1, status="[bold yellow]⏱ timeout[/]")
+                return None
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -582,9 +890,11 @@ class WebsiteRecon:
                 for name, coro, idx in deferred:
                     tid = prog2.add_task(name, total=1, status="[dim]analyzing…[/]")
                     try:
-                        await coro
+                        await _with_timeout(name, coro, idx)
                         prog2.update(tid, completed=1, status="[bold green]✓ done[/]")
-                        self._completed.append(ATTACK_MODULES[idx - 1][0])
+                        self._completed.append((module_entry(idx) or ("",))[0])
+                    except asyncio.TimeoutError:
+                        prog2.update(tid, completed=1, status="[bold yellow]⏱ timeout[/]")
                     except Exception as e:
                         prog2.update(tid, completed=1, status="[bold red]✗ fail[/]")
                         self.results['errors'].append(f"{name} crashed: {e!r}")
@@ -593,6 +903,13 @@ class WebsiteRecon:
 
         await self.client.aclose()
         report = self.export_dict()
+
+        # --- Change detection vs the previous scan of this target ----------
+        try:
+            self._compute_diff(report)
+        except Exception as e:
+            self.results['errors'].append(f"diff: {e!r}")
+
         hid = self._history_save(report)
         if hid and not getattr(self, "quiet", False):
             console.print(f"[dim]Scan saved to history:[/] [cyan]{hid}[/]  "
@@ -3198,7 +3515,7 @@ class WebsiteRecon:
     async def compliance_map(self):
         """Map collected technical evidence to PCI-DSS v4.0 / ISO 27001:2022 Annex A / SOC 2 TSC.
         Evidence-based partial assessment only — NOT a certification or audit."""
-        ran = {ATTACK_MODULES[i - 1][0] for i in self.attack_set if 0 < i <= MAX_MODULE}
+        ran = {(module_entry(i) or ("",))[0] for i in self.attack_set if module_entry(i)}
         ev = {}
         # TLS / crypto
         tls_m = self.results.get('tls_matrix', [])
@@ -3894,6 +4211,10 @@ class WebsiteRecon:
         custom = str(getattr(self, "nuclei_templates", "") or "")
         if custom:
             cmd += ["-t", custom]
+        for h in getattr(self, "_auth_cmd", []):
+            cmd += ["-H", h]
+        if self.proxy:
+            cmd += ["-proxy", self.proxy]   # Burp/Caido capture (module 34)
         findings = []
         stdout_lines = []
         version = ""
@@ -3954,6 +4275,1924 @@ class WebsiteRecon:
             "findings": sorted(findings, key=lambda x: sev_rank.get(x[0], 5)),
         }
 
+    # ---------------------------------------------------------- Katana Crawler
+    async def katana_crawl(self):
+        """Run ProjectDiscovery katana and harvest API endpoints + JS files."""
+        import shutil as _shutil
+        exe = _shutil.which("katana") or _shutil.which("katana.exe")
+        if not exe:
+            self.results['katana'] = {
+                "available": False, "endpoints": [], "js_files": [], "urls": [],
+                "note": "katana binary not found — install: "
+                        "go install github.com/projectdiscovery/katana/cmd/katana@latest",
+            }
+            self.results['errors'].append(
+                "katana: binary missing — install from projectdiscovery.io, then re-run -a katana")
+            return
+
+        depth = 5 if self.deep else 3
+        cmd = [exe, "-u", self.base_url, "-jsonl", "-d", str(depth),
+               "-jc", "-silent", "-timeout", str(max(self.timeout, 8)),
+               "-c", str(min(self.concurrency, 25)),
+               "-ef", "png,jpg,jpeg,gif,svg,css,ico,woff,woff2,mp4,pdf"]
+        for h in getattr(self, "_auth_cmd", []):
+            cmd += ["-H", h]
+        if self.proxy:
+            cmd += ["-proxy", self.proxy]   # Burp/Caido capture (module 34)
+        version = ""
+        wall_limit = 600 if self.deep else 300
+        try:
+            try:
+                vproc = await asyncio.create_subprocess_exec(
+                    exe, "-version", stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT)
+                vout, _ = await asyncio.wait_for(vproc.communicate(), timeout=15)
+                m = re.search(r'v?(\d+\.\d+\.\d+)', vout.decode('utf-8', 'replace'))
+                version = m.group(1) if m else ""
+            except Exception:
+                pass
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=wall_limit)
+                stdout_lines = stdout_bytes.decode('utf-8', 'replace').splitlines()
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                stdout_lines = []
+                self.results['errors'].append(f"katana: stopped after {wall_limit}s wall-time cap")
+        except Exception as e:
+            self.results['errors'].append(f"katana: execution failed: {type(e).__name__} — {e}")
+            self.results['katana'] = {"available": False, "endpoints": [], "js_files": [],
+                                      "urls": [], "note": f"execution failed: {type(e).__name__}"}
+            return
+
+        urls, js_files, endpoints = set(), set(), set()
+        for line in stdout_lines:
+            line = line.strip()
+            if not line.startswith('{'):
+                continue
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            req = j.get("request", {}) or {}
+            u = str(req.get("endpoint") or req.get("url") or "")
+            if not u:
+                continue
+            path = urlparse(u).path
+            q = urlparse(u).query
+            urls.add(u)
+            if re.search(r'\.m?js(\?|$)', path, re.I):
+                js_files.add(u)
+            if re.search(r'(?i)/(api|rest|graphql|v\d|auth|oauth|json|rpc|soap|wsdl)[/\w\-.$]*', path):
+                endpoints.add(f"{path}" + (f"?{q}" if q else ""))
+            if self.deep:
+                endpoints.add(path)
+
+        self.results['katana'] = {
+            "available": True, "binary": exe, "version": version, "depth": depth,
+            "urls_crawled": len(urls),
+            "js_files": sorted(js_files)[:200],
+            "endpoints": sorted(endpoints)[:2000],
+            "urls": sorted(urls)[:1000],
+        }
+        for u in sorted(urls)[:800]:
+            self.results['api_pool'].append({"path": urlparse(u).path or "/", "source": "katana"})
+        for ep in sorted(endpoints)[:800]:
+            self.results['api_pool'].append({"path": ep, "source": "katana"})
+
+    # ---------------------------------------------------------- LinkFinder JS
+    async def linkfinder_scan(self):
+        """Extract hidden API endpoints from JS bundles (LinkFinder engine).
+
+        Uses the LinkFinder regex natively (no dependency) + runs the
+        ``linkfinder`` CLI too when it is installed.
+        """
+        import shutil as _shutil
+        js_urls = set()
+        kat = self.results.get('katana', {}) or {}
+        for u in (kat.get('js_files') or []):
+            js_urls.add(u)
+        # JS bundles seen in Burp/Caido HAR captures
+        for u in ((self.results.get('burp', {}) or {}).get('js_files') or []):
+            if isinstance(u, str) and u.startswith(('http://', 'https://')):
+                js_urls.add(u)
+        try:
+            async with self.sem:
+                r = await self.client.get(self.scalar_results.get('final_url', self.base_url + "/"))
+            html = r.text[:500_000]
+            for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
+                js_urls.add(urljoin(str(r.url), m.group(1)))
+        except Exception:
+            pass
+
+        js_urls = {u for u in js_urls if re.search(r'\.m?js(\?|$)', urlparse(u).path, re.I)} or js_urls
+        js_limit = 25 if self.deep else 12
+        js_urls = sorted(js_urls)[:js_limit]
+
+        # LinkFinder's core regex (from the original gerbenjaviering/linkfinder)
+        LINKFINDER_RE = re.compile(
+            r"""(?:"|')(((?:[a-zA-Z]{1,10}://|//)[^"'/]{1,}\.[a-zA-Z]{2,}[^"']{0,})|((?:/|\.\./|\./)[^"'><,;| *()(%%$^/\\\[\]][^"'><,;|()]{1,})|([a-zA-Z0-9_\-/]{1,}/[a-zA-Z0-9_\-/]{1,}\.(?:[a-zA-Z]{1,4}|action)(?:[\?|#][^"|']{0,}|))|([a-zA-Z0-9_\-/]{1,}/[a-zA-Z0-9_\-/]{3,}(?:[\?|#][^"|']{0,}|))|([a-zA-Z0-9_\-]{1,}\.(?:php|asp|aspx|jsp|json|action|html|js|txt|xml)(?:[\?|#][^"|']{0,}|)))(?:"|')""")
+        found = {}
+
+        async def analyze(u):
+            try:
+                async with self.sem:
+                    r = await self.client.get(u)
+                if r.status_code != 200:
+                    return
+                body = r.text[:2_000_000]
+                for m in LINKFINDER_RE.finditer(body):
+                    ep = (m.group(1) or '').strip()
+                    if ep and len(ep) >= 3:
+                        found.setdefault(ep, u)
+                for m in re.finditer(
+                        r'(?:fetch|axios\.(?:get|post|put|delete|patch)|\$\.(?:get|post))\(\s*["\'`]([^"\'`]{3,200})["\'`]', body):
+                    v = m.group(1)
+                    if v.startswith('/') or '://' in v:
+                        found.setdefault(v, u)
+            except Exception:
+                pass
+
+        await asyncio.gather(*[analyze(u) for u in js_urls])
+
+        lf_exe = _shutil.which("linkfinder")
+        ext_count = 0
+        if lf_exe and js_urls:
+            for u in js_urls[:6]:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        lf_exe, "-i", u, "-o", "json",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    out, _ = await asyncio.wait_for(proc.communicate(), timeout=45)
+                    data = json.loads(out.decode('utf-8', 'replace') or '[]')
+                    for ep in (data if isinstance(data, list) else []):
+                        if isinstance(ep, str) and len(ep) >= 3:
+                            found.setdefault(ep, f"linkfinder:{u}")
+                            ext_count += 1
+                except Exception:
+                    continue
+
+        clean = {}
+        for ep, src in found.items():
+            ep = ep.strip()
+            if re.search(r'\.(png|jpg|jpeg|gif|svg|css|woff2?|ico|mp4|pdf)(\?|$)', ep, re.I):
+                continue
+            if ep.startswith('//') and '://' not in ep[2:20]:
+                continue
+            # MIME-type / content-negotiation noise (application/json, text/html …)
+            if re.match(r'(?i)^(application|audio|font|image|message|model|multipart|text|video)/',
+                        ep):
+                continue
+            # pure file-extension or language tags ("*.js", "en-US", "v1.2.3")
+            if re.fullmatch(r'[\w.*-]+', ep) and ('/' not in ep):
+                continue
+            clean[ep] = src
+
+        endpoints = sorted(clean.keys())
+        self.results['linkfinder'] = {
+            "available": True, "js_analyzed": len(js_urls), "external_cli": bool(lf_exe),
+            "ext_found": ext_count, "count": len(endpoints),
+            "endpoints": endpoints[:1500],
+            "sources": {ep: clean[ep] for ep in endpoints[:300]},
+        }
+        for ep in endpoints[:800]:
+            self.results['api_pool'].append({"path": ep, "source": "linkfinder"})
+
+    # ---------------------------------------------------------- FFUF Fuzzing
+    async def ffuf_fuzz(self):
+        """Run ffuf content/API fuzzing (curated API wordlist + discovered paths)."""
+        import shutil as _shutil
+        exe = _shutil.which("ffuf") or _shutil.which("ffuf.exe")
+        if not exe:
+            self.results['ffuf'] = {
+                "available": False, "findings": [],
+                "note": "ffuf binary not found — install: go install github.com/ffuf/ffuf/v2@latest "
+                        "(or: apt install ffuf)",
+            }
+            self.results['errors'].append(
+                "ffuf: binary missing — install from github.com/ffuf/ffuf, then re-run -a ffuf")
+            return
+
+        # wordlist = curated API list + every discovered API path (base dirs too)
+        # + user-supplied --ffuf-wordlist (if any)
+        words = set(FFUF_API_WORDLIST)
+        custom_wl = str(getattr(self, "ffuf_wordlist", "") or "")
+        if custom_wl and os.path.isfile(custom_wl):
+            try:
+                with open(custom_wl, 'r', encoding='utf-8', errors='ignore') as fh:
+                    words.update(
+                        ln.strip() for ln in fh
+                        if ln.strip() and not ln.startswith('#') and ' ' not in ln.strip())
+            except Exception as _e:
+                self.results['errors'].append(f"ffuf: could not read custom wordlist {custom_wl}: {_e}")
+        elif custom_wl:
+            self.results['errors'].append(f"ffuf: custom wordlist not found: {custom_wl}")
+        for e in self.results.get('api_pool', []):
+            p = str(e.get('path', '')).split('?')[0].strip('/')
+            if p and 0 < len(p) < 60 and ' ' not in p:
+                words.add(p)
+            parts = [x for x in str(e.get('path', '')).strip('/').split('/') if x]
+            for i in range(1, min(len(parts), 4)):
+                words.add('/'.join(parts[:i]))
+        words = sorted(w for w in words if w and not w.startswith('http'))
+        wl_file = out_file = None
+        try:
+            fd, wl_file = tempfile.mkstemp(prefix="nullveil_ffuf_", suffix=".txt")
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write("\n".join(words))
+            ofd, out_file = tempfile.mkstemp(prefix="nullveil_ffuf_", suffix=".json")
+            os.close(ofd)
+
+            url = self.base_url.rstrip('/') + "/FUZZ"
+            cmd = [exe, "-u", url, "-w", wl_file,
+                   "-mc", "200,201,202,204,207,301,302,307,401,403,405,500,501,502,503",
+                   "-t", str(min(self.concurrency, 200)),
+                   "-timeout", str(max(self.timeout, 8)),
+                   "-of", "json", "-o", out_file, "-s",
+                   "-H", f"User-Agent: Mozilla/5.0 NULLVEIL-Recon/{__version__}"]
+            for h in getattr(self, "_auth_cmd", []):
+                cmd += ["-H", h]
+            if self.proxy:
+                cmd += ["-x", self.proxy]   # Burp/Caido capture (module 34)
+            if self.deep:
+                cmd += ["-recursion", "-recursion-depth", "2"]
+            wall_limit = 600 if self.deep else 300
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=wall_limit)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                self.results['errors'].append(f"ffuf: stopped after {wall_limit}s wall-time cap")
+
+            try:
+                with open(out_file, encoding='utf-8') as fh:
+                    data = json.load(fh)
+            except Exception:
+                data = {}
+        except Exception as e:
+            self.results['errors'].append(f"ffuf: execution failed: {type(e).__name__} — {e}")
+            self.results['ffuf'] = {"available": False, "findings": [],
+                                    "note": f"execution failed: {type(e).__name__}"}
+            return
+        finally:
+            for f in (wl_file, out_file):
+                if f:
+                    try:
+                        os.unlink(f)
+                    except Exception:
+                        pass
+
+        findings = []
+        for r in (data.get('results') or []):
+            findings.append({
+                "url": r.get('url', ''), "status": r.get('status', 0),
+                "size": r.get('length', 0), "words": r.get('words', 0),
+                "content_type": r.get('content-type', ''),
+                "redirectlocation": r.get('redirectlocation', ''),
+            })
+        self.results['ffuf'] = {
+            "available": True, "binary": exe, "fuzz_url": url,
+            "wordlist_size": len(words), "count": len(findings),
+            "findings": findings[:500],
+        }
+        for f in findings[:500]:
+            self.results['api_pool'].append(
+                {"path": urlparse(f['url']).path or '/', "source": f"ffuf:{f['status']}"})
+
+    # ======================================================== Burp / Caido Bridge (34)
+    async def burp_bridge(self):
+        """Burp Suite / Caido traffic-capture bridge.
+
+        Two-way integration with intercepting proxies:
+          • ``--har FILE`` (repeatable) — import HAR captures exported from
+            Burp (Proxy > HTTP history > Save items > HAR) or Caido (Traffic >
+            Export HAR): every request/response is parsed for endpoints,
+            parameters, cookies, auth material, JS bundles & secrets, then fed
+            into the unified API pool so ffuf/auth/smartfuzz analyze them too.
+          • ``--proxy URL`` — the whole scan (shared httpx client + katana /
+            ffuf / nuclei subprocesses) is routed through your local proxy, so
+            NULLVEIL's traffic lands in Burp/Caido for manual follow-up; this
+            module verifies the proxy is actually reachable and reports status.
+        """
+        proxy = str(getattr(self, "proxy", "") or "")
+        har_files = list(getattr(self, "har_files", []) or [])
+        info = {
+            "proxy": proxy, "proxy_ok": False, "proxy_note": "",
+            "har_files": [], "har_entries": 0,
+            "endpoints": [], "params": [], "cookies": [], "auth_headers": [],
+            "js_files": [], "secrets": [], "findings": [],
+        }
+
+        # ---------- 1) Proxy reachability (Burp :8080 / Caido :8080 typical) ----------
+        if proxy:
+            try:
+                p = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+                host, port = p.hostname or "127.0.0.1", p.port or (443 if p.scheme == "https" else 8080)
+                # Burp & Caido both speak plain HTTP proxying on the listener port
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=4)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                info["proxy_ok"] = True
+                info["proxy_note"] = f"capture active — every request (httpx + katana/ffuf/nuclei) is routed via {host}:{port}"
+                self.results['proxy_findings'].append(
+                    ("INFO", "proxy-active", f"All scan traffic routed through {host}:{port} — inspect it live in Burp/Caido"))
+            except Exception as e:
+                info["proxy_note"] = f"proxy {proxy} unreachable ({type(e).__name__}) — scan continues WITHOUT capture"
+                self.results['errors'].append(
+                    f"proxy: {proxy} unreachable ({type(e).__name__} — {e}) — traffic not captured; "
+                    f"start Burp/Caido listener or drop --proxy")
+
+        # ---------- 2) HAR import (Burp / Caido / browser export) ----------
+        endpoints, params, cookies, auth_headers, js_files = set(), set(), set(), set(), set()
+        secrets = []
+        seen_entries = 0
+
+        def _walk_query(qs):
+            """queryString list or dict-of-lists -> param names."""
+            if isinstance(qs, list):
+                for q in qs:
+                    if isinstance(q, dict) and q.get("name"):
+                        params.add(str(q["name"])[:80])
+                    elif isinstance(q, str) and q:
+                        params.add(q[:80])
+            elif isinstance(qs, dict):
+                for k in qs:
+                    params.add(str(k)[:80])
+
+        for hf in har_files:
+            if not os.path.isfile(hf):
+                self.results['errors'].append(f"har: file not found: {hf}")
+                continue
+            try:
+                with open(hf, encoding='utf-8', errors='ignore') as fh:
+                    har = json.load(fh)
+            except Exception as e:
+                self.results['errors'].append(f"har: could not parse {hf}: {type(e).__name__} — {e}")
+                continue
+            entries = ((har or {}).get('log') or {}).get('entries') or []
+            info["har_files"].append({"file": hf, "entries": len(entries)})
+            seen_entries += len(entries)
+
+            for ent in entries:
+                req = ent.get('request') or {}
+                resp = ent.get('response') or {}
+                url = str(req.get('url') or '')
+                if not url:
+                    continue
+                method = str(req.get('method') or 'GET').upper()
+                pu = urlparse(url)
+                # keep only target (and its subdomains) traffic
+                host = (pu.hostname or '').lower()
+                if host and host != self.domain and not host.endswith('.' + self.domain):
+                    continue
+                path = (pu.path or '/') + (f"?{pu.query}" if pu.query else '')
+                endpoints.add(f"{method} {path}")
+                _walk_query(req.get('queryString'))
+                # POST/PUT body params (form or JSON keys)
+                pd = req.get('postData') or {}
+                if isinstance(pd, dict):
+                    _walk_query(pd.get('params'))
+                    if str(pd.get('mimeType', '')).startswith('application/json') and pd.get('text'):
+                        try:
+                            body = json.loads(str(pd['text'])[:200_000])
+                            if isinstance(body, dict):
+                                for k in body:
+                                    params.add(str(k)[:80])
+                        except Exception:
+                            pass
+                # request headers — auth material names (values never stored) + cookie names
+                for h in (req.get('headers') or []):
+                    hn = str((h or {}).get('name') or '')
+                    if re.search(r'(?i)^(authorization|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token|api-key)$', hn):
+                        auth_headers.add(f"{method} {pu.path or '/'} → {hn}")
+                    elif hn.lower() == 'cookie':
+                        for pair in str((h or {}).get('value') or '').split(';'):
+                            cn = pair.split('=', 1)[0].strip()
+                            if cn:
+                                cookies.add(cn[:80])
+                # request cookies (HAR native field)
+                for c in (req.get('cookies') or []):
+                    cn = str((c or {}).get('name') or '')
+                    if cn:
+                        cookies.add(cn[:80])
+                # response cookies
+                for c in (resp.get('cookies') or []):
+                    cn = str((c or {}).get('name') or '')
+                    if cn:
+                        cookies.add(cn[:80])
+                # JS bundles directly requested
+                if pu.path and re.search(r'\.m?js(\?|$)', pu.path, re.I):
+                    js_files.add(url)
+                # secrets in response bodies
+                rtext = str(((resp.get('content') or {}).get('text') or ''))[:500_000]
+                if rtext:
+                    # JS bundles referenced by captured HTML/JS (script src=)
+                    for sm in re.finditer(r'''<script[^>]+src\s*=\s*["']([^"']+?\.m?js(?:\?[^"']*)?)["']''', rtext, re.I):
+                        js_files.add(urljoin(url, sm.group(1)))
+                    for label, pat in SECRET_PATTERNS:
+                        m = re.search(pat, rtext)
+                        if m:
+                            val = m.group(0)
+                            masked = val[:6] + "…" + val[-3:] if len(val) > 12 else val[:2] + "…"
+                            secrets.append(f"{label} (HAR {method} {pu.path or '/'}): {masked}")
+
+        info["har_entries"] = seen_entries
+        info["endpoints"] = sorted(endpoints)[:3000]
+        info["params"] = sorted(params)[:1500]
+        info["cookies"] = sorted(cookies)[:200]
+        info["auth_headers"] = sorted(auth_headers)[:300]
+        info["js_files"] = sorted(js_files)[:500]
+        info["secrets"] = secrets[:100]
+
+        # feed unified API pool → ffuf / auth / smartfuzz pick these up
+        for ep in sorted(endpoints)[:1500]:
+            path_only = ep.split(' ', 1)[1] if ' ' in ep else ep
+            self.results['api_pool'].append({"path": path_only, "source": "har"})
+
+        if secrets:
+            self.results['proxy_findings'].append(
+                ("HIGH", "har-secrets", f"{len(secrets)} secret(s) visible in captured HAR responses"))
+        if cookies:
+            self.results['proxy_findings'].append(
+                ("INFO", "har-cookies", f"{len(cookies)} cookie(s) seen in capture: {', '.join(sorted(cookies)[:8])}"))
+        if auth_headers:
+            self.results['proxy_findings'].append(
+                ("INFO", "har-auth", f"{len(auth_headers)} authenticated request(s) captured — replayable in Repeater / Caido"))
+
+        self.results['burp'] = info
+        if not proxy and not har_files:
+            self.results['burp']["proxy_note"] = (
+                "no --proxy / --har given — run with --proxy http://127.0.0.1:8080 (Burp) "
+                "to capture traffic, or --har capture.har to import an existing capture")
+
+    # ======================================================== Authenticated Scan (31)
+    @staticmethod
+    def _parse_header_specs(specs):
+        """['Name: Value', ...] -> {'Name': 'Value'} (first ':' splits)."""
+        out = {}
+        for s in specs or []:
+            s = str(s)
+            if ":" in s:
+                name, val = s.split(":", 1)
+                if name.strip():
+                    out[name.strip()] = val.strip()
+        return out
+
+    async def _auth_setup(self):
+        """Inject session headers/cookies + run the automated login engine ONCE
+        at scan start, so every module (shared httpx client + katana/ffuf/nuclei
+        subprocesses) operates inside the same authenticated session."""
+        cfg = getattr(self, "auth_cfg", {}) or {}
+        hdrs = self._parse_header_specs(cfg.get("headers"))
+        for c in (cfg.get("cookies") or []):
+            c = str(c)
+            if "=" in c:
+                k, v = c.split("=", 1)
+                if k.strip():
+                    self.client.cookies.set(k.strip(), v.strip())
+        if cfg.get("token"):
+            hdrs["Authorization"] = f"Bearer {cfg['token']}"
+        if cfg.get("api_key"):
+            hdrs[str(cfg.get("api_key_header") or "X-API-Key")] = str(cfg["api_key"])
+        # static session material applies BEFORE login (some logins need it)
+        for k, v in hdrs.items():
+            self.client.headers[k] = v
+
+        login_summary = None
+        lu = str(cfg.get("login_url") or "")
+        user = str(cfg.get("login_user") or "")
+        pw = str(cfg.get("login_pass") or "")
+        if lu and user:
+            uf = str(cfg.get("user_field") or "username")
+            pf = str(cfg.get("pass_field") or "password")
+            tpl = str(cfg.get("body") or "")
+            try:
+                payload = {uf: user, pf: pw}
+                for kv in (cfg.get("extra") or []):
+                    if "=" in str(kv):
+                        a, b = str(kv).split("=", 1)
+                        if a.strip():
+                            payload[a.strip()] = b.strip()
+                if tpl:
+                    body = (tpl.replace("{user}", user).replace("{pass}", pw)
+                               .replace("{password}", pw))
+                    json.loads(body)                      # validate the template
+                    as_json = True
+                else:
+                    body = json.dumps(payload)
+                    as_json = not cfg.get("form")
+                url = (lu if lu.startswith("http")
+                       else self.base_url.rstrip("/") + "/" + lu.lstrip("/"))
+                if as_json:
+                    resp = await self.client.post(
+                        url, content=body.encode("utf-8"),
+                        headers={"Content-Type": "application/json"})
+                else:
+                    resp = await self.client.post(url, data=payload)
+                captured = []
+                token_val = None
+                try:
+                    jd = resp.json()
+                except Exception:
+                    jd = None
+                if isinstance(jd, dict):
+                    probes = ([str(cfg["token_path"])] if cfg.get("token_path") else []) + [
+                        "access_token", "token", "jwt", "id_token", "data.access_token",
+                        "data.token", "result.access_token", "result.token",
+                        "auth.token", "session.token"]
+                    for pth in probes:
+                        cur = jd
+                        try:
+                            for part in pth.split("."):
+                                cur = cur[part]
+                        except Exception:
+                            continue
+                        if isinstance(cur, str) and 8 < len(cur) < 8192:
+                            token_val = cur
+                            captured.append(f"bearer token (json path: {pth})")
+                            break
+                if token_val:
+                    hdrs["Authorization"] = f"Bearer {token_val}"
+                rh = (resp.headers.get("authorization")
+                      or resp.headers.get("x-auth-token") or "")
+                if rh and not token_val:
+                    hdrs["Authorization"] = rh
+                    captured.append("auth response header")
+                try:
+                    n_ck = len(self.client.cookies.jar)
+                except Exception:
+                    n_ck = 0
+                if n_ck:
+                    captured.append(f"{n_ck} session cookie(s)")
+                login_summary = {"url": url, "status": resp.status_code,
+                                 "captured": captured or ["none"]}
+                if resp.status_code >= 400:
+                    self.results['errors'].append(
+                        f"auth: login returned HTTP {resp.status_code} at {url}")
+            except Exception as e:
+                login_summary = {"url": lu, "status": 0,
+                                 "error": f"{type(e).__name__} — {e}"}
+                self.results['errors'].append(
+                    f"auth: automated login failed: {login_summary['error']}")
+
+        # final headers on the shared client + header list for subprocess tools
+        for k, v in hdrs.items():
+            self.client.headers[k] = v
+        self._auth_cmd = [f"{k}: {v}" for k, v in hdrs.items()]
+        try:
+            ck = "; ".join(f"{c.name}={c.value}" for c in self.client.cookies.jar)
+            if ck and not any(x.lower().startswith("cookie:") for x in self._auth_cmd):
+                self._auth_cmd.append(f"Cookie: {ck}")
+        except Exception:
+            pass
+
+        # ---- multi-role profiles:
+        #   --role 'admin=Authorization: Bearer eyJ...'   -> header override
+        #   --role 'user=Cookie: sid=abc'                 -> cookie set
+        #   --role 'member=session=xyz'                   -> cookie shorthand
+        #   --role 'qa=abc123def456'                      -> bare token -> Bearer
+        roles = {}
+        for r in (cfg.get("roles") or []):
+            if "=" not in str(r):
+                continue
+            name, spec = str(r).split("=", 1)
+            name, spec = name.strip(), spec.strip()
+            if not name or not spec:
+                continue
+            rh_, rc = {}, {}
+            m = re.match(r"^([\w-]{1,60})\s*:\s*(.+)$", spec, re.S)
+            if m and m.group(1).lower() == "cookie":
+                for part in m.group(2).split(";"):
+                    if "=" in part:
+                        a, b = part.split("=", 1)
+                        if a.strip():
+                            rc[a.strip()] = b.strip()
+            elif m:
+                rh_[m.group(1)] = m.group(2).strip()
+            elif "=" in spec:
+                a, b = spec.split("=", 1)
+                if a.strip():
+                    rc[a.strip()] = b.strip()
+            else:
+                rh_["Authorization"] = f"Bearer {spec}"
+            roles[name] = {"headers": rh_, "cookies": rc}
+        self.roles = roles
+
+        try:
+            ck_names = sorted({c.name for c in self.client.cookies.jar})
+        except Exception:
+            ck_names = []
+        self.results['auth_setup'] = {
+            "active": bool(hdrs or ck_names or roles),
+            "headers": sorted(hdrs.keys()),
+            "cookies": ck_names,
+            "roles": sorted(roles.keys()),
+            "login": login_summary,
+        }
+        if self.results['auth_setup']["active"]:
+            console.print(f"      [bold green]✓ Auth active[/] — "
+                          f"headers: {', '.join(sorted(hdrs)) or '-'}  ·  "
+                          f"cookies: {', '.join(ck_names) or '-'}  ·  "
+                          f"roles: {', '.join(sorted(roles)) or '-'}")
+
+    async def auth_scan(self):
+        """Probe every discovered endpoint WITH & WITHOUT the session to expose
+        auth-gated APIs, then repeat per --role profile to find role-hidden ones."""
+        auth_info = self.results.get('auth_setup') or {}
+        eps, seen = [], set()
+        for e in (self.results.get('api_pool') or []):
+            p = str((e or {}).get('path', '')).split('#')[0]
+            if p and p not in seen:
+                seen.add(p)
+                eps.append(p)
+        for p in (self.results.get('api_endpoints') or []):
+            path = str(p.get('path', '') if isinstance(p, dict) else p).split('#')[0]
+            if path and path not in seen:
+                seen.add(path)
+                eps.append(path)
+        for p in (self.results.get('api_endpoints_found') or []):
+            path = str(p).split('#')[0]
+            if path and path not in seen:
+                seen.add(path)
+                eps.append(path)
+        limit = 60 if self.deep else 30
+        eps = [e for e in eps if e.startswith('/') or str(e).startswith('http')][:limit]
+
+        if not auth_info.get("active"):
+            self.results['authscan'] = {
+                "available": False, "endpoints_probed": 0, "auth_gated": 0,
+                "status_changed": 0, "session_verified": False, "findings": [],
+                "roles": [], "role_matrix": {}, "role_gated": [],
+                "note": "No session configured — pass --auth-token / --auth-header / "
+                        "--auth-cookie, or --login-url + --login-user + --login-pass "
+                        "for the automated login engine (then: -a auth)",
+            }
+            return
+        if not eps:
+            admin_audit = await self._auth_admin_audit([], None)
+            self.results['authscan'] = {
+                "available": True, "endpoints_probed": 0, "auth_gated": 0,
+                "status_changed": 0, "session_verified": False, "findings": [],
+                "roles": sorted(self.roles), "role_matrix": {}, "role_gated": [],
+                "note": "Session active but no discovered endpoints to diff — add "
+                        "discovery modules: -a api,katana,linkfinder,ffuf,auth",
+                "admin_audit": admin_audit,
+            }
+            return
+
+        def _abs(p):
+            p = str(p)
+            return (p if p.startswith('http')
+                    else self.base_url.rstrip('/') + (p if p.startswith('/') else '/' + p))
+
+        bare = httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, verify=False,
+                                 headers={"User-Agent": self.client.headers.get(
+                                     "User-Agent", f"NULLVEIL-Recon/{__version__}")})
+        diffs, role_matrix, gated = [], {}, []
+
+        async def _probe(cli, path, headers=None, cookies=None):
+            try:
+                async with self.sem:
+                    r = await cli.get(_abs(path), headers=headers or {}, cookies=cookies)
+                return r.status_code, len(r.content)
+            except Exception:
+                return None, None
+
+        try:
+            for p in eps:
+                ns, nl = await _probe(bare, p)
+                as_, al_ = await _probe(self.client, p)
+                if ns is None and as_ is None:
+                    continue
+                auth_gated = (ns in (401, 403, 404)
+                              and as_ in (200, 201, 202, 204, 301, 302))
+                diffs.append({"path": p, "status_noauth": ns, "status_auth": as_,
+                              "size_noauth": nl, "size_auth": al_,
+                              "auth_gated": auth_gated})
+                if auth_gated:
+                    self.results['api_pool'].append({"path": p, "source": "auth:gated"})
+                if self.roles:
+                    codes = {}
+                    for rname, rcfg in self.roles.items():
+                        rs, _ = await _probe(self.client, p,
+                                             headers=rcfg.get("headers") or {},
+                                             cookies=(rcfg.get("cookies") or None))
+                        codes[rname] = rs
+                    role_matrix[p] = codes
+                    live = {k: v for k, v in codes.items() if v is not None}
+                    if len(live) >= 2 and 200 in live.values():
+                        allowed = sorted(k for k, v in live.items() if v == 200)
+                        hidden = [{"role": k, "status": v}
+                                  for k, v in sorted(live.items()) if v != 200]
+                        if hidden:
+                            gated.append({"path": p, "visible_to": allowed,
+                                          "hidden_from": hidden})
+        finally:
+            try:
+                await bare.aclose()
+            except Exception:
+                pass
+
+        changed = [d for d in diffs if d["status_noauth"] != d["status_auth"]]
+        gated_paths = [d for d in diffs if d["auth_gated"]]
+        for g in gated[:100]:
+            self.results['api_pool'].append({"path": g["path"], "source": "auth:role-hidden"})
+
+        # ---- backend / admin API audit with the injected session ----------
+        admin_audit = await self._auth_admin_audit(eps, bare)
+
+        self.results['authscan'] = {
+            "available": True, "endpoints_probed": len(eps),
+            "auth_gated": len(gated_paths), "status_changed": len(changed),
+            "session_verified": bool(gated_paths or changed),
+            "findings": changed[:200], "roles": sorted(self.roles.keys()),
+            "role_matrix": role_matrix, "role_gated": gated[:100],
+            "admin_audit": admin_audit,
+        }
+
+    # ------------------------------------------------- Backend / admin API audit
+    ADMIN_BACKEND_PATHS = [
+        "/admin", "/admin/", "/admin/api", "/api/admin", "/api/v1/admin",
+        "/api/v2/admin", "/api/internal", "/internal", "/internal/api",
+        "/api/private", "/private", "/api/manage", "/manage", "/management",
+        "/api/console", "/console", "/api/backoffice", "/backoffice",
+        "/api/staff", "/staff", "/api/superuser", "/superadmin",
+        "/api/debug", "/debug", "/api/config", "/api/settings",
+        "/api/users", "/api/v1/users", "/api/accounts", "/api/roles",
+        "/api/permissions", "/api/metrics", "/api/health", "/api/status",
+        "/api/export", "/api/import", "/api/logs", "/api/audit",
+        "/api/tokens", "/api/keys", "/api/webhooks", "/api/jobs",
+        "/api/queue", "/api/tasks", "/api/system", "/api/tenant",
+    ]
+    ADMIN_CTYPE_OK = re.compile(r'(?i)(json|xml|plain|javascript)')
+    ADMIN_BODY_SIG = re.compile(
+        r'(?i)("?(role|is_admin|is_superuser|permissions|scope|privilege|'
+        r'access_token|refresh_token|api_key|secret|password_hash|ssn|credit_card)"?\s*:|'
+        r'<role>|<permissions>|admin|superuser)')
+
+    async def _auth_admin_audit(self, eps, bare):
+        """With the authenticated session, probe admin/backend endpoints and flag
+        those reachable *only* with the session (privilege surface) plus
+        authenticated data-exposure signals (sensitive keys, verbose errors)."""
+        found, findings = [], []
+        # a no-auth client is needed for the "session-only" comparison
+        own_bare = False
+        if bare is None:
+            bare = httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, verify=False,
+                                     headers={"User-Agent": self.client.headers.get(
+                                         "User-Agent", f"NULLVEIL-Recon/{__version__}")})
+            own_bare = True
+        try:
+            return await self._auth_admin_audit_run(eps, bare, found, findings)
+        finally:
+            if own_bare:
+                try:
+                    await bare.aclose()
+                except Exception:
+                    pass
+
+    async def _auth_admin_audit_run(self, eps, bare, found, findings):
+        # candidate admin paths + any discovered path that looks privileged
+        candidates, seen = [], set()
+        for p in self.ADMIN_BACKEND_PATHS:
+            if p not in seen:
+                seen.add(p)
+                candidates.append(p)
+        for p in eps:
+            lp = str(p).lower()
+            if any(k in lp for k in ('admin', 'internal', 'backoffice', 'manage',
+                                     'superuser', 'staff', 'debug', 'private')):
+                if p not in seen:
+                    seen.add(p)
+                    candidates.append(p)
+        candidates = candidates[:(80 if self.deep else 40)]
+
+        def _abs(p):
+            p = str(p)
+            return (p if p.startswith('http')
+                    else self.base_url.rstrip('/') + (p if p.startswith('/') else '/' + p))
+
+        for p in candidates:
+            try:
+                async with self.sem:
+                    authed = await self.client.get(_abs(p))
+                    bare_r = await bare.get(_abs(p))
+            except Exception:
+                continue
+            if authed.status_code not in (200, 201, 202, 204, 207, 300, 301, 302, 401, 403):
+                continue
+            ctype = (authed.headers.get('content-type') or '').lower()
+            body = (authed.text or '')[:60_000]
+            sensitive = bool(re.search(
+                r'(?i)"?(password_hash|api_key|secret|ssn|credit_card|access_token|'
+                r'private_key|refresh_token)"?\s*:', body))
+            verbose = bool(re.search(
+                r'(?i)(traceback|stack trace|sqlstate|syntax error|at\s+\w+\.\w+\('
+                r'|exception in thread|django\.|org\.springframework)', body))
+            data_sig = bool(self.ADMIN_BODY_SIG.search(body)) and bool(self.ADMIN_CTYPE_OK.search(ctype))
+            session_only = (bare_r.status_code in (401, 403, 404)
+                            and authed.status_code in (200, 201, 202, 204))
+            reachable = authed.status_code in (200, 201, 202, 204)
+            if not (session_only or (reachable and (sensitive or verbose))):
+                continue
+
+            sev = "HIGH" if (session_only and reachable) else "MEDIUM"
+            detail_parts = []
+            if session_only:
+                detail_parts.append(f"reachable only WITH session (no-auth→{bare_r.status_code}, auth→{authed.status_code})")
+            if sensitive:
+                sev = "CRITICAL"
+                detail_parts.append("sensitive fields (password_hash/api_key/secret/token) in authenticated response")
+            if verbose:
+                detail_parts.append("verbose error / stack trace leaked")
+            if data_sig and not detail_parts:
+                detail_parts.append("administration-like data structure exposed to this session")
+            rec = {
+                "path": p, "status": authed.status_code,
+                "noauth_status": bare_r.status_code, "session_only": session_only,
+                "sensitive_keys": sensitive, "verbose_error": verbose, "size": len(authed.content),
+            }
+            found.append(rec)
+            findings.append((sev, "admin-api", f"{p}: " + "; ".join(detail_parts)))
+            if reachable:
+                self.results['api_pool'].append({"path": p, "source": "auth:admin"})
+
+        result = {
+            "probed": len(candidates), "reachable": len(found),
+            "session_only": len([f for f in found if f["session_only"]]),
+            "sensitive": len([f for f in found if f["sensitive_keys"]]),
+            "endpoints": found[:150],
+            "findings": findings[:150],
+        }
+        # surface admin findings as report-wide findings too
+        self.results.setdefault('admin_findings', []).extend(findings)
+        return result
+
+    # ======================================================== Finding helpers
+    def _collect_findings(self):
+        """Flatten every finding across all modules into one normalised list.
+
+        Returns ``[(severity, check, detail, source_module), ...]`` sorted by
+        severity (CRITICAL first). Used by the patch / PoC / notify / executive
+        modules so they all reason over the same evidence set."""
+        F = []
+        r = self.results
+
+        def add(sev, chk, det, src):
+            det = str(det or "")
+            # keep to a single line and a sane length for every consumer
+            det = re.sub(r"\s+", " ", det).strip()[:400]
+            F.append((str(sev or "INFO").upper(), str(chk or ""), det, src))
+
+        # generic (sev, check, detail) triples used across modules
+        # (email_findings uses (sev, message) 2-tuples, so handle both shapes)
+        for key, src in (("email_findings", "email"), ("api_audit_findings", "audit"),
+                         ("ext_findings", "ext"), ("tls_findings", "tls"),
+                         ("admin_findings", "auth"), ("proxy_findings", "burp"),
+                         ("diff_findings", "diff")):
+            for t in (r.get(key) or []):
+                if isinstance(t, (list, tuple)) and len(t) >= 3:
+                    add(t[0], t[1], t[2], src)
+                elif isinstance(t, (list, tuple)) and len(t) == 2:
+                    add(t[0], src, t[1], src)
+        # dict-grouped findings {severity, check/id, detail}
+        for key, src in (("nuclei", "nuclei"), ("supply", "supply"), ("anomaly", "anomaly"),
+                         ("intel", "intel"), ("breach", "breach"), ("correlation", "correlate"),
+                         ("compliance", "comp")):
+            blob = r.get(key) or {}
+            for f in (blob.get("findings") or []) if isinstance(blob, dict) else []:
+                if isinstance(f, dict):
+                    chk = f.get("id") or f.get("check") or f.get("title") or src
+                    det = f.get("detail") or f.get("message") or f.get("desc") or ""
+                    add(f.get("severity"), chk, det, src)
+                elif isinstance(f, (list, tuple)) and len(f) >= 3:
+                    add(f[0], f[1], f[2], src)
+                elif isinstance(f, (list, tuple)) and len(f) == 2:
+                    add(f[0], src, f[1], src)
+        # cve / ffuf / katana style
+        for f in (r.get("cve_findings") or []):
+            if isinstance(f, (list, tuple)) and len(f) >= 3:
+                add(f[0], f[1], f[2], "cve")
+        for x in ((r.get("ffuf") or {}).get("findings") or []):
+            if isinstance(x, dict):
+                st = str(x.get("status", ""))
+                if st in ("200", "401", "403", "500"):
+                    sev = "HIGH" if st == "200" else "INFO"
+                    add(sev, "ffuf-path", f"{st} {x.get('url', '')} (size {x.get('size', '?')})", "ffuf")
+        for x in ((r.get("katana") or {}).get("endpoints") or [])[:0]:
+            pass
+        for s, c, d in (r.get("graph", {}) or {}).get("chains", [])[:0]:
+            pass
+        F.sort(key=lambda t: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2,
+                              "LOW": 3, "INFO": 4}.get(t[0], 5))
+        return F
+
+    def _dedupe_findings(self, findings):
+        """Smart deduplication — collapse redundant/near-identical findings.
+
+        * exact (severity, check, normalised detail) duplicates removed
+        * repeated INFO findings with the same check collapsed to one entry
+          with a ``(×N)`` count
+        * detail normalised (paths/numbers masked) so ``/a/1`` & ``/a/2`` dedupe
+        """
+        if getattr(self, "no_dedupe", False):
+            return findings
+        def norm(d):
+            d = re.sub(r"\b\d{1,5}\b", "N", d.lower())
+            d = re.sub(r"(https?://[^\s)]+)", lambda m: m.group(1).split('?')[0], d)
+            d = re.sub(r"\s+", " ", d).strip()
+            return d[:200]
+
+        seen = {}
+        order = []
+        norm_findings = []
+        for f in findings:
+            # accept both 4-tuples (sev, check, detail, source) and 3-tuples
+            if isinstance(f, (list, tuple)) and len(f) >= 4:
+                norm_findings.append((f[0], f[1], f[2], f[3]))
+            elif isinstance(f, (list, tuple)) and len(f) == 3:
+                norm_findings.append((f[0], f[1], f[2], ""))
+        for sev, chk, det, src in norm_findings:
+            key = (sev, chk.lower().strip(), norm(det))
+            if key in seen:
+                seen[key][1] += 1
+                continue
+            seen[key] = [list((sev, chk, det, src)), 1]
+            order.append(key)
+        out = []
+        removed = 0
+        for key in order:
+            (sev, chk, det, src), count = seen[key]
+            if count > 1:
+                removed += count - 1
+                out.append((sev, chk, f"{det}  (×{count})", src))
+            else:
+                out.append((sev, chk, det, src))
+        self.results['dedupe_stats'] = {"before": len(norm_findings), "after": len(out),
+                                        "removed": removed}
+        return out
+
+    # ======================================================== AI Patch / Remediation (35)
+    PATCH_RULES = [
+        # (matcher regex against check/detail, title, remediation markdown)
+        (r"(?i)(hsts|strict-transport|missing security header|security header)",
+         "Enforce HTTP security headers at the edge",
+         "Add the header at your reverse proxy so every route inherits it:\n\n"
+         "```nginx\n# nginx — security headers\nadd_header Strict-Transport-Security \"max-age=63072000; includeSubDomains; preload\" always;\n"
+         "add_header X-Content-Type-Options \"nosniff\" always;\n"
+         "add_header X-Frame-Options \"SAMEORIGIN\" always;\n"
+         "add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n"
+         "add_header Content-Security-Policy \"default-src 'self'; object-src 'none'; frame-ancestors 'self'\" always;\n```\n\n"
+         "Cloudflare: **SSL/TLS → Edge Certificates → HSTS** + **Rules → Transform Rules** to inject headers."),
+        (r"(?i)(csp|content-security-polic|xss)",
+         "Deploy a Content-Security-Policy",
+         "Start in report-only, then enforce:\n\n"
+         "```\nContent-Security-Policy-Report-Only: default-src 'self'; script-src 'self'; report-uri /csp-report\n```\n"
+         "Once reports are clean, drop `-Report-Only` and tighten `script-src` (avoid `unsafe-inline`)."),
+        (r"(?i)(cors|access-control-allow-origin)",
+         "Restrict CORS to trusted origins",
+         "```nginx\n# allow-list instead of reflecting arbitrary Origin\nlocation /api/ {\n"
+         "  if ($http_origin ~* \"^https://(app|admin)\\.example\\.com$\") { add_header Access-Control-Allow-Origin $http_origin always; }\n"
+         "  add_header Access-Control-Allow-Credentials \"true\" always;\n  add_header Vary \"Origin\" always;\n}\n```\n"
+         "Never combine `Access-Control-Allow-Origin: *` with credentials."),
+        (r"(?i)(verbose error|stack trace|traceback|debug|info disclosure|phpinfo|actuator)",
+         "Disable debug/verbose error output in production",
+         "* App: run with `DEBUG=false`, disable framework debug toolbars, set a generic 500 page.\n"
+         "* nginx: `fastcgi_intercept_errors on;` + a custom `error_page 500 502 503 504 /500.html;`\n"
+         "* Spring: `management.endpoints.web.exposure.include=health` (hide `env`, `heapdump`, `beans`).\n"
+         "* PHP: `display_errors=Off`, `expose_php=Off`, remove `phpinfo()`."),
+        (r"(?i)(dmarc|spf|dkim|email security|mail auth|mta-sts|bimi|mx\b)",
+         "Publish complete email authentication (SPF / DKIM / DMARC)",
+         "Publish the DNS records (replace the domain/selector with your own):\n\n"
+         "```\n; SPF — authorize only your real senders (keep under 10 DNS lookups)\nyourdomain.com.        TXT  \"v=spf1 mx include:_spf.google.com ~all\"\n\n"
+         "; DMARC — start at p=none to collect reports, then move to quarantine/reject\n_dmarc.yourdomain.com.  TXT  \"v=DMARC1; p=reject; rua=mailto:dmarc@yourdomain.com; ruf=mailto:dmarc@yourdomain.com; fo=1; pct=100\"\n\n"
+         "; DKIM — public key published by your mail provider at <selector>._domainkey\ndefault._domainkey.yourdomain.com.  TXT  \"v=DKIM1; k=rsa; p=MIGfMA0GCSq...\"\n\n"
+         "; MTA-STS / TLS-RPT (optional but recommended)\n_mta-sts.yourdomain.com.  TXT  \"v=STSv1; id=20260101T000000\"\n_smtp._tls.yourdomain.com. TXT \"v=TLSRPTv1; rua=mailto:tlsrpt@yourdomain.com\"\n```\n"
+         "* Run with `p=none` + `rua` for a week, read the aggregate reports, then tighten to `p=quarantine` → `p=reject`.\n"
+         "* Add `include:` only for providers that actually send mail; one bad `include` can blow the 10-lookup SPF limit."),
+        (r"(?i)(secret|api[_ -]?key|token|credential|leak|\.env|private key)",
+         "Rotate leaked secrets and remove them from artefacts",
+         "1. **Rotate now** — treat any credential exposed to an unauthenticated client as compromised.\n"
+         "2. Move secrets to a secret manager (Vault / AWS Secrets Manager / SSM), never in JS or repos.\n"
+         "3. Purge from source history (`git filter-repo`) and invalidate old tokens.\n"
+         "4. Add a pre-commit secret scanner + CI secret detection."),
+        (r"(?i)(swagger|openapi|api doc|postman)",
+         "Restrict public API documentation & schema",
+         "```nginx\nlocation ~* ^/(swagger|openapi|api-docs) {\n  allow 10.0.0.0/8;\n  deny all;\n}\n```\n"
+         "Keep the spec internal (build-time artefact), not served to the public internet."),
+        (r"(?i)(admin|backoffice|management|internal api|session-only)",
+         "Lock down admin/backend surfaces",
+         "* Enforce authn+authz **server-side** on every admin route (not just hidden UI).\n"
+         "```nginx\nlocation ^~ /admin/ { allow 10.0.0.0/8; deny all; }\n```\n"
+         "* Add MFA + IP allow-listing, and log all admin access.\n"
+         "* Cloudflare: **WAF → Custom rules** — block `/admin*` unless from a trusted ASN/IP."),
+        (r"(?i)(ssrf|metadata|169\.254|internal pivot|bypass)",
+         "Harden against SSRF / internal pivot",
+         "* egress allow-list only — block RFC1918 + `169.254.169.254` at the network layer.\n"
+         "* Never trust `X-Forwarded-For` / `X-Original-URL` from clients; strip them at the proxy.\n"
+         "```nginx\nproxy_set_header X-Forwarded-For $remote_addr;  # not $proxy_add_x_forwarded_for for untrusted edges\n```\n"
+         "* IMDSv2 only on AWS; validate all user-supplied URLs against an allow-list."),
+        (r"(?i)(tls|ssl|cipher|weak|expired|self-signed|protocol)",
+         "Modernise TLS configuration",
+         "```nginx\nssl_protocols TLSv1.2 TLSv1.3;\nssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256';\n"
+         "ssl_prefer_server_ciphers off;\nssl_session_tickets off;\n```\n"
+         "* Renew/automate certs (ACME). Cloudflare: **SSL/TLS → Minimum TLS 1.2**, enable **Always Use HTTPS**."),
+        (r"(?i)(rate limit|brute|no throttl|429)",
+         "Add rate-limiting / anti-automation",
+         "```nginx\nlimit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;\nlocation /api/ { limit_req zone=api burst=20 nodelay; }\n```\n"
+         "* Cloudflare: **Security → WAF → Rate limiting rules** per path.\n* Add generic error messages + account lockout/CAPTCHA on auth."),
+        (r"(?i)(waf|cdn|cloudflare)",
+         "Front the edge with a WAF/CDN",
+         "Put the origin behind Cloudflare/AWS WAF: enable managed + OWASP rule sets, "
+         "bot management, and hide the origin IP. Lock the origin firewall to the WAF IP ranges only."),
+        (r"(?i)(takeover|dangling|cname|subdomain)",
+         "Prevent subdomain takeover",
+         "Remove or claim every dangling DNS record; audit CNAMEs pointing at deprovisioned "
+         "cloud resources (S3, Heroku, GitHub Pages, Azure). Automate a periodic takeover scan in CI."),
+        (r"(?i)(cookie|session|jwt|auth)",
+         "Harden session / cookie handling",
+         "* Cookies: `Secure; HttpOnly; SameSite=Strict` (or `Lax`).\n"
+         "* Sessions: short TTL, rotate on login/privilege change, server-side revocation.\n"
+         "* JWTs: verify `alg`/`iss`/`aud`, reject `none`, keep secrets out of the token, use short expiry + refresh rotation."),
+        (r"(?i)(directory listing|index of|autoindex|\.git|backup|exposed file)",
+         "Disable directory listing & remove exposed artefacts",
+         "```nginx\nautoindex off;\nlocation ~ /\\.(git|env|svn) { deny all; }\nlocation ~* \\.(bak|old|sql|zip|tar\\.gz)$ { deny all; }\n```\n"
+         "* Remove backups/temp files from the web root; deploy from CI, not by hand."),
+        (r"(?i)(pathtraversal|path traversal|directory traversal|\.\.)",
+         "Normalise and validate paths server-side",
+         "Reject input containing traversal sequences, resolve canonical paths, and never concatenate "
+         "user input into filesystem paths. Serve user files via IDs mapped to a safe root."),
+        (r"(?i)(clickjack|frame)",
+         "Prevent clickjacking",
+         "```nginx\nadd_header Content-Security-Policy \"frame-ancestors 'self'\" always;\nadd_header X-Frame-Options \"SAMEORIGIN\" always;\n```"),
+    ]
+
+    def _remediation_for(self, sev, check, detail):
+        """Return (title, markdown) remediation guidance for a finding."""
+        hay = f"{check} {detail}"
+        for pat, title, fix in self.PATCH_RULES:
+            if re.search(pat, hay):
+                return title, fix
+        # severity-aware generic fallback
+        if sev in ("CRITICAL", "HIGH"):
+            return ("Harden the affected component",
+                    "* Restrict access to the affected endpoint (auth/IP/allow-list).\n"
+                    "* Remove the exposed data/behaviour or disable the feature until fixed.\n"
+                    "* Re-test with the same read-only request after the change.")
+        return ("Review and tighten configuration",
+                "* Confirm whether the behaviour is intended; if not, restrict it.\n"
+                "* Add compensating controls (WAF/rate-limit/headers) and re-test.")
+
+    async def patch_generator(self):
+        """Module 35 — AI-style (template + heuristic) patch & remediation generator.
+
+        Read-only: it only *reads* findings collected by other modules and emits
+        actionable, copy-paste fixes (nginx / Cloudflare WAF / code-level).
+        No network traffic, no AI API key required."""
+        findings = self._dedupe_findings(self._collect_findings())
+        patches, seen = [], set()
+        for sev, check, det, src in findings:
+            key = (check.lower(), self._remediation_for(sev, check, det)[0])
+            if key in seen:
+                continue
+            seen.add(key)
+            title, fix = self._remediation_for(sev, check, det)
+            patches.append({
+                "severity": sev, "check": check, "source": src,
+                "finding": det, "title": title, "remediation": fix,
+                "priority": {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3,
+                             "LOW": 4, "INFO": 5}.get(sev, 5),
+            })
+        patches.sort(key=lambda p: p["priority"])
+        self.results['patch'] = {
+            "generated": len(patches), "patches": patches[:200],
+            "categories": sorted({p["title"] for p in patches}),
+            "note": "Template/heuristic remediation (offline) — adapt to your stack and re-test read-only.",
+        }
+
+    # ======================================================== Read-Only PoC (36)
+    def _poc_commands_for(self, sev, check, detail):
+        """Build strictly non-destructive verification commands for a finding."""
+        base = self.base_url.rstrip('/')
+        host = self.domain
+        c = f"{check} {detail}".lower()
+        cmds = []
+        if re.search(r"(?i)header|hsts|csp|cors|security", c):
+            cmds.append({"desc": "Inspect response headers (read-only)",
+                         "cmd": f"curl -sSI {base}/ | grep -iE 'strict-transport|content-security|x-frame|access-control'"})
+        if re.search(r"(?i)cors|access-control-allow-origin", c):
+            # echo-probe: server only reflects the Origin header — no request is altered, nothing is written
+            cmds.append({"desc": "Check whether CORS reflects an arbitrary Origin (read-only echo probe)",
+                         "cmd": f"curl -sSI -H 'Origin: https://evil.example' {base}/ "
+                                f"| grep -i 'access-control-allow-origin'"})
+            cmds.append({"desc": "Confirm preflight behaviour (OPTIONS, no body)",
+                         "cmd": f"curl -sS -o /dev/null -D - -X OPTIONS "
+                                f"-H 'Origin: https://evil.example' -H 'Access-Control-Request-Method: GET' {base}/ "
+                                f"| grep -iE 'access-control|HTTP/'"})
+        if re.search(r"(?i)actuator|heapdump|spring", c):
+            cmds.append({"desc": "HEAD the Spring actuator endpoints (presence only — no download)",
+                         "cmd": f"for ep in heapdump env beans mappings; do "
+                                f"curl -sSI {base}/actuator/$ep | head -1; done"})
+        if re.search(r"(?i)\bport\b|open port|listening", c):
+            m = re.search(r"(?:port[:\s#]*)(\d{1,5})", detail, re.I) or re.search(r"\b(\d{2,5})\b", detail)
+            if m:
+                cmds.append({"desc": f"Confirm TCP port {m.group(1)} is open (connect only)",
+                             "cmd": f"curl -sS --connect-timeout 3 telnet://{host}:{m.group(1)} </dev/null || "
+                                    f"nc -z -w3 {host} {m.group(1)} && echo open"})
+        if re.search(r"(?i)path|admin|swagger|api|endpoint|directory|expos", c):
+            m = re.search(r"(/[A-Za-z0-9_\-./?=&%]+)", detail)
+            p = m.group(1) if m else "/"
+            cmds.append({"desc": f"HEAD the endpoint (no body, no side-effects)",
+                         "cmd": f"curl -sSI {base}{p}"})
+            cmds.append({"desc": "Fetch status only (GET, headers suppressed)",
+                         "cmd": f"curl -sS -o /dev/null -w '%{{http_code}}\\n' {base}{p}"})
+        if re.search(r"(?i)subdomain|dns|cname|takeover|mx|spf|dmarc", c):
+            m = re.search(r"([A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)+)", detail)
+            sub = m.group(1) if m else host
+            cmds.append({"desc": f"Resolve A/CNAME for {sub}",
+                         "cmd": f"dig +short A {sub}; dig +short CNAME {sub}"})
+            cmds.append({"desc": "Check SPF/DMARC posture",
+                         "cmd": f"dig +short TXT {host} | grep -i spf; dig +short TXT _dmarc.{host}"})
+        if re.search(r"(?i)tls|ssl|cipher|cert|expired", c):
+            cmds.append({"desc": "Read the certificate & negotiated protocol (no handshake data sent)",
+                         "cmd": f"echo | openssl s_client -connect {host}:443 -servername {host} 2>/dev/null "
+                                f"| openssl x509 -noout -subject -issuer -dates"})
+        if re.search(r"(?i)robots|sitemap", c):
+            cmds.append({"desc": "Fetch robots/sitemap policy",
+                         "cmd": f"curl -sS {base}/robots.txt; curl -sS {base}/sitemap.xml | head -c 2000"})
+        if not cmds:
+            cmds.append({"desc": "Neutral connectivity + status probe",
+                         "cmd": f"curl -sSI {base}/"})
+        return cmds[:5]
+
+    async def poc_generator(self):
+        """Module 36 — read-only PoC verification generator.
+
+        Emits benign, reproducible commands (curl/dig/openssl/nc) that *show a
+        finding exists* without sending any exploit payload or mutating state."""
+        findings = self._dedupe_findings(self._collect_findings())
+        pocs = []
+        for sev, check, det, src in findings:
+            if sev not in ("CRITICAL", "HIGH", "MEDIUM"):
+                continue
+            pocs.append({
+                "severity": sev, "check": check, "source": src, "finding": det,
+                "commands": self._poc_commands_for(sev, check, det),
+            })
+        self.results['poc'] = {
+            "generated": len(pocs), "pocs": pocs[:200],
+            "policy": "Read-only verification only — HEAD/GET/OPTIONS/dig/openssl; no payloads, no writes, no brute-force.",
+        }
+
+    # ======================================================== Webhook Notify (37)
+    def _notification_payload(self, report):
+        s = report.get("summary", {})
+        diff = report.get("scan_diff", {}) or {}
+        lines = [
+            f"*NULLVEIL Recon* — `{report.get('target', '')}`",
+            f"version {report.get('version', '')} · mode {report.get('mode', '')} · {report.get('duration_s', 0)}s",
+            "",
+            f"• Subdomains: {s.get('subdomains', 0)}  • Open ports: {s.get('open_ports', 0)}",
+            f"• Secrets: {s.get('secrets', 0)}  • API endpoints: {s.get('api_endpoints', 0)}",
+            f"• CVE issues: {s.get('cve_issues', 0)}  • Admin-API: {s.get('admin_api_findings', 0)}",
+            f"• New since last scan: {s.get('diff_new_assets', 0)} (score {s.get('diff_score', 0)}/100)",
+        ]
+        if diff.get("available"):
+            lines.append(f"• Change verdict: {diff.get('verdict', '')}")
+        return "\n".join(lines)
+
+    async def webhook_notify(self):
+        """Module 37 — push a concise scan summary to Slack/Telegram/Discord/Teams.
+
+        Uses any available HTTP client (httpx already a dependency). If no
+        webhook target is configured the module reports gracefully. Secrets are
+        never included — only counts and the target name."""
+        cfg = dict(getattr(self, "webhooks", {}) or {})
+        targets = {k: v for k, v in cfg.items() if v}
+        out = {"channels": sorted(targets.keys()), "sent": [], "failed": [], "note": ""}
+        if not targets:
+            out["note"] = ("no webhook configured — pass --webhook-slack / --webhook-telegram "
+                           "(TOKEN:CHATID) / --webhook-discord / --webhook-teams")
+            self.results['notify'] = out
+            return
+
+        text = self._notification_payload(self.export_dict())
+        async def _send(name, url, payload):
+            try:
+                async with self.sem:
+                    r = await self.client.post(url, json=payload, timeout=10,
+                                               follow_redirects=True)
+                if 200 <= r.status_code < 300:
+                    out["sent"].append({"channel": name, "status": r.status_code})
+                else:
+                    out["failed"].append({"channel": name, "status": r.status_code,
+                                          "body": (r.text or "")[:200]})
+            except Exception as e:
+                out["failed"].append({"channel": name, "error": f"{type(e).__name__}: {e}"})
+
+        for name, url in targets.items():
+            if name == "slack":
+                await _send(name, url, {"text": text})
+            elif name == "discord":
+                await _send(name, url, {"content": text[:1900]})
+            elif name == "teams":
+                await _send(name, url, {"text": text})
+            elif name == "telegram":
+                # url format: TOKEN:CHATID
+                if ":" in url:
+                    token, chat = url.split(":", 1)
+                    api = f"https://api.telegram.org/bot{token}/sendMessage"
+                    await _send(name, api, {"chat_id": chat, "text": text,
+                                            "parse_mode": "Markdown",
+                                            "disable_web_page_preview": True})
+                else:
+                    out["failed"].append({"channel": name,
+                                          "error": "expected TOKEN:CHATID"})
+        self.results['notify'] = out
+
+    # ======================================================== Executive report (39)
+    def _exec_metrics(self, report):
+        s = report.get("summary", {})
+        F = self._dedupe_findings(self._collect_findings())
+        sev_count = {k: len([f for f in F if f[0] == k])
+                     for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+        crit, high, med = sev_count["CRITICAL"], sev_count["HIGH"], sev_count["MEDIUM"]
+        score = min(100, crit * 20 + high * 9 + med * 4 + (s.get("secrets", 0) or 0) * 8
+                    + (s.get("takeover_risks", 0) or 0) * 15)
+        verdict = ("CRITICAL EXPOSURE" if score >= 70 else "HIGH EXPOSURE" if score >= 40
+                   else "MODERATE EXPOSURE" if score >= 15 else "LOW RISK")
+        comp = report.get("compliance", {}) or {}
+        return {
+            "score": score, "verdict": verdict, "sev": sev_count,
+            "findings": F,
+            "top_risks": [f for f in F if f[0] in ("CRITICAL", "HIGH")][:12],
+            "compliance": {"coverage_pct": comp.get("coverage_pct", 0),
+                           "total_fail": comp.get("total_fail", 0),
+                           "total_controls": comp.get("total_controls", 0),
+                           "frameworks": comp.get("frameworks", {})},
+            "kpis": {
+                "subdomains": s.get("subdomains", 0), "open_ports": s.get("open_ports", 0),
+                "secrets": s.get("secrets", 0), "api_endpoints": s.get("api_endpoints", 0),
+                "cve_issues": s.get("cve_issues", 0), "takeover_risks": s.get("takeover_risks", 0),
+                "admin_api_findings": s.get("admin_api_findings", 0),
+                "new_since_last_scan": s.get("diff_new_assets", 0),
+            },
+        }
+
+    def build_executive_html(self, report):
+        """Standalone, print-ready executive (C-level) HTML report."""
+        from html import escape as _e
+        m = self._exec_metrics(report)
+        tgt = _e(str(report.get("target", "")))
+        when = _e(str(report.get("started", ""))[:19].replace("T", " "))
+        col = "#ef4444" if m["score"] >= 70 else "#f97316" if m["score"] >= 40 else "#eab308" if m["score"] >= 15 else "#22c55e"
+        kr = "".join(f"<div class='kpi'><div class='kv'>{_e(str(v))}</div><div class='kl'>{_e(k)}</div></div>"
+                     for k, v in m["kpis"].items())
+        risks = "".join(
+            f"<tr><td><span class='chip' style='background:{'#ef4444' if s=='CRITICAL' else '#f97316'}'>{_e(s)}</span></td>"
+            f"<td><b>{_e(c)}</b><div class='det'>{_e(d)}</div></td></tr>"
+            for s, c, d, _src in m["top_risks"]) or "<tr><td colspan='2'>No high-severity findings 🎉</td></tr>"
+        prio = "".join(
+            f"<li><b>{_e(p['title'])}</b> <span class='chip b'>{_e(p['severity'])}</span>"
+            f"<div class='det'>{_e(p['check'])} — {_e(p['finding'][:160])}</div></li>"
+            for p in (self.results.get('patch', {}) or {}).get('patches', [])[:10])
+        comp = m["compliance"]
+        fw = "".join(f"<tr><td>{_e(k)}</td><td>{_e(str(v))}</td></tr>"
+                     for k, v in (comp.get("frameworks") or {}).items()) or \
+             "<tr><td colspan='2'>Compliance module not run (−a comp)</td></tr>"
+        return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NULLVEIL Executive Report — {tgt}</title>
+<style>
+ :root{{--line:#e5e7eb;--mut:#6b7280}}
+ *{{box-sizing:border-box}} body{{font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;color:#111827;margin:0;background:#f8fafc}}
+ .wrap{{max-width:980px;margin:0 auto;padding:40px 28px}}
+ header{{border-bottom:3px solid {col};padding-bottom:16px;margin-bottom:24px}}
+ h1{{margin:0;font-size:26px}} h2{{font-size:18px;margin:28px 0 10px;border-left:4px solid {col};padding-left:10px}}
+ .sub{{color:var(--mut);font-size:13px;margin-top:6px}}
+ .meter{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px;margin:16px 0}}
+ .score{{font-size:44px;font-weight:800;color:{col}}} .verdict{{font-weight:700;color:{col};margin-top:4px}}
+ .track{{height:12px;background:#eef2f7;border-radius:8px;overflow:hidden;margin-top:12px}}
+ .track i{{display:block;height:100%;width:{m['score']}%;background:{col}}}
+ .kpis{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px}}
+ .kpi{{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;text-align:center}}
+ .kv{{font-size:24px;font-weight:800}} .kl{{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}}
+ table{{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}}
+ th,td{{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top;font-size:14px}}
+ .chip{{color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}} .chip.b{{background:#6b7280}}
+ .det{{color:var(--mut);font-size:12px}} ul{{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 18px 14px 34px}}
+ li{{margin:8px 0}} footer{{color:var(--mut);font-size:12px;margin-top:30px;border-top:1px solid var(--line);padding-top:12px}}
+ @media print{{body{{background:#fff}} .wrap{{padding:0}}}}
+</style></head><body><div class="wrap">
+<header><h1>Executive Security Report</h1>
+<div class="sub">Target <b>{tgt}</b> · {when} · NULLVEIL Recon v{_e(str(report.get('version','')))}</div></header>
+<div class="meter"><div class="score">{m['score']}/100</div><div class="verdict">{_e(m['verdict'])}</div>
+<div class="track"><i></i></div>
+<p style="margin:14px 0 0;color:var(--mut)">Severity mix — CRITICAL {m['sev']['CRITICAL']} · HIGH {m['sev']['HIGH']} · MEDIUM {m['sev']['MEDIUM']} · LOW {m['sev']['LOW']} · INFO {m['sev']['INFO']}</p></div>
+<div class="kpis">{kr}</div>
+<h2>Top Risks</h2><table><tbody>{risks}</tbody></table>
+<h2>Compliance Snapshot</h2>
+<table><tbody><tr><th>Framework / metric</th><th>Value</th></tr>
+<tr><td>Overall coverage</td><td>{_e(str(comp.get('coverage_pct', 0)))}% ({_e(str(comp.get('total_fail', 0)))} failing controls of {_e(str(comp.get('total_controls', 0)))})</td></tr>
+{fw}</tbody></table>
+<h2>Prioritised Remediation</h2><ul>{prio or '<li>No remediation items generated.</li>'}</ul>
+<footer>Generated by NULLVEIL Recon · Owner NULLVEIL · Engine DeepHat · Evidence-based, read-only assessment — not a certification. Use only on authorized targets.</footer>
+</div></body></html>"""
+
+    def export_executive_html(self, report, path):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(self.build_executive_html(report))
+        return path
+
+    def export_executive_pdf(self, report, path):
+        """Best-effort executive PDF: weasyprint → reportlab → playwright → skip."""
+        html_doc = self.build_executive_html(report)
+        # 1) weasyprint (pure-python HTML→PDF)
+        try:
+            from weasyprint import HTML  # type: ignore
+            HTML(string=html_doc).write_pdf(path)
+            return path, "weasyprint"
+        except Exception:
+            pass
+        # 2) reportlab (rendered from structured metrics)
+        try:
+            from reportlab.lib.pagesizes import A4  # type: ignore
+            from reportlab.pdfgen import canvas  # type: ignore
+            m = self._exec_metrics(report)
+            c = canvas.Canvas(path, pagesize=A4)
+            w, h = A4
+            y = h - 60
+            c.setFont("Helvetica-Bold", 18)
+            c.drawString(50, y, "NULLVEIL Executive Security Report")
+            y -= 26
+            c.setFont("Helvetica", 11)
+            c.drawString(50, y, f"Target: {report.get('target','')}   v{report.get('version','')}")
+            y -= 20
+            c.setFont("Helvetica-Bold", 24)
+            c.drawString(50, y, f"{m['score']}/100  -  {m['verdict']}")
+            y -= 34
+            c.setFont("Helvetica", 11)
+            c.drawString(50, y, f"CRITICAL {m['sev']['CRITICAL']}  HIGH {m['sev']['HIGH']}  "
+                                f"MEDIUM {m['sev']['MEDIUM']}  LOW {m['sev']['LOW']}")
+            y -= 28
+            c.setFont("Helvetica-Bold", 13)
+            c.drawString(50, y, "Top Risks")
+            y -= 18
+            c.setFont("Helvetica", 10)
+            for s, ck, d, _src in m["top_risks"][:14]:
+                for line in _wrap(f"[{s}] {ck}: {d}", 95):
+                    if y < 60:
+                        c.showPage(); y = h - 60; c.setFont("Helvetica", 10)
+                    c.drawString(50, y, line); y -= 14
+            c.save()
+            return path, "reportlab"
+        except Exception:
+            pass
+        # 3) playwright chromium (already optional in the project)
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore
+            with sync_playwright() as p:
+                b = p.chromium.launch()
+                pg = b.new_page()
+                pg.set_content(html_doc, wait_until="load")
+                pg.pdf(path=path, format="A4", print_background=True)
+                b.close()
+            return path, "playwright"
+        except Exception:
+            pass
+        return None, "unavailable"
+
+    async def executive_report(self):
+        """Module 39 — executive C-level HTML (+PDF) report exporter.
+
+        Reads the final report and writes a print-ready HTML file; the PDF is a
+        best-effort extras (weasyprint/reportlab/playwright) and degrades quietly."""
+        # report is built later; we snapshot current results into a report dict
+        report = self.export_dict()
+        html_path = getattr(self, "exec_report_path", "") or os.path.join(
+            os.getcwd(), f"nullveil-exec-{self.domain}.html")
+        try:
+            self.export_executive_html(report, html_path)
+        except Exception as e:
+            self.results['errors'].append(f"exec report: {e!r}")
+            self.results['exec'] = {"html": "", "pdf": "", "error": repr(e)}
+            return
+        pdf_path, engine = "", ""
+        want_pdf = getattr(self, "exec_pdf_path", "")
+        if want_pdf:
+            pdf_path, engine = self.export_executive_pdf(report, want_pdf)
+        m = self._exec_metrics(report)
+        self.results['exec'] = {
+            "html": html_path, "pdf": pdf_path or "", "pdf_engine": engine,
+            "score": m["score"], "verdict": m["verdict"], "sev": m["sev"],
+            "kpis": m["kpis"], "compliance": m["compliance"],
+        }
+
+    # ======================================================== SSRF / Internal Pivot (32)
+    SSRF_BYPASS_HEADERS = [
+        {"X-Forwarded-For": "127.0.0.1"},
+        {"X-Real-IP": "127.0.0.1"},
+        {"X-Client-IP": "127.0.0.1"},
+        {"X-Originating-IP": "127.0.0.1"},
+        {"X-Remote-IP": "127.0.0.1"},
+        {"True-Client-IP": "127.0.0.1"},
+        {"X-Custom-IP-Authorization": "127.0.0.1"},
+        {"Client-IP": "10.0.0.1"},
+        {"X-Forwarded-Host": "localhost"},
+        {"X-Host": "localhost"},
+        {"Forwarded": "for=127.0.0.1;host=localhost;proto=http"},
+        {"X-Internal-API": "true"},
+        {"X-Backend-Host": "127.0.0.1"},
+        {"X-Original-URL": "/admin"},
+        {"X-Rewrite-URL": "/admin"},
+        {"X-Forwarded-For": "127.0.0.1, 10.0.0.1"},
+        {"X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1",
+         "X-Internal-API": "true"},
+    ]
+    SSRF_METADATA_PATHS = [
+        "/latest/meta-data/", "/latest/meta-data/iam/security-credentials/",
+        "/latest/user-data", "/computeMetadata/v1/",
+        "/computeMetadata/v1/instance/service-accounts/default/token",
+        "/metadata/instance", "/metadata/instance?api-version=2021-02-01",
+        "/metadata/v1/", "/machine-metadata/", "/openstack/latest/meta_data.json",
+    ]
+    SSRF_METADATA_SIG = re.compile(
+        r"(?i)(ami-[0-9a-f]{8,}|instance-id|computeengine|projects/\d+/|token_type"
+        r"|security-credentials|meta-data|iam/security|\"access_token\")")
+
+    async def ssrf_probe(self):
+        """Internal-pivot recon: (1) IP-bypass header fuzz vs baseline, (2) cloud
+        metadata path probing with provider headers, (3) optional interactsh
+        out-of-band SSRF callbacks (--oob, needs interactsh-client binary)."""
+        eps, seen = [], set()
+        for e in (self.results.get('api_pool') or []):
+            p = str((e or {}).get('path', ''))
+            if p.startswith('/') and p not in seen:
+                seen.add(p)
+                eps.append(p)
+        for p in (self.results.get('api_endpoints') or []):
+            path = str(p.get('path', '') if isinstance(p, dict) else p)
+            if path.startswith('/') and path not in seen:
+                seen.add(path)
+                eps.append(path)
+        for p in (self.results.get('api_endpoints_found') or []):
+            path = str(p)
+            if path.startswith('/') and path not in seen:
+                seen.add(path)
+                eps.append(path)
+        if not eps:
+            eps = ['/']
+        eps = eps[: (25 if self.deep else 12)]
+
+        def _abs(p):
+            return p if p.startswith('http') else self.base_url.rstrip('/') + p
+
+        # ---- 1) internal bypass header fuzzing (baseline vs injected) ----
+        bypass_hits = []
+        for p in eps:
+            url = _abs(p)
+            try:
+                async with self.sem:
+                    base = await self.client.get(url)
+                b_status, b_len = base.status_code, len(base.content)
+            except Exception:
+                continue
+            for hb in self.SSRF_BYPASS_HEADERS:
+                try:
+                    async with self.sem:
+                        r = await self.client.get(url, headers=hb)
+                except Exception:
+                    continue
+                d_len = len(r.content) - b_len
+                if r.status_code != b_status or abs(d_len) > max(250, int(b_len * 0.2)):
+                    bypass_hits.append({
+                        "path": p,
+                        "header": "; ".join(f"{k}: {v}" for k, v in hb.items()),
+                        "baseline_status": b_status, "status": r.status_code,
+                        "size_delta": d_len,
+                        "verdict": ("possible ACL/IP bypass" if r.status_code != b_status
+                                    else "response variance"),
+                    })
+
+        # ---- 2) cloud metadata probing (metadata-proxy exposure) ----
+        meta_hits = []
+        meta_header_sets = [{}, {"Metadata-Flavor": "Google"},
+                            {"Metadata": "true"},
+                            {"Metadata-Flavor": "Google", "Metadata": "true"}]
+        for mp in self.SSRF_METADATA_PATHS:
+            for mh in meta_header_sets:
+                try:
+                    async with self.sem:
+                        r = await self.client.get(self.base_url.rstrip('/') + mp,
+                                                  headers=mh)
+                except Exception:
+                    continue
+                ctype = (r.headers.get('content-type') or '').lower()
+                sig = bool(self.SSRF_METADATA_SIG.search((r.text or '')[:8000]))
+                if sig or (r.status_code == 200 and 'html' not in ctype):
+                    meta_hits.append({
+                        "path": mp, "status": r.status_code,
+                        "header": "; ".join(f"{k}: {v}" for k, v in mh.items()) or "-",
+                        "signature": sig, "size": len(r.content),
+                    })
+
+        # ---- 3) out-of-band SSRF callbacks (interactsh) ----
+        oob = {"enabled": False, "domain": "", "injected": 0,
+               "hits": [], "note": "disabled — pass --oob to enable"}
+        oob_cfg = getattr(self, "oob_cfg", {}) or {}
+        if oob_cfg.get("enabled"):
+            import shutil as _shutil
+            exe = _shutil.which("interactsh-client")
+            if not exe:
+                oob["note"] = ("interactsh-client not found — install: go install "
+                               "github.com/projectdiscovery/interactsh/cmd/"
+                               "interactsh-client@latest")
+                self.results['errors'].append(f"ssrf: {oob['note']}")
+            else:
+                oob["enabled"] = True
+                oob_proc = None
+
+                async def _read(tmo):
+                    """b'' = EOF, None = timeout (keep polling)."""
+                    try:
+                        return await asyncio.wait_for(oob_proc.stdout.readline(),
+                                                      timeout=tmo)
+                    except asyncio.TimeoutError:
+                        return None
+
+                try:
+                    argv = [exe, "-json"]
+                    if oob_cfg.get("server"):
+                        argv += ["-s", str(oob_cfg["server"])]
+                    oob_proc = await asyncio.create_subprocess_exec(
+                        *argv, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL)
+                    # registration line -> correlation domain
+                    domain = None
+                    for _ in range(12):
+                        line = await _read(15)
+                        if line in (b"", None) and domain:
+                            break
+                        if not line:
+                            if line == b"":
+                                break
+                            continue
+                        txt = line.decode("utf-8", "replace")
+                        if txt.lstrip().startswith("{"):
+                            continue
+                        m = re.search(r"([a-z0-9]{8,64}\.[a-z0-9-]+\.[a-z]{2,})", txt)
+                        if m:
+                            domain = m.group(1)
+                            break
+                    if not domain:
+                        oob["note"] = "could not parse OOB domain from interactsh-client"
+                    else:
+                        oob["domain"] = domain
+                        oob_url = f"http://{domain}/nullveil-oob"
+                        targets = []
+                        for p in eps:
+                            u = _abs(p)
+                            if "?" in u:
+                                targets.append(re.sub(r"=[^&]*", "=" + oob_url, u))
+                            else:
+                                for pn in ("url", "path", "dest", "callback", "webhook",
+                                           "next", "img", "file", "target", "proxy",
+                                           "redirect", "feed", "host"):
+                                    targets.append(f"{u}{'&' if '?' in u else '?'}"
+                                                   f"{pn}={oob_url}")
+                        targets = list(dict.fromkeys(targets))[: (45 if self.deep else 25)]
+                        for t in targets:
+                            try:
+                                async with self.sem:
+                                    await self.client.get(t)
+                            except Exception:
+                                continue
+                        oob["injected"] = len(targets)
+                        # poll for interactions
+                        wait_s = int(oob_cfg.get("wait") or (90 if self.deep else 45))
+                        deadline = time.time() + wait_s
+                        while time.time() < deadline:
+                            line = await _read(min(10, max(1, deadline - time.time())))
+                            if line is None:
+                                continue
+                            if line == b"":
+                                break
+                            txt = line.decode("utf-8", "replace").strip()
+                            if txt and (txt.startswith("{")
+                                        or domain.split(".")[0][:8] in txt):
+                                oob["hits"].append(txt[:400])
+                                if len(oob["hits"]) >= 50:
+                                    break
+                        if oob["hits"]:
+                            oob["note"] = (f"{len(oob['hits'])} out-of-band interaction(s) "
+                                           f"received — SSRF/OOB callback confirmed")
+                        else:
+                            oob["note"] = (f"no interactions within {wait_s}s after "
+                                           f"{oob['injected']} injected probe(s)")
+                except Exception as e:
+                    oob["note"] = f"interactsh failed: {type(e).__name__} — {e}"
+                    self.results['errors'].append(f"ssrf: {oob['note']}")
+                finally:
+                    if oob_proc:
+                        try:
+                            oob_proc.kill()
+                        except Exception:
+                            pass
+
+        for h in bypass_hits[:80]:
+            if h["verdict"].startswith("possible"):
+                self.results['api_pool'].append(
+                    {"path": h["path"], "source": "ssrf:bypass"})
+        self.results['ssrf'] = {
+            "available": True, "endpoints": len(eps),
+            "bypass_count": len(bypass_hits),
+            "bypass": bypass_hits[:120],
+            "metadata": meta_hits, "oob": oob,
+        }
+
+    # ======================================================== Smart Context Fuzz (33)
+    BUSINESS_NOUNS = {
+        "ecommerce": ["cart", "checkout", "order", "orders", "payment", "payments",
+                      "invoice", "refund", "coupon", "sku", "wishlist", "shipment",
+                      "tracking", "catalog", "inventory", "stock", "address", "review"],
+        "fintech": ["transaction", "transactions", "transfer", "balance", "ledger",
+                    "upi", "kyc", "mandate", "payout", "settlement", "wallet",
+                    "beneficiary", "statement", "card", "loan", "credit"],
+        "saas": ["tenant", "workspace", "subscription", "plan", "billing", "seat",
+                 "invite", "webhook", "integration", "usage", "quota", "sso",
+                 "organization", "deployment"],
+        "blog": ["post", "posts", "author", "authors", "comment", "comments",
+                 "category", "categories", "tag", "tags", "draft", "publish"],
+        "health": ["patient", "appointment", "prescription", "record", "vitals",
+                   "insurance", "claim", "doctor", "clinic", "booking"],
+        "edu": ["student", "course", "enrollment", "grade", "assignment", "exam",
+                "class", "teacher"],
+        "travel": ["booking", "itinerary", "pnr", "flight", "hotel", "seatmap",
+                   "fare", "voucher"],
+        "social": ["feed", "story", "follower", "following", "message", "thread",
+                   "mention", "group"],
+    }
+    CTX_MODIFIERS = ["", "api/", "api/v1/", "api/v2/", "internal/", "private/",
+                     "admin/", "mobile/", "v2/", "v3/"]
+    CTX_SUFFIXES = ["", "/internal", "/v2", "/bulk", "/export", "/search",
+                    "/stats", "/config"]
+    STATIC_EXT_RE = re.compile(
+        r"(?i)\.(png|jpe?g|gif|svg|css|ico|woff2?|ttf|mp4|map|pdf)(\?|$)")
+
+    async def smart_fuzz(self):
+        """Context-aware API discovery:
+        1. business/domain/tech analysis -> targeted wordlist generation
+        2. JS data-flow analysis -> resolve variable concatenation into endpoints
+        3. fuzz with the generated list (ffuf if present, native fallback)."""
+        # ---- 1) context: homepage + meta + domain + tech stack ----
+        page = ""
+        try:
+            async with self.sem:
+                r = await self.client.get(self.base_url + "/")
+                page = r.text[:300_000]
+        except Exception:
+            page = ""
+        meta = self.results.get('meta', {}) or {}
+        title = str(meta.get('title', '') or "")
+        meta_kw = " ".join(str(meta.get(k, '') or '')
+                           for k in ('keywords', 'description', 'og:title', 'og:description'))
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page))[:20000]
+        hay = (f"{title} {meta_kw} {text} "
+               f"{' '.join(self.results.get('tech_stack', []))} {self.domain}").lower()
+        scores = {v: sum(1 for n in ns if n in hay)
+                  for v, ns in self.BUSINESS_NOUNS.items()}
+        verticals = sorted((v for v, s in scores.items() if s >= 3),
+                           key=lambda v: -scores[v])[:3]
+        if not verticals:
+            verticals = ["ecommerce", "saas"]
+
+        nouns = []
+        for v in verticals:
+            nouns += self.BUSINESS_NOUNS[v][:14]
+        nouns += ["user", "users", "account", "profile", "settings", "config",
+                  "search", "upload", "report", "reports", "notification",
+                  "session", "token", "device", "dashboard", "export"]
+        stop = {"www", "com", "org", "net", "io", "app", "co", "dev", "site",
+                "web", "api", "the", "www2"}
+        nouns += [t for t in re.split(r"[.\-/]", self.domain.lower())
+                  if t and t not in stop][:6]
+
+        # ---- 2) JS data-flow: variable + concatenation -> concrete endpoints ----
+        js_urls = set()
+        for src in (self.results.get('js_files') or [],
+                    (self.results.get('katana') or {}).get('js_files') or []):
+            for u in src:
+                u = str(u).strip()
+                if u.startswith(('http://', 'https://', '/')) and ':' not in u.split('/')[0]:
+                    js_urls.add(u)
+        for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', page, re.I):
+            js_urls.add(urljoin(self.base_url + "/", m.group(1)))
+        js_urls = sorted(js_urls)[: (14 if self.deep else 8)]
+
+        VAR_RE = re.compile(
+            r"""(?:const|let|var)\s+([A-Za-z_$][\w$.]*)\s*=\s*["'`]([^"'`]{1,200})["'`]""")
+        CONCAT_RE = re.compile(
+            r"""([A-Za-z_$][\w$.]*)\s*\+\s*["'`]([^"'`]{1,160})["'`]""")
+        BASEURL_RE = re.compile(r"""baseURL\s*[:=]\s*["'`]([^"'`]{1,200})["'`]""")
+        CFG_RE = re.compile(
+            r"""([A-Za-z_$][\w$.]*(?:api_?url|api_?base|base_?url|api_?endpoint"""
+            r"""|graphql_?url|rest_?url|api_?root)[\w$.]*)\s*[:=]\s*["'`]([^"'`]{1,200})["'`]""",
+            re.I)
+        js_candidates, external = set(), set()
+        for ju in js_urls:
+            body = ""
+            try:
+                u = ju if ju.startswith("http") else urljoin(self.base_url + "/", ju)
+                async with self.sem:
+                    r = await self.client.get(u)
+                if r.status_code == 200:
+                    body = r.text[:3_000_000]
+            except Exception:
+                continue
+            if not body:
+                continue
+            varmap = {}
+            for m in VAR_RE.finditer(body):
+                # fold simple literal concatenation: const X = "a" + "b" + "c";
+                val, tail, pos = m.group(2), body[m.end():m.end() + 400], 0
+                while pos < 300:
+                    fm = re.match(r"""\s*\+\s*["'`]([^"'`]{1,200})["'`]""", tail[pos:])
+                    if not fm:
+                        break
+                    val += fm.group(1)
+                    pos += fm.end()
+                varmap[m.group(1)] = val
+            for m in BASEURL_RE.finditer(body):
+                varmap.setdefault("baseURL", m.group(1))
+                js_candidates.add(m.group(1))
+            for m in CFG_RE.finditer(body):
+                js_candidates.add(varmap.get(m.group(1), m.group(2)))
+            for m in CONCAT_RE.finditer(body):
+                name, lit = m.group(1), m.group(2)
+                base = varmap.get(name)
+                if base is None:
+                    base = next((v for k, v in varmap.items()
+                                 if k.endswith("." + name)), None)
+                if not base:
+                    continue
+                if base.endswith('/') and lit.startswith('/'):
+                    joined = base.rstrip('/') + lit
+                elif base.endswith('/') or lit.startswith('/'):
+                    joined = base + lit
+                else:
+                    joined = base + '/' + lit
+                if re.search(r"(?i)(api|v\d|graphql|auth|user|admin|internal|service)",
+                             joined):
+                    js_candidates.add(joined)
+
+        js_paths = set()
+        for c in js_candidates:
+            c = str(c).strip().strip('"\'')
+            if not c or c.startswith('//') or len(c) > 300:
+                continue
+            if c.startswith('http'):
+                u = urlparse(c)
+                if u.netloc and self.domain not in u.netloc:
+                    external.add(f"{u.scheme}://{u.netloc}{u.path}")
+                    continue
+                path = (u.path or '/') + (f"?{u.query}" if u.query else '')
+            elif c.startswith('/'):
+                path = c
+            else:
+                continue
+            if self.STATIC_EXT_RE.search(path):
+                continue
+            js_paths.add(path)
+
+        js_resolved = []
+        for p in sorted(js_paths)[: (80 if self.deep else 40)]:
+            url = p if p.startswith('http') else self.base_url.rstrip('/') + p
+            try:
+                async with self.sem:
+                    r = await self.client.get(url)
+                if r.status_code != 404:
+                    js_resolved.append({"path": p, "status": r.status_code,
+                                        "size": len(r.content)})
+                    self.results['api_pool'].append(
+                        {"path": p, "source": f"smartfuzz:js-flow:{r.status_code}"})
+            except Exception:
+                continue
+
+        # ---- generated context wordlist ----
+        words, seen_w = [], set()
+        for n in nouns:
+            for mod in self.CTX_MODIFIERS:
+                for suf in self.CTX_SUFFIXES:
+                    w = f"{mod}{n}{suf}".strip('/')
+                    if w and w not in seen_w and 2 < len(w) < 60:
+                        seen_w.add(w)
+                        words.append(w)
+        known = set(FFUF_API_WORDLIST)          # module 30 already covered these
+        words = [w for w in words if w not in known]
+        words = words[: (1500 if self.deep else 700)]
+
+        # ---- 3) fuzz with the generated list ----
+        import shutil as _shutil
+        exe = _shutil.which("ffuf") or _shutil.which("ffuf.exe")
+        findings, engine, wl_file, out_file = [], "native", None, None
+        if exe and words:
+            try:
+                engine = "ffuf"
+                fd, wl_file = tempfile.mkstemp(prefix="nullveil_smart_", suffix=".txt")
+                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                    fh.write("\n".join(words))
+                ofd, out_file = tempfile.mkstemp(prefix="nullveil_smart_", suffix=".json")
+                os.close(ofd)
+                url = self.base_url.rstrip('/') + "/FUZZ"
+                cmd = [exe, "-u", url, "-w", wl_file,
+                       "-mc", "200,201,202,204,207,301,302,307,401,403,405,500,501,502,503",
+                       "-t", str(min(self.concurrency, 200)),
+                       "-timeout", str(max(self.timeout, 8)),
+                       "-of", "json", "-o", out_file, "-s",
+                       "-H", f"User-Agent: Mozilla/5.0 NULLVEIL-Recon/{__version__}"]
+                if self.deep:
+                    cmd += ["-recursion", "-recursion-depth", "2"]
+                for h in getattr(self, "_auth_cmd", []):
+                    cmd += ["-H", h]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                try:
+                    await asyncio.wait_for(proc.communicate(),
+                                           timeout=300 if self.deep else 180)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    self.results['errors'].append("smartfuzz: ffuf wall-time cap reached")
+                try:
+                    with open(out_file, encoding='utf-8') as fh:
+                        data = json.load(fh)
+                except Exception:
+                    data = {}
+                for r_ in (data.get('results') or []):
+                    findings.append({"url": r_.get('url', ''),
+                                     "status": r_.get('status', 0),
+                                     "size": r_.get('length', 0),
+                                     "content_type": r_.get('content-type', ''),
+                                     "source": "context-wordlist"})
+            except Exception as e:
+                self.results['errors'].append(
+                    f"smartfuzz: ffuf failed: {type(e).__name__} — {e}")
+                engine, findings = "native", []
+            finally:
+                for f in (wl_file, out_file):
+                    if f:
+                        try:
+                            os.unlink(f)
+                        except Exception:
+                            pass
+        if engine == "native":
+            for w in words[: (400 if self.deep else 200)]:
+                try:
+                    async with self.sem:
+                        r = await self.client.get(
+                            self.base_url.rstrip('/') + '/' + w.strip('/'))
+                    if r.status_code != 404:
+                        findings.append({"url": str(r.url), "status": r.status_code,
+                                         "size": len(r.content),
+                                         "content_type": r.headers.get('content-type', ''),
+                                         "source": "context-wordlist"})
+                except Exception:
+                    continue
+
+        seen_u, uniq_f = set(), []
+        for f in findings:
+            p = urlparse(f['url']).path or '/'
+            if p in seen_u:
+                continue
+            seen_u.add(p)
+            uniq_f.append(f)
+            self.results['api_pool'].append(
+                {"path": p, "source": f"smartfuzz:{f['status']}"})
+        self.results['smartfuzz'] = {
+            "available": True, "engine": engine,
+            "business_profile": verticals,
+            "keyword_hits": {v: scores.get(v, 0) for v in verticals},
+            "wordlist_size": len(words), "js_analyzed": len(js_urls),
+            "js_resolved": js_resolved, "js_endpoints": sorted(js_paths)[:200],
+            "external_bases": sorted(external)[:20],
+            "count": len(uniq_f), "findings": uniq_f[:300],
+        }
+
     # ---------------------------------------------------------- Scan History
     HISTORY_DIR = os.path.join(os.path.expanduser("~"), ".nullveil", "history")
 
@@ -3963,9 +6202,10 @@ class WebsiteRecon:
         done = getattr(self, "_completed", None)
         if done is not None:
             done_set = set(done)
-            idxs = ({i for i in idxs if ATTACK_MODULES[i - 1][0] in done_set}
+            idxs = ({i for i in idxs if (module_entry(i) or ("",))[0] in done_set}
                     | set(getattr(self, "_resume_done", [])))
-        return [ATTACK_MODULES[i - 1][0] for i in sorted(idxs) if 0 < i <= MAX_MODULE]
+        return [(module_entry(i) or ("",))[0] for i in sorted(idxs)
+                if module_entry(i)]
 
     def _history_save(self, report=None):
         """Auto-save every completed scan for --history / --resume."""
@@ -4028,6 +6268,122 @@ class WebsiteRecon:
             elif e.get("domain", "").lower() == self.domain.lower():
                 return e
         return None
+
+    # ---------------------------------------------------------- Change Detection / Diff
+    @staticmethod
+    def _asset_sets(report):
+        """Normalise a report into comparable sets of assets."""
+        r = (report or {}).get("report", report) or {}
+
+        def _ports(v):
+            out = set()
+            for p in (v or []):
+                if isinstance(p, dict):
+                    n = p.get("port", p.get("number"))
+                    if n is not None:
+                        out.add(str(n))
+                elif p is not None and str(p) != "":
+                    out.add(str(p).split('/')[0])
+            return out
+
+        def _paths(v):
+            out = set()
+            for p in (v or []):
+                if isinstance(p, dict):
+                    if p.get("path"):
+                        out.add(str(p["path"]))
+                elif p:
+                    out.add(str(p))
+            return out
+
+        api = r.get("api", {}) or {}
+        return {
+            "subdomains": {str(x).lower() for x in (r.get("subdomains") or []) if x},
+            "ports": _ports(r.get("open_ports")),
+            "paths": _paths(r.get("paths")),
+            "api_endpoints": _paths(api.get("live_endpoints")) | _paths(api.get("paths_in_source")),
+            "cookies": {str(x) for x in (api.get("cookies") or []) if x},
+            "js_files": {str(x) for x in (r.get("js_files") or []) if x},
+            "tech_stack": {str(x) for x in (r.get("tech_stack") or []) if x},
+            "users": {str(x) for x in (r.get("users") or []) if x},
+        }
+
+    def _compute_diff(self, report):
+        """Compare this scan against the newest previous scan of the same target
+        and produce security-relevant change alerts (new subdomains, open ports,
+        paths, API endpoints, cookies, tech …), with a CLI + report + dashboard view."""
+        if getattr(self, "no_history", False) or getattr(self, "diff_disabled", False):
+            return
+        # newest prior entry that is not this very scan (save happens after us)
+        prev = None
+        for e in self._history_list():
+            if e.get("domain", "").lower() == self.domain.lower():
+                prev = e
+                break
+        if not prev:
+            self.results['diff'] = {
+                "available": False, "baseline": None,
+                "note": "first scan of this target — no baseline to diff against yet",
+            }
+            return
+
+        cur, old = self._asset_sets(report), self._asset_sets(prev.get("report", {}))
+        added = {k: sorted(cur[k] - old[k]) for k in cur}
+        removed = {k: sorted(old[k] - cur[k]) for k in old}
+
+        # severity mapping for newly-appeared assets
+        SEV = {
+            "subdomains": ("MEDIUM", "new subdomain appeared"),
+            "ports": ("HIGH", "new open port"),
+            "paths": ("MEDIUM", "new reachable path"),
+            "api_endpoints": ("HIGH", "new API endpoint"),
+            "cookies": ("LOW", "new cookie observed"),
+            "js_files": ("LOW", "new JS bundle"),
+            "tech_stack": ("INFO", "new technology fingerprinted"),
+            "users": ("LOW", "new user/author exposed"),
+        }
+        findings = []
+        for key, items in added.items():
+            if not items:
+                continue
+            sev, desc = SEV.get(key, ("INFO", "new " + key))
+            findings.append({
+                "severity": sev, "check": f"new-{key.rstrip('s')}",
+                "detail": f"{len(items)} {desc}(s): {', '.join(items[:8])}"
+                          + (" …" if len(items) > 8 else ""),
+                "items": items,
+            })
+
+        # score the change set (new risky ports weigh heaviest)
+        risk_ports = [p for p in added.get("ports", []) if p.isdigit()
+                      and int(p) in getattr(type(self), "CRIT_PORTS", {})]
+        score = (len(added.get("ports", [])) * 12 + len(risk_ports) * 18
+                 + len(added.get("api_endpoints", [])) * 6
+                 + len(added.get("subdomains", [])) * 4
+                 + len(added.get("paths", [])) * 3
+                 + len(added.get("users", [])) * 2
+                 + (len(added.get("cookies", [])) + len(added.get("js_files", []))) * 1)
+        score = min(100, score)
+        verdict = ("CRITICAL DRIFT" if score >= 70 else "HIGH DRIFT" if score >= 40
+                   else "MODERATE DRIFT" if score >= 15 else
+                   ("LOW DRIFT" if score else "NO CHANGE"))
+
+        self.results['diff'] = {
+            "available": True,
+            "baseline_id": prev.get("id"), "baseline_when": prev.get("when"),
+            "added": added, "removed": removed,
+            "score": score, "verdict": verdict,
+            "summary": {k: len(v) for k, v in added.items()},
+            "findings": findings,
+        }
+        # surface notable new assets as first-class findings too
+        if added.get("ports"):
+            self.results['diff_findings'] = [
+                (f["severity"], f"change:{f['check']}", f["detail"]) for f in findings]
+            for sev, chk, det in self.results['diff_findings']:
+                if sev in ("CRITICAL", "HIGH"):
+                    self.results['errors'].append(
+                        f"change-alert: {det}")
 
     # ---------------------------------------------------------- Evidence / Repro Pack (-R)
     def export_repro(self, path):
@@ -4241,6 +6597,16 @@ class WebsiteRecon:
             ("CVE / Misconfig", len([f for f in self.results.get('cve_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')])),
             ("Crawled Pages", self.results.get('crawl', {}).get('pages_crawled', 0)),
             ("TLS Issues", len([f for f in self.results.get('tls_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')])),
+            ("Auth-Gated APIs", self.results.get('authscan', {}).get('auth_gated', 0)
+             if isinstance(self.results.get('authscan'), dict) else 0),
+            ("Role-Hidden APIs", len(self.results.get('authscan', {}).get('role_gated', []))
+             if isinstance(self.results.get('authscan'), dict) else 0),
+            ("SSRF / Bypass Hits", (len(self.results.get('ssrf', {}).get('bypass', []))
+                                    + len(self.results.get('ssrf', {}).get('metadata', []))
+                                    + len(self.results.get('ssrf', {}).get('oob', {}).get('hits', [])))
+             if isinstance(self.results.get('ssrf'), dict) else 0),
+            ("Smart Fuzz Hits", self.results.get('smartfuzz', {}).get('count', 0)
+             if isinstance(self.results.get('smartfuzz'), dict) else 0),
         ]
         for label, count in summary_rows:
             flag = "[bold red] ⚠[/]" if ("Secret" in label and count) else ""
@@ -4679,6 +7045,259 @@ class WebsiteRecon:
                 console.print(Panel(f"  [yellow]•[/] {nuc['note']}",
                                     title="[bold yellow]◈ NUCLEI (not available) ◈[/]",
                                     border_style="yellow", box=rbox.ROUNDED))
+        # --- Katana crawler ---
+        kat = self.results.get('katana', [])
+        if isinstance(kat, dict) and (kat.get('urls_crawled') or kat.get('note')):
+            if kat.get('urls_crawled'):
+                body = (f"  [green]✓[/] v{kat.get('version', '?')}  ·  depth {kat.get('depth', '?')}  ·  "
+                        f"[bold]{kat.get('urls_crawled', 0)}[/] URLs crawled  ·  "
+                        f"[bold]{len(kat.get('endpoints', []))}[/] API endpoints  ·  "
+                        f"[bold]{len(kat.get('js_files', []))}[/] JS files\n")
+                eps = kat.get('endpoints', [])[:40]
+                if eps:
+                    body += "\n" + "\n".join(f"  [cyan]•[/] {e}" for e in eps)
+                console.print(Panel(body, title=f"[bold cyan]◈ KATANA CRAWLER ◈[/]",
+                                    border_style="cyan", box=rbox.ROUNDED))
+            elif kat.get('note'):
+                console.print(Panel(f"  [yellow]•[/] {kat['note']}",
+                                    title="[bold yellow]◈ KATANA (not available) ◈[/]",
+                                    border_style="yellow", box=rbox.ROUNDED))
+        # --- LinkFinder JS endpoints ---
+        lf = self.results.get('linkfinder', [])
+        if isinstance(lf, dict) and lf.get('count'):
+            src_note = ("external linkfinder CLI" if lf.get('external_cli')
+                        else "built-in LinkFinder regex engine")
+            body = (f"  [green]✓[/] {lf.get('js_analyzed', 0)} JS bundle(s) analyzed via {src_note}  ·  "
+                    f"[bold]{lf.get('count', 0)}[/] hidden endpoint(s) found\n")
+            eps = lf.get('endpoints', [])[:40]
+            if eps:
+                body += "\n" + "\n".join(f"  [magenta]•[/] {e}" for e in eps)
+            console.print(Panel(body, title="[bold magenta]◈ LINKFINDER JS ENDPOINTS ◈[/]",
+                                border_style="magenta", box=rbox.ROUNDED))
+        # --- FFUF fuzzing ---
+        ff = self.results.get('ffuf', [])
+        if isinstance(ff, dict) and (ff.get('count') or ff.get('note')):
+            if ff.get('count'):
+                sev_col2 = {"200": "bold green", "201": "bold green", "204": "green",
+                            "301": "yellow", "302": "yellow", "307": "yellow",
+                            "401": "red", "403": "red", "405": "magenta"}
+                ft = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_blue",
+                           title=f"[bold blue]◈ FFUF API FUZZING ◈[/] [dim]{ff.get('count', 0)} live path(s) · "
+                                 f"wordlist: {ff.get('wordlist_size', 0)}[/]")
+                ft.add_column("Status", justify="center")
+                ft.add_column("URL")
+                ft.add_column("Size", justify="right")
+                ft.add_column("Type")
+                for x in ff.get('findings', [])[:50]:
+                    st = str(x.get('status', ''))
+                    ft.add_row(f"[{sev_col2.get(st, 'white')}]{st}[/]",
+                               str(x.get('url', ''))[:90],
+                               str(x.get('size', '')),
+                               str(x.get('content_type', ''))[:24])
+                console.print(ft)
+            elif ff.get('note'):
+                console.print(Panel(f"  [yellow]•[/] {ff['note']}",
+                                    title="[bold yellow]◈ FFUF (not available) ◈[/]",
+                                    border_style="yellow", box=rbox.ROUNDED))
+        # --- Burp / Caido traffic bridge ---
+        bur = self.results.get('burp', [])
+        if isinstance(bur, dict) and (bur.get('proxy') or bur.get('har_entries') or bur.get('proxy_note')):
+            body = ""
+            if bur.get('proxy'):
+                ok = bur.get('proxy_ok')
+                body += (f"  {'[green]✓[/]' if ok else '[red]✗[/]'} Proxy: [bold]{bur['proxy']}[/] — "
+                         + (f"[green]capture active[/]  [dim]{bur.get('proxy_note', '')}[/]"
+                            if ok else f"[red]unreachable[/]  [dim]{bur.get('proxy_note', '')}[/]") + "\n")
+            if bur.get('har_files'):
+                names = ", ".join(os.path.basename(h.get('file', '')) for h in bur['har_files'])
+                body += (f"  [green]✓[/] HAR import: [bold]{bur.get('har_entries', 0)}[/] entrie(s) from "
+                         f"[bold]{len(bur['har_files'])}[/] file(s) [dim]({names})[/]\n")
+                if bur.get('endpoints'):
+                    body += (f"    [cyan]•[/] [bold]{len(bur['endpoints'])}[/] endpoint(s)  ·  "
+                             f"[bold]{len(bur.get('params', []))}[/] parameter(s)  ·  "
+                             f"[bold]{len(bur.get('cookies', []))}[/] cookie(s)  ·  "
+                             f"[bold]{len(bur.get('js_files', []))}[/] JS bundle(s)\n")
+                eps = bur.get('endpoints', [])[:30]
+                if eps:
+                    body += "\n" + "\n".join(f"  [magenta]•[/] {e}" for e in eps)
+            if bur.get('secrets'):
+                body += "\n\n  [red]secrets visible in captured responses:[/]\n"
+                body += "\n".join(f"  [red]•[/] {s}" for s in bur['secrets'][:15])
+            console.print(Panel(body or f"  [dim]{bur.get('proxy_note', '')}[/]",
+                                title="[bold yellow]◈ BURP / CAIDO TRAFFIC BRIDGE ◈[/]",
+                                border_style="yellow", box=rbox.ROUNDED))
+        # --- Change detection vs previous scan (diff tracking) ---
+        dif = self.results.get('diff', {})
+        if isinstance(dif, dict) and dif.get('available'):
+            score_d = int(dif.get('score', 0))
+            vcol = ("bold red" if score_d >= 70 else "bold yellow" if score_d >= 40
+                    else "yellow" if score_d >= 15 else ("cyan" if score_d else "green"))
+            body = (f"  change score: [bold]{score_d}[/][dim]/100[/]  ·  "
+                    f"verdict: [{vcol}]{dif.get('verdict', '')}[/]\n"
+                    f"  [dim]baseline:[/] {dif.get('baseline_id', '?')} "
+                    f"[dim]({str(dif.get('baseline_when', ''))[:19].replace('T', ' ')})[/]\n")
+            for key, items in (dif.get('added') or {}).items():
+                if items:
+                    body += (f"\n  [green]+{len(items)}[/] new [bold]{key}[/]: "
+                             + ", ".join(items[:8]) + (" …" if len(items) > 8 else ""))
+            for key, items in (dif.get('removed') or {}).items():
+                if items:
+                    body += (f"\n  [red]-{len(items)}[/] gone [bold]{key}[/]: "
+                             + ", ".join(items[:8]) + (" …" if len(items) > 8 else ""))
+            if not any((dif.get('added') or {}).values()):
+                body += "\n  [green]no new assets since the last scan[/]"
+            console.print(Panel(body, title="[bold magenta]◈ SCAN DIFF — CHANGES SINCE LAST SCAN ◈[/]",
+                                border_style=vcol.split()[-1], box=rbox.ROUNDED))
+        # --- Authenticated scan (session injection + role diff) ---
+        asc = self.results.get('authscan', [])
+        if isinstance(asc, dict) and (asc.get('available') or asc.get('note')):
+            if asc.get('available'):
+                ainfo = self.results.get('auth_setup', {}) or {}
+                body = (f"  [green]✓[/] session — headers: "
+                        f"{', '.join(ainfo.get('headers', [])) or '-'} · cookies: "
+                        f"{', '.join(ainfo.get('cookies', [])) or '-'}"
+                        + (f" · login: HTTP {ainfo['login'].get('status')}"
+                           if isinstance(ainfo.get('login'), dict) else "")
+                        + f"\n  [bold]{asc.get('endpoints_probed', 0)}[/] endpoint(s) probed "
+                          f"with & without auth · [bold]{asc.get('auth_gated', 0)}[/] auth-gated"
+                          f" · [bold]{asc.get('status_changed', 0)}[/] status changed"
+                          + (" · session [green]verified[/]" if asc.get('session_verified') else "")
+                          + "\n")
+                roles = asc.get('roles', [])
+                if roles:
+                    body += f"  [cyan]roles:[/] {', '.join(roles)}\n"
+                changed = [x for x in asc.get('findings', []) if x.get('auth_gated')][:25]
+                if changed:
+                    body += "\n" + "\n".join(
+                        f"  [red]•[/] {x['path']}  [dim]noauth {x['status_noauth']} → "
+                        f"auth [bold]{x['status_auth']}[/][/]" for x in changed)
+                console.print(Panel(body, title="[bold red]◈ AUTHENTICATED API SCAN ◈[/]",
+                                    border_style="red", box=rbox.ROUNDED))
+                gated = asc.get('role_gated', [])
+                if gated:
+                    gt = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_red",
+                               title=f"[bold red]◈ ROLE-HIDDEN APIs ◈[/] [dim]{len(gated)} endpoint(s) "
+                                     f"visible to some roles only[/]")
+                    gt.add_column("Endpoint")
+                    gt.add_column("Visible to")
+                    gt.add_column("Hidden from")
+                    for g in gated[:40]:
+                        gt.add_row(str(g.get('path', ''))[:70],
+                                   ", ".join(g.get('visible_to', [])) or "-",
+                                   ", ".join(f"{h.get('role')}:{h.get('status')}"
+                                             for h in g.get('hidden_from', [])))
+                    console.print(gt)
+                # --- backend / admin API audit with injected session ---
+                adm = asc.get('admin_audit') or {}
+                if adm.get('probed'):
+                    ab = (f"  [bold]{adm.get('probed', 0)}[/] admin/backend path(s) probed with your session  ·  "
+                          f"[bold]{adm.get('reachable', 0)}[/] reachable  ·  "
+                          f"[bold]{adm.get('session_only', 0)}[/] session-only  ·  "
+                          f"[bold]{adm.get('sensitive', 0)}[/] sensitive-data\n")
+                    for f in (adm.get('findings') or [])[:25]:
+                        sev, chk, det = (f[0], f[1], f[2]) if isinstance(f, (list, tuple)) else (f.get('severity', ''), f.get('check', ''), f.get('detail', ''))
+                        col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow"}.get(sev, "cyan")
+                        ab += f"\n  [{col}]•[/] [{col}]{sev}[/] {det}"
+                    console.print(Panel(ab, title="[bold red]◈ BACKEND / ADMIN API AUDIT ◈[/]",
+                                        border_style="red", box=rbox.ROUNDED))
+            elif asc.get('note'):
+                console.print(Panel(f"  [yellow]•[/] {asc['note']}",
+                                    title="[bold yellow]◈ AUTH SCAN (no session) ◈[/]",
+                                    border_style="yellow", box=rbox.ROUNDED))
+        # --- SSRF / internal pivot ---
+        ssr = self.results.get('ssrf', [])
+        if isinstance(ssr, dict) and ssr.get('available'):
+            body = (f"  [bold]{ssr.get('endpoints', 0)}[/] endpoint(s) × "
+                    f"{len(self.SSRF_BYPASS_HEADERS)} bypass header set(s)  ·  "
+                    f"[bold]{ssr.get('bypass_count', 0)}[/] response diff(s)  ·  "
+                    f"[bold]{len(ssr.get('metadata', []))}[/] metadata path hit(s)\n")
+            bps = [b for b in ssr.get('bypass', [])
+                   if str(b.get('verdict', '')).startswith('possible')][:20]
+            bt = None
+            if bps:
+                bt = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_red")
+                bt.add_column("Endpoint")
+                bt.add_column("Header")
+                bt.add_column("Baseline→New", justify="center")
+                bt.add_column("Verdict")
+                for b in bps:
+                    bt.add_row(str(b.get('path', ''))[:40], str(b.get('header', ''))[:46],
+                               f"{b.get('baseline_status')}→{b.get('status')}",
+                               str(b.get('verdict', '')))
+                body += "\n  [red]possible internal bypass:[/]\n"
+            oob = ssr.get('oob', {}) or {}
+            if oob.get('enabled'):
+                body += (f"\n  [cyan]OOB:[/] domain [bold]{oob.get('domain', '?')}[/] · "
+                         f"{oob.get('injected', 0)} probe(s) · {oob.get('note', '')}\n")
+            console.print(Panel(body, title="[bold red]◈ SSRF & INTERNAL PIVOT ◈[/]",
+                                border_style="red", box=rbox.ROUNDED))
+            if bt is not None:
+                console.print(bt)
+            mds = ssr.get('metadata', [])[:12]
+            if mds:
+                mt = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_orange",
+                           title="[bold yellow]◈ CLOUD METADATA PROBE HITS ◈[/]")
+                mt.add_column("Path")
+                mt.add_column("Status", justify="center")
+                mt.add_column("Header")
+                mt.add_column("Sig", justify="center")
+                for m in mds:
+                    mt.add_row(str(m.get('path', ''))[:52], str(m.get('status', '')),
+                               str(m.get('header', ''))[:30],
+                               "[green]✓[/]" if m.get('signature') else "[dim]-[/]")
+                console.print(mt)
+        # --- Smart context fuzz ---
+        smf = self.results.get('smartfuzz', [])
+        if isinstance(smf, dict) and smf.get('available'):
+            body = (f"  [green]✓[/] business profile: "
+                    f"[bold]{', '.join(smf.get('business_profile', [])) or '?'}[/] "
+                    f"[dim]{smf.get('keyword_hits', {})}[/]\n"
+                    f"  [bold]{smf.get('wordlist_size', 0)}[/] generated path(s) fuzzed via "
+                    f"{'ffuf' if smf.get('engine') == 'ffuf' else 'native prober'} · "
+                    f"[bold]{smf.get('js_analyzed', 0)}[/] JS bundle(s) data-flow analyzed → "
+                    f"[bold]{len(smf.get('js_endpoints', []))}[/] candidate(s), "
+                    f"[bold]{len(smf.get('js_resolved', []))}[/] live\n")
+            for b in smf.get('external_bases', [])[:5]:
+                body += f"  [magenta]• external API base (JS data-flow):[/] {b}\n"
+            js_live = smf.get('js_resolved', [])[:15]
+            if js_live:
+                body += "\n" + "\n".join(
+                    f"  [cyan]•[/] {j['path']}  [dim]{j['status']}[/]"
+                    for j in js_live)
+            console.print(Panel(body, title="[bold blue]◈ SMART CONTEXT FUZZ ◈[/]",
+                                border_style="blue", box=rbox.ROUNDED))
+            sf = smf.get('findings', [])
+            if sf:
+                sft = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_blue",
+                            title=f"[bold blue]◈ CONTEXT-AWARE FINDINGS ◈[/] "
+                                  f"[dim]{smf.get('count', 0)} live path(s)[/]")
+                sft.add_column("Status", justify="center")
+                sft.add_column("URL")
+                sft.add_column("Size", justify="right")
+                sft.add_column("Source")
+                for x in sf[:40]:
+                    sft.add_row(str(x.get('status', '')), str(x.get('url', ''))[:90],
+                                str(x.get('size', '')), str(x.get('source', '')))
+                console.print(sft)
+        # --- Unified API pool (katana + linkfinder + ffuf + api modules) ---
+        pool = self.results.get('api_pool', [])
+        if pool:
+            seen, uniq = set(), []
+            for e in pool:
+                k = str(e.get('path', ''))
+                if k and k not in seen:
+                    seen.add(k)
+                    uniq.append(e)
+            pt = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_green",
+                       title=f"[bold green]◈ UNIFIED API POOL ◈[/] [dim]{len(uniq)} unique endpoint(s) across all modules[/]")
+            pt.add_column("Endpoint", style="bold")
+            pt.add_column("Source(s)", style="dim")
+            src_map = {}
+            for e in uniq:
+                src_map.setdefault(str(e.get('path', '')), set()).add(str(e.get('source', '')))
+            for p, srcs in list(src_map.items())[:60]:
+                pt.add_row(p[:80], ", ".join(sorted(srcs))[:60])
+            console.print(pt)
         # --- Screenshots ---
         shots = self.results.get('screenshots', [])
         if isinstance(shots, dict) and (shots.get('captured') or shots.get('note')):
@@ -4695,11 +7314,70 @@ class WebsiteRecon:
                                     title="[bold yellow]◈ SCREENSHOTS (not available) ◈[/]",
                                     border_style="yellow", box=rbox.ROUNDED))
 
+        # --- AI patch & remediation generator (35) ---
+        pat = self.results.get('patch', {})
+        if isinstance(pat, dict) and pat.get('generated'):
+            body = f"  [green]✓[/] [bold]{pat.get('generated', 0)}[/] remediation item(s) · " \
+                   f"[dim]offline template/heuristic engine (no AI key needed)[/]\n"
+            for p in (pat.get('patches') or [])[:12]:
+                sev = str(p.get('severity', 'INFO'))
+                col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow",
+                       "LOW": "cyan"}.get(sev, "dim")
+                body += f"\n  [{col}]•[/] [{col}]{sev}[/] [bold]{p.get('title', '')}[/]  [dim]({p.get('check', '')})[/]"
+            console.print(Panel(body, title="[bold cyan]◈ AI PATCH & REMEDIATION ◈[/]",
+                                border_style="cyan", box=rbox.ROUNDED))
+        # --- Read-only PoC verification (36) ---
+        poc = self.results.get('poc', {})
+        if isinstance(poc, dict) and poc.get('generated'):
+            body = f"  [green]✓[/] [bold]{poc.get('generated', 0)}[/] read-only verification set(s)  ·  " \
+                   f"[dim]{poc.get('policy', '')}[/]\n"
+            for p in (poc.get('pocs') or [])[:6]:
+                body += f"\n  [magenta]•[/] [{ 'red' if p.get('severity') in ('CRITICAL','HIGH') else 'yellow'}]" \
+                        f"{p.get('severity')}[/] {p.get('check', '')}"
+                for cm in (p.get('commands') or [])[:2]:
+                    body += f"\n      [dim]{cm.get('desc', '')}:[/] [white]{cm.get('cmd', '')[:110]}[/]"
+            console.print(Panel(body, title="[bold magenta]◈ READ-ONLY PoC VERIFICATION ◈[/]",
+                                border_style="magenta", box=rbox.ROUNDED))
+        # --- Multi-channel notifications (37) ---
+        ntf = self.results.get('notify', {})
+        if isinstance(ntf, dict) and (ntf.get('channels') or ntf.get('note')):
+            if ntf.get('channels'):
+                body = f"  channels: [bold]{', '.join(ntf.get('channels', []))}[/]  ·  " \
+                       f"[green]{len(ntf.get('sent', []))} sent[/]  ·  " \
+                       f"[red]{len(ntf.get('failed', []))} failed[/]\n"
+                for x in ntf.get('failed', [])[:10]:
+                    body += f"  [red]•[/] {x.get('channel')}: {x.get('status', '')} {x.get('error') or x.get('body', '')}\n"
+                console.print(Panel(body, title="[bold green]◈ WEBHOOK NOTIFICATIONS ◈[/]",
+                                    border_style="green", box=rbox.ROUNDED))
+            elif ntf.get('note'):
+                console.print(Panel(f"  [yellow]•[/] {ntf['note']}",
+                                    title="[bold yellow]◈ WEBHOOK NOTIFICATIONS (not configured) ◈[/]",
+                                    border_style="yellow", box=rbox.ROUNDED))
+        # --- Executive report (39) ---
+        ex = self.results.get('exec', {})
+        if isinstance(ex, dict) and ex.get('html'):
+            body = (f"  [green]✓[/] executive HTML → [cyan]{ex.get('html')}[/]\n"
+                    f"  exposure: [bold]{ex.get('score', 0)}[/]/100 — [bold]{ex.get('verdict', '')}[/]\n"
+                    f"  severity: CRITICAL {ex.get('sev', {}).get('CRITICAL', 0)} · "
+                    f"HIGH {ex.get('sev', {}).get('HIGH', 0)} · MEDIUM {ex.get('sev', {}).get('MEDIUM', 0)}")
+            if ex.get('pdf'):
+                body += f"\n  [green]✓[/] executive PDF ({ex.get('pdf_engine', '')}) → [cyan]{ex.get('pdf')}[/]"
+            elif getattr(self, "exec_pdf_path", ""):
+                body += f"\n  [yellow]•[/] PDF skipped — install weasyprint / reportlab / playwright"
+            console.print(Panel(body, title="[bold blue]◈ EXECUTIVE REPORT ◈[/]",
+                                border_style="blue", box=rbox.ROUNDED))
+        # --- Smart deduplication stats ---
+        dd = self.results.get('dedupe_stats', {})
+        if isinstance(dd, dict) and dd.get('removed'):
+            console.print(Panel(
+                f"  [green]✓[/] deduplicated findings: {dd.get('before', 0)} → {dd.get('after', 0)} "
+                f"[dim]({dd.get('removed', 0)} redundant removed)[/]",
+                title="[bold white]◈ SMART DEDUPLICATION ◈[/]", border_style="white", box=rbox.ROUNDED))
+
         # --- Errors ---
         if self.results['errors']:
             body = "\n".join(f"  [red]•[/] {e}" for e in self.results['errors'][:10])
             console.print(Panel(body, title="[bold red]◈ ERRORS ◈[/]", border_style="red", box=rbox.ROUNDED))
-
         # --- Footer ---
         console.print()
         footer = Group(
@@ -4763,6 +7441,27 @@ class WebsiteRecon:
                 "nuclei_issues": len([f for f in self.results.get('nuclei', {}).get('findings', [])
                                       if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
                 "screenshots": self.results.get('screenshots', {}).get('captured', 0),
+                "katana_urls": self.results.get('katana', {}).get('urls_crawled', 0),
+                "katana_endpoints": len(self.results.get('katana', {}).get('endpoints', [])),
+                "linkfinder_endpoints": self.results.get('linkfinder', {}).get('count', 0),
+                "ffuf_found": self.results.get('ffuf', {}).get('count', 0),
+                "har_endpoints": len(self.results.get('burp', {}).get('endpoints', [])),
+                "har_entries": self.results.get('burp', {}).get('har_entries', 0),
+                "auth_gated_apis": self.results.get('authscan', {}).get('auth_gated', 0),
+                "role_hidden_apis": len(self.results.get('authscan', {}).get('role_gated', [])),
+                "admin_api_findings": len(self.results.get('admin_findings', [])),
+                "ssrf_bypass_hits": len(self.results.get('ssrf', {}).get('bypass', [])),
+                "ssrf_metadata_hits": len(self.results.get('ssrf', {}).get('metadata', [])),
+                "oob_interactions": len(self.results.get('ssrf', {}).get('oob', {}).get('hits', [])),
+                "smartfuzz_found": self.results.get('smartfuzz', {}).get('count', 0),
+                "api_pool_total": len(self.results.get('api_pool', [])),
+                "diff_new_assets": sum(len(v) for v in
+                                       (self.results.get('diff', {}).get('added') or {}).values()),
+                "diff_score": self.results.get('diff', {}).get('score', 0),
+                "remediation_patches": self.results.get('patch', {}).get('generated', 0),
+                "poc_verifications": self.results.get('poc', {}).get('generated', 0),
+                "notifications_sent": len(self.results.get('notify', {}).get('sent', [])),
+                "dedupe_removed": self.results.get('dedupe_stats', {}).get('removed', 0),
             },
             "http": {k: v for k, v in self.scalar_results.items() if k != 'http_headers'},
             "headers": self.scalar_results.get('http_headers', {}),
@@ -4770,8 +7469,9 @@ class WebsiteRecon:
             "missing_security_headers": self.results['missing_security_headers'],
             "dns": self.results['dns'],
             "subdomains": sorted(set(self.results['subdomains'])),
-            "open_ports": self.results['ports'],
-            "paths": self.results['paths'],
+            "open_ports": _norm_ports(self.results['ports']),
+            "ports_detail": self.results.get('port_details', []),
+            "paths": _norm_paths(self.results['paths']),
             "emails": sorted(set(self.results['emails'])),
             "ips": sorted(set(self.results['ips'])),
             "phones": self.results['phones'],
@@ -4924,6 +7624,64 @@ class WebsiteRecon:
                 "findings": [{"severity": sev, "id": fid, "detail": det}
                              for sev, fid, det in self.results.get('nuclei', {}).get('findings', [])],
             },
+            "katana": {
+                "available": self.results.get('katana', {}).get('available', False),
+                "binary": self.results.get('katana', {}).get('binary', ''),
+                "version": self.results.get('katana', {}).get('version', ''),
+                "depth": self.results.get('katana', {}).get('depth', 0),
+                "urls_crawled": self.results.get('katana', {}).get('urls_crawled', 0),
+                "js_files": self.results.get('katana', {}).get('js_files', []),
+                "endpoints": self.results.get('katana', {}).get('endpoints', []),
+                "note": self.results.get('katana', {}).get('note', ''),
+            },
+            "linkfinder": {
+                "available": self.results.get('linkfinder', {}).get('available', False),
+                "js_analyzed": self.results.get('linkfinder', {}).get('js_analyzed', 0),
+                "external_cli": self.results.get('linkfinder', {}).get('external_cli', False),
+                "ext_found": self.results.get('linkfinder', {}).get('ext_found', 0),
+                "count": self.results.get('linkfinder', {}).get('count', 0),
+                "endpoints": self.results.get('linkfinder', {}).get('endpoints', []),
+                "sources": self.results.get('linkfinder', {}).get('sources', {}),
+            },
+            "ffuf": {
+                "available": self.results.get('ffuf', {}).get('available', False),
+                "binary": self.results.get('ffuf', {}).get('binary', ''),
+                "fuzz_url": self.results.get('ffuf', {}).get('fuzz_url', ''),
+                "wordlist_size": self.results.get('ffuf', {}).get('wordlist_size', 0),
+                "count": self.results.get('ffuf', {}).get('count', 0),
+                "note": self.results.get('ffuf', {}).get('note', ''),
+                "findings": self.results.get('ffuf', {}).get('findings', []),
+            },
+            "burp_caido": {
+                "proxy": self.results.get('burp', {}).get('proxy', ''),
+                "proxy_ok": self.results.get('burp', {}).get('proxy_ok', False),
+                "proxy_note": self.results.get('burp', {}).get('proxy_note', ''),
+                "har_files": self.results.get('burp', {}).get('har_files', []),
+                "har_entries": self.results.get('burp', {}).get('har_entries', 0),
+                "endpoints": self.results.get('burp', {}).get('endpoints', []),
+                "params": self.results.get('burp', {}).get('params', []),
+                "cookies": self.results.get('burp', {}).get('cookies', []),
+                "auth_headers": self.results.get('burp', {}).get('auth_headers', []),
+                "js_files": self.results.get('burp', {}).get('js_files', []),
+                "secrets": self.results.get('burp', {}).get('secrets', []),
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('proxy_findings', [])],
+            },
+            "api_pool": self.results.get('api_pool', []),
+            "auth_setup": self.results.get('auth_setup', {}),
+            "authscan": self.results.get('authscan', {}),
+            "admin_api": {
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('admin_findings', [])],
+            },
+            "ssrf": self.results.get('ssrf', {}),
+            "smartfuzz": self.results.get('smartfuzz', {}),
+            "scan_diff": self.results.get('diff', {"available": False}),
+            "remediation": self.results.get('patch', {}),
+            "poc_verification": self.results.get('poc', {}),
+            "notifications": self.results.get('notify', {}),
+            "executive_report": self.results.get('exec', {}),
+            "dedupe": self.results.get('dedupe_stats', {}),
             "errors": self.results['errors'],
         }
         return out
@@ -4976,9 +7734,12 @@ class WebsiteRecon:
         parts.append(sec("Subdomains", li(d.get('subdomains', [])), "#06b6d4"))
         ports = d.get('open_ports', [])
         if ports:
-            parts.append(sec("Open Ports",
-                             "<div class='chips'>" + "".join(f"<span class='chip green'>{p}</span>" for p in ports) + "</div>",
-                             "#22c55e"))
+            chips = "".join(
+                f"<span class='chip green'>{_e(str(p.get('port', p.get('number', p))))}"
+                f" ({_e(str(p.get('service', p.get('name', '?'))))})</span>"
+                if isinstance(p, dict) else f"<span class='chip green'>{_e(str(p))}</span>"
+                for p in ports)
+            parts.append(sec("Open Ports", "<div class='chips'>" + chips + "</div>", "#22c55e"))
         # HTTP + headers
         http = d.get('http', {})
         if http:
@@ -5329,6 +8090,151 @@ class WebsiteRecon:
                                        _e(f['id']), _e(str(f['detail'])[:140])] for f in nf[:80]]), "#ef4444"))
             elif nuc.get('note'):
                 parts.append(sec("Nuclei Scan", f"<p class='muted'>{_e(nuc['note'])}</p>", "#64748b"))
+        # Katana crawler
+        kat = d.get('katana', {})
+        if kat and (kat.get('urls_crawled') or kat.get('note')):
+            if kat.get('urls_crawled'):
+                eps = kat.get('endpoints', [])
+                inner = (f"<p><b>{kat.get('urls_crawled',0)}</b> URLs crawled · "
+                         f"<b>{len(eps)}</b> API endpoints · <b>{len(kat.get('js_files',[]))}</b> JS files "
+                         f"(katana v{_e(str(kat.get('version','?')))})</p>")
+                if eps:
+                    inner += tbl(["Endpoint"], [[_e(e)] for e in eps[:120]])
+                parts.append(sec("Katana Crawler (API Discovery)", inner, "#06b6d4"))
+            else:
+                parts.append(sec("Katana Crawler", f"<p class='muted'>{_e(kat.get('note',''))}</p>", "#64748b"))
+        # LinkFinder JS endpoints
+        lf = d.get('linkfinder', {})
+        if lf and lf.get('count'):
+            src_note = "external linkfinder CLI" if lf.get('external_cli') else "built-in LinkFinder regex engine"
+            rows = [[_e(e)] for e in lf.get('endpoints', [])[:150]]
+            parts.append(sec(f"LinkFinder JS Endpoints ({lf.get('count',0)}) — {lf.get('js_analyzed',0)} JS via {src_note}",
+                             tbl(["Endpoint"], rows) if rows else "", "#d946ef"))
+        # FFUF fuzzing
+        ff = d.get('ffuf', {})
+        if ff and (ff.get('count') or ff.get('note')):
+            if ff.get('count'):
+                rows = [[f"<span class='chip {'green' if str(x.get('status','')).startswith('2') else ('yellow' if str(x.get('status','')).startswith(('3','4')) else 'red')}'>{_e(str(x.get('status','')))}</span>",
+                         _e(str(x.get('url',''))[:120]), _e(str(x.get('size',''))),
+                         _e(str(x.get('content_type',''))[:40])] for x in ff.get('findings', [])[:100]]
+                parts.append(sec(f"FFUF API Fuzzing — {ff.get('count',0)} live path(s)",
+                                 tbl(["Status", "URL", "Size", "Type"], rows), "#3b82f6"))
+            elif ff.get('note'):
+                parts.append(sec("FFUF API Fuzzing", f"<p class='muted'>{_e(ff['note'])}</p>", "#64748b"))
+        # Burp / Caido traffic bridge
+        bur = d.get('burp_caido', {})
+        if bur and (bur.get('proxy') or bur.get('har_entries') or bur.get('proxy_note')):
+            head = ""
+            if bur.get('proxy'):
+                head += (f"<p>Proxy: <b>{_e(str(bur['proxy']))}</b> — "
+                         + ("<span class='chip green'>capture active</span>" if bur.get('proxy_ok')
+                            else "<span class='chip red'>unreachable</span>")
+                         + f" <span class='muted'>{_e(str(bur.get('proxy_note', '')))}</span></p>")
+            if bur.get('har_files'):
+                head += (f"<p>HAR import: <b>{bur.get('har_entries', 0)}</b> entries from "
+                         f"<b>{len(bur['har_files'])}</b> file(s) · <b>{len(bur.get('endpoints', []))}</b> endpoint(s) · "
+                         f"<b>{len(bur.get('params', []))}</b> parameter(s) · <b>{len(bur.get('cookies', []))}</b> cookie(s)</p>")
+                if bur.get('endpoints'):
+                    head += tbl(["Captured endpoint"], [[_e(str(e)[:160])] for e in bur['endpoints'][:150]])
+                if bur.get('secrets'):
+                    head += "<h3>Secrets in captured responses</h3>" + tbl(
+                        ["Secret"], [[_e(str(s)[:160])] for s in bur['secrets'][:40]])
+            parts.append(sec("Burp / Caido Traffic Bridge", head, "#eab308"))
+        # Authenticated scan (session injection + role diff)
+        asc = d.get('authscan', {})
+        ainfo = d.get('auth_setup', {}) or {}
+        if asc and (asc.get('available') or asc.get('note')):
+            if asc.get('available'):
+                head = (f"<p>Headers: <b>{_e(', '.join(ainfo.get('headers', [])) or '-')}</b> · "
+                        f"Cookies: <b>{_e(', '.join(ainfo.get('cookies', [])) or '-')}</b> · "
+                        f"Probed: <b>{asc.get('endpoints_probed', 0)}</b> · "
+                        f"Auth-gated: <b>{asc.get('auth_gated', 0)}</b> · "
+                        f"Status changed: <b>{asc.get('status_changed', 0)}</b>"
+                        + (" · <span class='chip green'>session verified</span>"
+                           if asc.get('session_verified') else "") + "</p>")
+                rows = [[_e(str(x.get('path', ''))[:140]), _e(str(x.get('status_noauth'))),
+                         _e(str(x.get('status_auth'))), _e(str(x.get('size_auth')))]
+                        for x in asc.get('findings', [])[:120]
+                        if x.get('auth_gated') or x.get('status_noauth') != x.get('status_auth')]
+                if rows:
+                    head += tbl(["Endpoint", "No-auth", "Auth", "Size (auth)"], rows)
+                gated = asc.get('role_gated', [])
+                if gated:
+                    head += "<h3>Role-hidden APIs</h3>" + tbl(
+                        ["Endpoint", "Visible to", "Hidden from"],
+                        [[_e(str(g.get('path', ''))[:140]), _e(', '.join(g.get('visible_to', []))),
+                          _e(', '.join(f"{h.get('role')}:{h.get('status')}"
+                                       for h in g.get('hidden_from', [])))]
+                         for g in gated[:100]])
+                parts.append(sec("Authenticated API Scan", head, "#ef4444"))
+            elif asc.get('note'):
+                parts.append(sec("Authenticated API Scan",
+                                 f"<p class='muted'>{_e(asc['note'])}</p>", "#64748b"))
+        # SSRF / internal pivot
+        ssr = d.get('ssrf', {})
+        if ssr and ssr.get('available'):
+            head = (f"<p>Endpoints: <b>{ssr.get('endpoints', 0)}</b> · "
+                    f"bypass response diffs: <b>{ssr.get('bypass_count', 0)}</b> · "
+                    f"metadata hits: <b>{len(ssr.get('metadata', []))}</b></p>")
+            bps = [b for b in ssr.get('bypass', [])
+                   if str(b.get('verdict', '')).startswith('possible')][:60]
+            if bps:
+                head += tbl(["Endpoint", "Header", "Baseline→New", "Verdict"],
+                            [[_e(str(b.get('path', ''))[:100]), _e(str(b.get('header', ''))[:80]),
+                              _e(f"{b.get('baseline_status')}→{b.get('status')}"),
+                              _e(str(b.get('verdict', '')))] for b in bps])
+            mds = ssr.get('metadata', [])[:40]
+            if mds:
+                head += "<h3>Cloud metadata probe hits</h3>" + tbl(
+                    ["Path", "Status", "Header", "Signature"],
+                    [[_e(str(m.get('path', ''))), _e(str(m.get('status', ''))),
+                      _e(str(m.get('header', ''))[:60]),
+                      "yes" if m.get('signature') else "-"] for m in mds])
+            oob = ssr.get('oob', {}) or {}
+            if oob.get('enabled'):
+                head += (f"<p class='muted'>OOB domain: <b>{_e(str(oob.get('domain', '?')))}</b> · "
+                         f"{oob.get('injected', 0)} probe(s) · {_e(str(oob.get('note', '')))}</p>")
+                if oob.get('hits'):
+                    head += ("<h3>OOB interactions</h3><pre>"
+                             + _e("\n".join(str(h) for h in oob['hits'][:30])) + "</pre>")
+            parts.append(sec("SSRF & Internal Pivot", head, "#ef4444"))
+        # Smart context fuzz
+        smf = d.get('smartfuzz', {})
+        if smf and smf.get('available'):
+            head = (f"<p>Business profile: <b>{_e(', '.join(smf.get('business_profile', [])) or '?')}</b> "
+                    f"<span class='muted'>{_e(str(smf.get('keyword_hits', {})))}</span><br>"
+                    f"Generated wordlist: <b>{smf.get('wordlist_size', 0)}</b> "
+                    f"(engine: {_e(str(smf.get('engine', '')))}) · "
+                    f"JS analyzed: <b>{smf.get('js_analyzed', 0)}</b> → candidates "
+                    f"<b>{len(smf.get('js_endpoints', []))}</b>, "
+                    f"live <b>{len(smf.get('js_resolved', []))}</b></p>")
+            if smf.get('js_resolved'):
+                head += tbl(["JS data-flow endpoint", "Status", "Size"],
+                            [[_e(str(j.get('path', ''))[:140]), _e(str(j.get('status', ''))),
+                              _e(str(j.get('size', '')))] for j in smf['js_resolved'][:60]])
+            if smf.get('external_bases'):
+                head += ("<p class='muted'>external API bases: "
+                         + _e(', '.join(smf['external_bases'][:10])) + "</p>")
+            sf = smf.get('findings', [])
+            if sf:
+                rows = [[f"<span class='chip {'green' if str(x.get('status', '')).startswith('2') else ('yellow' if str(x.get('status', '')).startswith(('3', '4')) else 'red')}'>{_e(str(x.get('status', '')))}</span>",
+                         _e(str(x.get('url', ''))[:120]), _e(str(x.get('size', ''))),
+                         _e(str(x.get('source', ''))[:30])] for x in sf[:100]]
+                head += tbl(["Status", "URL", "Size", "Source"], rows)
+            parts.append(sec(f"Smart Context Fuzz — {smf.get('count', 0)} live path(s)",
+                             head, "#3b82f6"))
+        # Unified API pool
+        pool = d.get('api_pool', [])
+        if pool:
+            seen, src_map = set(), {}
+            for e in pool:
+                p = str(e.get('path', ''))
+                if p:
+                    src_map.setdefault(p, set()).add(str(e.get('source', '')))
+            if src_map:
+                rows = [[_e(p[:140]), _e(', '.join(sorted(s))[:80])] for p, s in list(src_map.items())[:160]]
+                parts.append(sec(f"Unified API Pool ({len(src_map)} unique endpoint(s))",
+                                 tbl(["Endpoint", "Source(s)"], rows), "#22c55e"))
         # Screenshots
         sh = d.get('screenshots', {})
         if sh and sh.get('captured'):
@@ -5589,7 +8495,7 @@ async function loadScans(){
   document.querySelectorAll('.scan').forEach(el=>el.onclick=()=>openScan(el.dataset.id));
   if(SCANS.length && !DATA) openScan(SCANS[0].id);
 }
-function findCount(s){ s=s||{}; const keys=['cve_issues','audit_issues','supply_issues','nuclei_issues','anomaly_issues','intel_issues','breach_issues','tls_issues','email_issues'];
+function findCount(s){ s=s||{}; const keys=['cve_issues','audit_issues','supply_issues','nuclei_issues','anomaly_issues','intel_issues','breach_issues','tls_issues','email_issues','ssrf_bypass_hits'];
   let cri=0,hig=0,all=0; keys.forEach(k=>{all+=(s[k]||0)}); return {all,cri:s.cve_issues||0,hig:s.supply_issues||0}; }
 
 function findings(d){
@@ -5608,7 +8514,12 @@ function findings(d){
   push('Breach',d.breach&&d.breach.findings);
   push('Correlation',d.correlation&&d.correlation.findings);
   push('Nuclei',d.nuclei&&d.nuclei.findings);
+  push('Burp / Caido',d.burp_caido&&d.burp_caido.findings);
+  push('Scan Diff',d.scan_diff&&d.scan_diff.findings);
+  push('Admin API',d.admin_api&&d.admin_api.findings);
   push('Email',d.email_security&&d.email_security.findings);
+  push('Remediation',(d.remediation&&d.remediation.patches||[]).map(p=>({severity:p.severity,check:p.title,detail:p.finding})));
+  push('PoC Verify',(d.poc_verification&&d.poc_verification.pocs||[]).map(p=>({severity:p.severity,check:p.check,detail:p.finding})));
   out.sort((a,b)=>SEV_ORDER.indexOf(a.sev)-SEV_ORDER.indexOf(b.sev));
   return out;
 }
@@ -5646,6 +8557,7 @@ function render(d){
     ${kpi(s.secrets||0,'Secrets leaked','var(--cri)')}${kpi(s.subdomains||0,'Subdomains')}
     ${kpi(s.open_ports||0,'Open ports')}${kpi(s.takeover_risks||0,'Takeover risks')}
     ${kpi(chains.length,'Attack chains')}${kpi(shots.length,'Screenshots')}
+    ${kpi((s.diff_new_assets||0),'New since last scan',(s.diff_score>=40?'var(--hig)':''))}
     ${kpi((comp.coverage_pct||0)+'%','Compliance')}
   </div>
   <div class="grid2">
@@ -5686,10 +8598,34 @@ function render(d){
      shots.map((x,i)=>x.file?`<div class="shot"><img loading="lazy" src="/api/shot?id=${encodeURIComponent(d.__id)}&i=${i}">
        <div class="cap">${e(x.status||'')} · ${e(x.url||'')}</div></div>`:'').join('')}</div>`:''}
 
+  ${(d.scan_diff&&d.scan_diff.available)?`<h3>Changes since last scan <span class="mut" style="font-size:12px">· baseline ${e((d.scan_diff.baseline_when||'').slice(0,16).replace('T',' '))} · score ${e(d.scan_diff.score||0)}/100 · ${e(d.scan_diff.verdict||'')}</span></h3>
+    <div class="panel">${(d.scan_diff.findings||[]).length?(d.scan_diff.findings||[]).map(f=>`<div style="margin-bottom:8px">
+      <span class="chip ${e((f.severity||'INFO').toUpperCase())}">${e((f.severity||'INFO').toUpperCase())}</span>
+      <b style="margin-left:8px">${e(f.check||'')}</b>
+      <div class="mut" style="font-size:12px;margin-top:3px">${e(f.detail||'')}</div>
+      ${(f.items||[]).length?`<div style="margin-top:4px">${(f.items||[]).slice(0,40).map(x=>`<span class="chip mod">${e(x)}</span>`).join('')}</div>`:''}
+    </div>`).join(''):'<div class="mut">No new assets since the last scan.</div>'}</div>`:''}
+
+  ${(d.remediation&&d.remediation.generated)?`<h3>Remediation plan (${d.remediation.generated})</h3><div class="panel">${
+     (d.remediation.patches||[]).slice(0,30).map(p=>`<div style="margin-bottom:10px">
+       <span class="chip ${e((p.severity||'INFO').toUpperCase())}">${e((p.severity||'INFO').toUpperCase())}</span>
+       <b style="margin-left:8px">${e(p.title||'')}</b> <span class="mut">(${e(p.check||'')})</span>
+       <div class="mut" style="font-size:12px;margin-top:3px">${e((p.finding||'').slice(0,180))}</div>
+       <pre style="white-space:pre-wrap;font-size:11px;margin-top:4px;background:#0b1220;padding:8px;border-radius:6px">${e((p.remediation||'').slice(0,700))}</pre>
+     </div>`).join('')}</div>`:''}
+
+  ${(d.poc_verification&&d.poc_verification.generated)?`<h3>Read-only PoC verification (${d.poc_verification.generated})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${e(d.poc_verification.policy||'')}</div>${
+     (d.poc_verification.pocs||[]).slice(0,25).map(p=>`<div style="margin-bottom:8px">
+       <span class="chip ${e((p.severity||'INFO').toUpperCase())}">${e((p.severity||'INFO').toUpperCase())}</span>
+       <b style="margin-left:8px">${e(p.check||'')}</b>
+       ${(p.commands||[]).map(c=>`<pre style="white-space:pre-wrap;font-size:11px;margin-top:4px;background:#0b1220;padding:8px;border-radius:6px"># ${e(c.desc||'')}\n${e(c.cmd||'')}</pre>`).join('')}
+     </div>`).join('')}</div>`:''}
+
   <div class="grid2" style="margin-top:18px">
     <div class="panel"><h3>Assets</h3>
       <h4 class="tag">Subdomains</h4><ul>${list(d.subdomains,40)}</ul>
-      <h4 class="tag">Open ports</h4><ul>${list((d.open_ports||[]).map(p=>p.port+' ('+(p.service||'?')+')'),30)}</ul>
+      <h4 class="tag">Open ports</h4><ul>${list(portList(d.open_ports),30)}</ul>
     </div>
     <div class="panel"><h3>Secrets & intel</h3>
       <h4 class="tag">Secrets (masked)</h4><ul>${list(d.secrets,30)}</ul>
@@ -5697,13 +8633,17 @@ function render(d){
     </div>
   </div>
   ${(d.errors&&d.errors.length)?`<h3>Notes / errors</h3><div class="panel err">${list(d.errors,40)}</div>`:''}
-  `;
-  document.getElementById('main').innerHTML=html;
+  `;  document.getElementById('main').innerHTML=html;
   renderFindings(F);
   document.getElementById('q').oninput=()=>renderFindings(F);
 }
 function kpi(v,l,col){return `<div class="kpi"><div class="tag">${e(l)}</div>
   <div class="kpi-v" style="${col?'color:'+col:''}">${e(v)}</div></div>`}
+function portList(a){a=a||[];return a.map(p=>{
+  if(p==null||p==='') return '';
+  if(typeof p==='object'){const n=p.port!=null?p.port:(p.number!=null?p.number:'');const s=p.service||p.name||'?';return n===''?'':(n+' ('+s+')');}
+  return String(p);
+}).filter(Boolean);}
 function list(a,n){a=a||[];return a.length?a.slice(0,n||99).map(x=>`<li>${e(x)}</li>`).join(''):'<li class="mut">none</li>'}
 function renderFindings(F){
   const q=(document.getElementById('q').value||'').toLowerCase();
@@ -5865,8 +8805,16 @@ def main():
                "  nullveil example.com -R repro.md    -> evidence/repro pack (benign, no payloads)\n"
                "  nullveil example.com --dot graph.dot -> export attack path graph as DOT\n"
                "  nullveil example.com --correlate a.com,b.com -> cross-org correlation\n"
+               "  nullveil example.com -a auth --login-url https://x/login --login-user u --login-pass p\n"
+               "  nullveil example.com -a auth --auth-token eyJ... --role 'admin=Authorization: Bearer eyJ...'\n"
+               "  nullveil example.com -a ssrf,smartfuzz --oob  -> OOB SSRF probe + context-aware fuzz\n"
+               "  nullveil example.com --proxy http://127.0.0.1:8080 -> route scan via Burp/Caido for manual follow-up\n"
+               "  nullveil example.com -a burp --har capture.har -> import Burp/Caido HAR into the API pool\n"
                "  HIBP_API_KEY=xxx nullveil example.com -a breach -> breach monitoring\n"
                "  nullveil example.com --pdf report.pdf -> client-ready PDF report\n"
+               "  nullveil example.com -a patch,poc    -> AI-style remediation + read-only PoC commands\n"
+               "  nullveil example.com -a exec --exec-report exec.html --exec-pdf exec.pdf -> C-level report\n"
+               "  nullveil example.com --webhook-slack https://hooks.slack.com/... -> push summary to Slack\n"
                "  nullveil --dashboard                -> local web dashboard (scan history)\n"
                "  nullveil --pdf-from old.json --pdf out.pdf -> convert saved JSON to PDF\n"
                "  nullveil -l                         -> list attack modules\n\n"
@@ -5882,7 +8830,7 @@ def main():
     parser.add_argument("-p", "--ports", type=str, help="Custom comma-separated ports (e.g. 80,443,8080)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Less console output")
     parser.add_argument("-a", "--attack", metavar="LIST", default=None,
-                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate,26=shot,27=nuclei or 'all'")
+                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate,26=shot,27=nuclei,28=katana,29=linkfinder,30=ffuf,31=auth,32=ssrf,33=smartfuzz,34=burp or 'all'")
     parser.add_argument("-m", "--menu", action="store_true", help="Interactive attack selection menu")
     parser.add_argument("-l", "--list-attacks", action="store_true", help="List available attack modules")
     parser.add_argument("-R", "--repro", metavar="FILE", help="Export evidence/reproduction pack (benign, no exploit payloads) to markdown file")
@@ -5895,10 +8843,80 @@ def main():
     parser.add_argument("--no-history", action="store_true", help="Do not auto-save this scan to history")
     parser.add_argument("--nuclei-templates", metavar="DIR", default=None,
                         help="Custom nuclei template path/dir (used by -a nuclei)")
+    parser.add_argument("--ffuf-wordlist", metavar="FILE", default=None,
+                        help="Custom path wordlist for ffuf (used by -a ffuf; default: built-in API list)")
+    authg = parser.add_argument_group("authenticated scanning (module 31: auth)")
+    authg.add_argument("--auth-header", action="append", metavar="'Name: Value'",
+                       help="Header injected into EVERY scan request (repeatable), e.g. --auth-header 'X-Api-Key: abc'")
+    authg.add_argument("--auth-cookie", action="append", metavar="name=value",
+                       help="Session cookie injected into every request (repeatable)")
+    authg.add_argument("--auth-token", metavar="TOKEN", default=None,
+                       help="Bearer token shorthand -> Authorization: Bearer TOKEN on every request")
+    authg.add_argument("--auth-api-key", metavar="KEY", default=None,
+                       help="API key sent in --auth-api-key-header (default header: X-API-Key)")
+    authg.add_argument("--auth-api-key-header", metavar="NAME", default="X-API-Key",
+                       help="Header name used for --auth-api-key (default: X-API-Key)")
+    authg.add_argument("--login-url", metavar="URL", default=None,
+                       help="Automated login endpoint (POST) — engine captures cookies/token, then every module runs authenticated")
+    authg.add_argument("--login-user", metavar="USER", default=None,
+                       help="Login username/email for --login-url")
+    authg.add_argument("--login-pass", metavar="PASS", default=None,
+                       help="Login password for --login-url")
+    authg.add_argument("--login-user-field", metavar="NAME", default="username",
+                       help="JSON/form field name for the username (default: username)")
+    authg.add_argument("--login-pass-field", metavar="NAME", default="password",
+                       help="JSON/form field name for the password (default: password)")
+    authg.add_argument("--login-body", metavar="JSON", default=None,
+                       help="Raw login JSON template with {user}/{pass} placeholders (overrides field names)")
+    authg.add_argument("--login-form", action="store_true",
+                       help="Send login fields as form data instead of JSON")
+    authg.add_argument("--login-token-path", metavar="PATH", default=None,
+                       help="Dot-path of bearer token in login JSON response (auto-detects access_token/token/jwt if omitted)")
+    authg.add_argument("--login-extra", action="append", metavar="K=V",
+                       help="Extra login body field (repeatable), e.g. --login-extra device=web")
+    authg.add_argument("--role", action="append", metavar="'NAME=SPEC'",
+                       help="Multi-role profile for role-diff scan (repeatable). SPEC: 'Header: value', "
+                            "'name=value' cookie, or bare token. e.g. --role 'user=Cookie: sid=123' "
+                            "--role 'admin=Authorization: Bearer eyJ...'")
+    oobg = parser.add_argument_group("SSRF / out-of-band (module 32: ssrf)")
+    oobg.add_argument("--oob", action="store_true",
+                      help="Enable interactsh out-of-band SSRF callbacks (needs interactsh-client binary)")
+    oobg.add_argument("--oob-server", metavar="HOST", default=None,
+                      help="Custom interactsh server host (default: interactsh public server)")
+    oobg.add_argument("--oob-wait", type=int, default=0, metavar="SEC",
+                      help="Seconds to wait for OOB callbacks (default: 45 normal / 90 deep)")
+    proxg = parser.add_argument_group("Burp Suite / Caido bridge (module 34: burp)")
+    proxg.add_argument("--proxy", metavar="URL", default=None,
+                       help="Route the whole scan (httpx + katana/ffuf/nuclei) through an intercepting proxy, "
+                            "e.g. Burp http://127.0.0.1:8080 or Caido http://127.0.0.1:8080 — traffic lands in "
+                            "their HTTP history for manual follow-up")
+    proxg.add_argument("--har", action="append", metavar="FILE", default=None,
+                       help="Import a HAR capture exported from Burp (Save items → HAR) or Caido (Export HAR) — "
+                            "endpoints, params, cookies & secrets feed the unified API pool (repeatable)")
     parser.add_argument("--pdf", metavar="FILE", default=None,
                         help="Export a client-ready PDF report (headless Chromium; needs playwright)")
     parser.add_argument("--pdf-from", metavar="JSON", default=None,
                         help="Convert an existing NULLVEIL JSON report to PDF (use with --pdf)")
+    # ---- webhook notifications (module 37) ----
+    parser.add_argument("--webhook-slack", metavar="URL", default=None,
+                        help="Post the scan summary to a Slack incoming-webhook URL")
+    parser.add_argument("--webhook-telegram", metavar="TOKEN:CHATID", default=None,
+                        help="Post to Telegram (bot TOKEN:CHAT_ID), e.g. 123:abc:-100123456")
+    parser.add_argument("--webhook-discord", metavar="URL", default=None,
+                        help="Post the scan summary to a Discord webhook URL")
+    parser.add_argument("--webhook-teams", metavar="URL", default=None,
+                        help="Post the scan summary to a Microsoft Teams incoming-webhook URL")
+    # ---- strict per-module timeouts ----
+    parser.add_argument("--module-timeout", type=float, metavar="SEC", default=180.0,
+                        help="Per-module hard timeout for normal modules (default: 180s)")
+    parser.add_argument("--module-timeout-heavy", type=float, metavar="SEC", default=300.0,
+                        help="Per-module hard timeout for crawl/fuzz modules (default: 300s)")
+    parser.add_argument("--no-dedupe", action="store_true",
+                        help="Disable smart deduplication of redundant low-severity findings")
+    parser.add_argument("--exec-report", metavar="FILE", default=None,
+                        help="Write the executive C-level HTML report to FILE (module 39)")
+    parser.add_argument("--exec-pdf", metavar="FILE", default=None,
+                        help="Also export the executive report as PDF (needs weasyprint/reportlab/playwright)")
     parser.add_argument("--dashboard", nargs="?", const="8899", metavar="PORT", default=None,
                         help="Serve a local web dashboard of scan history (default port: 8899)")
     parser.add_argument("-V", "--version", action="version", version=f"NULLVEIL Recon v{__version__} | Owner: NULLVEIL | Engine: DeepHat")
@@ -5968,7 +8986,10 @@ def main():
             console.print("[dim]Use -l or --list-attacks to see available modules[/]")
             sys.exit(1)
     else:
-        attack_indices = list(range(1, MAX_MODULE + 1))
+        attack_indices = list(ALL_MODULE_NUMS)
+    # Using --proxy / --har implies the Burp/Caido bridge (module 34) should run
+    if (args.proxy or args.har) and 34 not in attack_indices:
+        attack_indices = sorted(set(attack_indices) | {34})
     ports = None
     if args.ports:
         try:
@@ -5984,8 +9005,10 @@ def main():
         concurrency=args.concurrency,
         ports=ports,
         wordlist=args.wordlist,
+        proxy=args.proxy or None,
     )
     recon.attack_set = attack_indices
+    recon.har_files = [str(f) for f in (args.har or [])]
     if args.hibp_key:
         os.environ.setdefault('HIBP_API_KEY', args.hibp_key)
     try:
@@ -5997,7 +9020,44 @@ def main():
     except Exception:
         pass
     recon.nuclei_templates = args.nuclei_templates
+    recon.ffuf_wordlist = args.ffuf_wordlist
+    recon.auth_cfg = {
+        "headers": args.auth_header or [],
+        "cookies": args.auth_cookie or [],
+        "token": args.auth_token or "",
+        "api_key": args.auth_api_key or "",
+        "api_key_header": args.auth_api_key_header,
+        "login_url": args.login_url or "",
+        "login_user": args.login_user or "",
+        "login_pass": args.login_pass or "",
+        "user_field": args.login_user_field,
+        "pass_field": args.login_pass_field,
+        "body": args.login_body or "",
+        "form": bool(args.login_form),
+        "token_path": args.login_token_path or "",
+        "extra": args.login_extra or [],
+        "roles": args.role or [],
+    }
+    recon.oob_cfg = {"enabled": bool(args.oob),
+                     "server": args.oob_server or "",
+                     "wait": int(args.oob_wait or 0)}
     recon.no_history = args.no_history
+    # ---- roadmap v3.6.0 wiring ----
+    recon.module_timeout = float(args.module_timeout or 180.0)
+    recon.module_timeout_heavy = float(args.module_timeout_heavy or 300.0)
+    recon.no_dedupe = bool(args.no_dedupe)
+    recon.exec_report_path = args.exec_report or ""
+    recon.exec_pdf_path = args.exec_pdf or ""
+    recon.webhooks = {
+        "slack": args.webhook_slack or "",
+        "telegram": args.webhook_telegram or "",
+        "discord": args.webhook_discord or "",
+        "teams": args.webhook_teams or "",
+    }
+    if any(recon.webhooks.values()):
+        recon.attack_set = sorted(set(recon.attack_set) | {37})
+    if args.exec_report or args.exec_pdf:
+        recon.attack_set = sorted(set(recon.attack_set) | {39})
     if args.resume is not None:
         entry = recon._history_load(args.resume or None)
         if entry:

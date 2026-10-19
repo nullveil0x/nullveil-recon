@@ -1,8 +1,8 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.2.2 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.6.0 · **License:** MIT
 
-A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 27 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
+A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 38 attack modules — from DNS records to full API discovery, remediation and executive reporting — with a live progress bar and a premium terminal report.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.2.2   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.6.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -27,7 +27,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 git clone https://github.com/nullveil0x/nullveil-recon.git
 cd nullveil-recon
 pip install -r requirements.txt
-python3 nullveil_recon.py example.com                  # full scan (27 modules)
+python3 nullveil_recon.py example.com                  # full scan (38 modules)
 python3 nullveil_recon.py example.com --dashboard      # scan → PDF-ready UI opens
 ```
 
@@ -47,7 +47,7 @@ By using NULLVEIL Recon you agree to these terms.
 
 ---
 
-## ✨ Features — 27 Attack Modules
+## ✨ Features — 38 Attack Modules
 
 | # | Module | What it does |
 |---|--------|--------------|
@@ -78,11 +78,25 @@ By using NULLVEIL Recon you agree to these terms.
 | 25 | **Target Correlation** | **Cross-org/multi-tenant correlation: shared NS / MX / IP / CDN across your domains, auto-derived from cert SANs or `--correlate`** |
 | 26 | **Screenshot Capture** | **Headless-Chromium snapshots of homepage + discovered/flagged paths → `nullveil_shots/<domain>/`, embedded in HTML report (optional: `playwright`)** |
 | 27 | **Nuclei Template Scan** | **ProjectDiscovery nuclei integration — runs the industry-standard template engine (critical/high/medium) and parses JSONL findings (optional: `nuclei` binary)** |
+| 28 | **Katana Crawler (API)** | **ProjectDiscovery katana deep crawl — URL/endpoint/JS-file harvesting that feeds the unified API pool (optional: `katana` binary)** |
+| 29 | **LinkFinder JS Endpoints** | **Hidden API endpoint extraction from every JS bundle via LinkFinder's regex engine (uses `linkfinder` CLI if installed, otherwise built-in engine — zero-dependency)** |
+| 30 | **FFUF API Fuzzing** | **Content/API brute-force with a curated 400+ path API wordlist + every endpoint discovered by other modules, auto-calibrated, soft-404 filtered (optional: `ffuf` binary)** |
+| 31 | **Authenticated API Scan** | **Session/auth injection (`--auth-token` / `--auth-header` / `--auth-cookie`) + automated login engine (`--login-url` + user/pass → captures cookies & Bearer tokens) + multi-role profiling (`--role`) — probes every discovered endpoint *with & without* auth to expose auth-gated and role-hidden APIs** |
+| 32 | **SSRF & Internal Pivot** | **IP-bypass header fuzzing (XFF/X-Real-IP/X-Internal-API/X-Original-URL… vs baseline diff), cloud metadata probing (AWS/GCP/Azure paths + provider headers), optional out-of-band callbacks via `interactsh-client` (`--oob`)** |
+| 33 | **Smart Context Fuzz** | **Context-aware wordlist generation from business type / domain / tech fingerprint (e-commerce → `api/order/internal`, `cart/v2` …) + JS data-flow analysis that resolves `const API_BASE = … + '/v3/users'` concatenations into concrete endpoints, then fuzzes (ffuf or native prober)** |
+| 34 | **Burp / Caido Traffic Bridge** | **Two-way intercepting-proxy integration: `--proxy` routes the *entire* scan (shared httpx client + katana/ffuf/nuclei subprocesses) through Burp Suite / Caido so automated traffic lands in their HTTP history for manual follow-up — module verifies the listener is live; `--har` imports HAR captures exported from Burp (Save items → HAR) or Caido (Export HAR), parsing every entry for endpoints, query/body params, cookies, auth-header names and secrets in responses — all fed into the unified API pool so ffuf/auth/smartfuzz analyze captured traffic too** |
+| 35 | **AI Patch & Remediation Generator** | **Offline, template + heuristic engine (no AI key needed) that turns each finding into copy-paste remediation — nginx security-header blocks, Cloudflare WAF/rate-limit rules, CSP/CORS/TLS configs, secret rotation steps, admin/IP allow-listing and more, ranked by severity** |
+| 36 | **Read-Only PoC Verification Generator** | **Non-destructive verification commands (`curl` HEAD/GET, `dig`, `openssl s_client`, `nc -z`) that *demonstrate a finding exists* for CRITICAL/HIGH/MEDIUM issues — no exploit payloads, no writes, no brute-force; policy printed with every report** |
+| 37 | **Multi-Channel Webhook Notifications** | **Push a concise scan summary (counts, change verdict, admin-API hits) to Slack / Telegram / Discord / Teams via `--webhook-slack` / `--webhook-telegram TOKEN:CHATID` / `--webhook-discord` / `--webhook-teams` — redaction-aware (no secret values), graceful when unconfigured** |
+| 39 | **Executive Report Exporter** | **C-level HTML report (`--exec-report`) + best-effort PDF (`--exec-pdf`; weasyprint → reportlab → playwright): exposure score, severity mix, KPIs, top risks, PCI-DSS/ISO 27001/SOC 2 compliance snapshot and a prioritised remediation plan — print-ready** |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
 - 📊 Exposure Risk Meter (0–100 score)
 - 🎯 Selectable modules — run only what you need
+- 🧹 **Smart deduplication** — redundant INFO findings collapsed (`×N`), path/number normalisation (`--no-dedupe` to disable)
+- ⏱ **Strict per-module timeouts** — 180s normal / 300s crawl-fuzz (`--module-timeout`, `--module-timeout-heavy`)
+- 🔁 **Scan-diff change tracking** — new subdomains / ports / paths / APIs surfaced vs the previous scan
 - 💾 JSON export + **standalone HTML report** (dark theme, shareable)
 - 📄 **Client-ready PDF report** (`--pdf`, headless Chromium, paginated A4)
 - 🖥 **Local web dashboard** (`--dashboard`) — live charts, findings search, screenshot gallery — offline, stdlib-only, localhost-only
@@ -128,11 +142,12 @@ pip install -r requirements.txt
 
 ### Optional power-ups
 
-Screenshot capture (`-a shot`) and Nuclei scanning (`-a nuclei`) use **optional** tools —
-NULLVEIL degrades gracefully with a friendly hint if they are missing:
+Screenshot capture (`-a shot`), Nuclei (`-a nuclei`), external crawlers/fuzzers and the
+executive PDF use **optional** tools — NULLVEIL degrades gracefully with a friendly hint
+if they are missing:
 
 ```bash
-# Screenshots (headless Chromium)
+# Screenshots (headless Chromium) & HTML→PDF executive reports
 pip install playwright
 playwright install chromium
 
@@ -140,6 +155,21 @@ playwright install chromium
 # (github.com/projectdiscovery/nuclei/releases or):
 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
+
+**v3.6.0 feature dependencies (all optional — modules degrade gracefully):**
+
+```bash
+pip install aiogram slack-sdk weasyprint reportlab playwright
+python -m playwright install
+```
+
+| Feature | Package | Notes |
+|---------|---------|-------|
+| Executive PDF | `weasyprint` → `reportlab` → `playwright` | first available is used; HTML report always works |
+| Webhook notifications | `httpx` (already required) | Slack/Discord/Teams use plain HTTP; Telegram uses the Bot API |
+| Screenshots / PDF | `playwright` (+ `playwright install chromium`) | same optional dep as before |
+| AI Patch generator | *none* | **fully offline** — template/heuristic engine, no API key |
+| Read-only PoC generator | *none* | pure Python, emits `curl`/`dig`/`openssl` commands |
 
 ---
 
@@ -152,7 +182,7 @@ python3 nullveil_recon.py TARGET [options]
 ### Examples
 
 ```bash
-# Full scan (all 27 modules)
+# Full scan (all 38 modules)
 python3 nullveil_recon.py example.com
 
 # Interactive attack menu — pick modules by number
@@ -209,6 +239,60 @@ python3 nullveil_recon.py example.com -a shot,nuclei
 # Custom nuclei templates
 python3 nullveil_recon.py example.com -a nuclei --nuclei-templates ~/my-templates/
 
+# v3.3.0: API extraction pipeline — katana crawl → linkfinder JS endpoints → ffuf API fuzz
+python3 nullveil_recon.py example.com -a katana,linkfinder,ffuf
+
+# Same pipeline with custom fuzz wordlist
+python3 nullveil_recon.py example.com -a ffuf --ffuf-wordlist ~/api-paths.txt
+
+# v3.4.0: authenticated scan — automated login, then diff every endpoint with & without the session
+python3 nullveil_recon.py example.com -a api,katana,linkfinder,ffuf,auth \
+  --login-url https://example.com/api/login --login-user you@example.com --login-pass secret
+
+# Session / API-key injection (applies to EVERY module, incl. katana/ffuf/nuclei subprocesses)
+python3 nullveil_recon.py example.com -a auth --auth-token eyJhbGciOi... \
+  --auth-cookie 'session=abc123' --auth-header 'X-Api-Key: xyz'
+
+# Multi-role profiling: find APIs the admin role sees but the user role doesn't
+python3 nullveil_recon.py example.com -a auth --auth-token "$USER_TOKEN" \
+  --role 'user=Cookie: sid=user123' --role 'admin=Authorization: Bearer admin456'
+
+# v3.4.0: SSRF & internal pivot — bypass-header fuzz + cloud metadata + OOB callbacks
+python3 nullveil_recon.py example.com -a ssrf --oob --oob-wait 60
+# (needs: go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest)
+
+# v3.4.0: smart context fuzz — business-aware wordlist + JS data-flow endpoint resolution
+python3 nullveil_recon.py example.com -a smartfuzz --deep
+
+# v3.5.0: Burp/Caido bridge — route the whole scan through your intercepting proxy
+# (Burp: Proxy → Options → Proxy Listeners, default 127.0.0.1:8080 — every NULLVEIL
+# request — httpx, katana, ffuf, nuclei — shows up in Proxy → HTTP history)
+python3 nullveil_recon.py example.com --proxy http://127.0.0.1:8080
+
+# v3.5.0: import a HAR capture exported from Burp (Save items → HAR) or Caido (Export HAR)
+# → endpoints, params, cookies & secrets feed the API pool for ffuf/auth/smartfuzz
+python3 nullveil_recon.py example.com -a burp,ffuf --har burp_export.har
+
+# Multiple captures (e.g. one per logged-in role) — repeatable
+python3 nullveil_recon.py example.com -a burp --har user.har --har admin.har
+
+# v3.6.0: AI-style remediation + read-only PoC verification (offline, no AI key)
+python3 nullveil_recon.py example.com -a all,patch,poc
+
+# v3.6.0: executive C-level report (HTML always; PDF best-effort: weasyprint → reportlab → playwright)
+python3 nullveil_recon.py example.com -a all,exec --exec-report exec.html --exec-pdf exec.pdf
+
+# v3.6.0: push the summary to chat (Slack / Telegram / Discord / Teams — any combination)
+python3 nullveil_recon.py example.com --webhook-slack https://hooks.slack.com/services/T/B/X
+python3 nullveil_recon.py example.com --webhook-telegram "123456:ABC-DEF:-1001234567890"
+python3 nullveil_recon.py example.com --webhook-discord https://discord.com/api/webhooks/...
+
+# v3.6.0: scan-diff is automatic — rerun any target to get a "changes since last scan" panel
+
+# v3.6.0: tune module timeouts / disable dedup if you want raw findings
+python3 nullveil_recon.py example.com --module-timeout 120 --module-timeout-heavy 300
+python3 nullveil_recon.py example.com --no-dedupe
+
 # v3.2.0: client-ready PDF report
 python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
 
@@ -254,8 +338,34 @@ python3 nullveil_recon.py -l
 | `--resume [ID]` | Resume previous scan — re-runs only the missing modules |
 | `--no-history` | Don't auto-save this scan to history |
 | `--nuclei-templates DIR` | Custom nuclei template path for `-a nuclei` |
+| `--ffuf-wordlist FILE` | Custom path wordlist for `-a ffuf` (default: built-in API wordlist) |
+| `--auth-header 'Name: Value'` | Header injected into **every** scan request (repeatable) |
+| `--auth-cookie name=value` | Session cookie injected into every request (repeatable) |
+| `--auth-token TOKEN` | Bearer token shorthand → `Authorization: Bearer TOKEN` |
+| `--auth-api-key KEY` / `--auth-api-key-header NAME` | API key sent in a custom header (default `X-API-Key`) |
+| `--login-url URL` + `--login-user` + `--login-pass` | **Automated login engine** — POSTs credentials, captures cookies/Bearer token from the response, every module then runs authenticated |
+| `--login-user-field` / `--login-pass-field` | JSON/form field names (default `username` / `password`) |
+| `--login-body JSON` | Raw login JSON template with `{user}` / `{pass}` placeholders |
+| `--login-form` | Send login fields as form data instead of JSON |
+| `--login-token-path PATH` | Dot-path of the Bearer token in the login JSON (auto-detects `access_token`/`token`/`jwt`) |
+| `--login-extra K=V` | Extra login body field (repeatable) |
+| `--role 'NAME=SPEC'` | Multi-role profile for role-diff scan (repeatable): header, cookie, or bare-token spec |
+| `--oob` | Enable interactsh out-of-band SSRF callbacks for `-a ssrf` (needs `interactsh-client`) |
+| `--oob-server HOST` | Custom interactsh server (default: public server) |
+| `--oob-wait SEC` | Seconds to wait for OOB callbacks (default 45 normal / 90 deep) |
+| `--proxy URL` | Route the **entire scan** (httpx + katana/ffuf/nuclei) through an intercepting proxy — Burp / Caido `http://127.0.0.1:8080`. The `burp` module verifies the listener and reports capture status |
+| `--har FILE` | Import a **HAR capture** from Burp (*Save items → HAR*) or Caido (*Export HAR*) — endpoints, params, cookies, auth-header names & secrets feed the unified API pool (repeatable) |
 | `--pdf FILE` | Save a **client-ready PDF report** (headless Chromium — needs playwright) |
 | `--pdf-from JSON` | Convert an existing JSON report to PDF (use with `--pdf`) |
+| `--exec-report FILE` | Write the **executive C-level HTML report** (module 39) |
+| `--exec-pdf FILE` | Also export the executive report as PDF (weasyprint → reportlab → playwright) |
+| `--webhook-slack URL` | Post the scan summary to a **Slack** incoming-webhook URL (module 37) |
+| `--webhook-telegram TOKEN:CHATID` | Post to **Telegram** via a bot, e.g. `123456:ABC:-1001234567890` |
+| `--webhook-discord URL` | Post the scan summary to a **Discord** webhook URL |
+| `--webhook-teams URL` | Post the scan summary to a **Microsoft Teams** incoming-webhook URL |
+| `--module-timeout SEC` | Strict per-module hard timeout for normal modules (default: 180s) |
+| `--module-timeout-heavy SEC` | Strict hard timeout for crawl/fuzz modules (default: 300s) |
+| `--no-dedupe` | Disable smart deduplication of redundant low-severity findings |
 | `--dashboard [PORT]` | Serve a **local web dashboard** of scan history (default port 8899) |
 | `-q`, `--quiet` | Suppress console output |
 | `-V`, `--version` | Show version |
@@ -293,7 +403,7 @@ python3 nullveil_recon.py --dashboard
 
 ```
       Target: example.com   Mode: NORMAL   Started: 2026-10-19 01:10:21
-      Attacks: dns, sub  (2/27 modules)
+      Attacks: dns, sub  (2/38 modules)
 
 ╔══════════════════════════════ ◈ RECON REPORT ◈ ══════════════════════════════╗
 ║                                 example.com                                  ║
@@ -330,8 +440,8 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "3.1.0",
-  "summary": { "dns_records": 3, "api_endpoints": 16, "...": "..." },
+  "version": "3.6.0",
+  "summary": { "dns_records": 3, "api_endpoints": 16, "remediation_patches": 9, "poc_verifications": 4, "dedupe_removed": 6, "...": "..." },
   "dns": [...],
   "subdomains": [...],
   "open_ports": [...],
@@ -358,7 +468,14 @@ python3 nullveil_recon.py example.com -o report.json
   "attack_graph": { "nodes": [...], "edges": [...], "attack_paths": [...], "chains": [...] },
   "correlation": { "targets": [...], "links": [...], "findings": [...] },
   "screenshots": { "captured": 5, "shots": [...], "dir": "nullveil_shots/example.com" },
-  "nuclei": { "version": "v3.11.1", "templates_run": 1284, "findings": [...] }
+  "nuclei": { "version": "v3.11.1", "templates_run": 1284, "findings": [...] },
+  "burp_caido": { "proxy": "http://127.0.0.1:8080", "proxy_ok": true, "har_entries": 312, "endpoints": [...], "params": [...], "cookies": [...], "secrets": [...] },
+  "scan_diff": { "available": true, "score": 47, "verdict": "HIGH DRIFT", "added": {...}, "findings": [...] },
+  "remediation": { "generated": 9, "patches": [ { "severity": "HIGH", "title": "Enforce HTTP security headers at the edge", "remediation": "```nginx ...```" } ] },
+  "poc_verification": { "generated": 4, "policy": "Read-only verification only — HEAD/GET/dig/openssl", "pocs": [ { "severity": "HIGH", "check": "admin-api", "commands": [ { "desc": "HEAD the endpoint", "cmd": "curl -sSI https://..." } ] } ] },
+  "notifications": { "channels": ["slack"], "sent": [ { "channel": "slack", "status": 200 } ], "failed": [] },
+  "executive_report": { "html": "exec.html", "pdf": "exec.pdf", "score": 40, "verdict": "HIGH EXPOSURE" },
+  "dedupe": { "before": 84, "after": 71, "removed": 13 }
 }
 ```
 
@@ -376,6 +493,22 @@ A few v3 features are **deliberately shaped** so the tool stays defensive & repo
 | Multi-tenant correlation | Correlates **domains you provide/own** (`--correlate`) or auto-derived from your cert SANs |
 
 Compliance output is **evidence-based partial mapping**, never a certification claim.
+
+### v3.6.0 notes (remediation, PoC verification, notifications & executive reporting)
+
+- **AI Patch & Remediation Generator** (`patch`, module 35) is **fully offline** — a template + heuristic engine maps each finding to concrete, copy-paste fixes: nginx security-header blocks, Cloudflare WAF / rate-limit / transform rules, CSP & CORS config, TLS modernisation, secret-rotation steps, admin IP allow-listing, SSRF egress hardening and more. **No AI API key, no network traffic.**
+- **Read-Only PoC Verification Generator** (`poc`, module 36) emits strictly non-destructive commands (`curl` HEAD/GET, `dig`, `openssl s_client`, `nc -z`) that *demonstrate a finding exists*. It sends **no payloads, performs no writes and never brute-forces** — the policy is printed with every report and embedded in the JSON.
+- **Multi-Channel Webhook Notifications** (`notify`, module 37) pushes a concise summary (counts, change verdict, admin-API hits) to Slack / Telegram / Discord / Teams. Only **counts and the target name** are sent — never secrets — and the module degrades gracefully when nothing is configured *or* when a channel rejects the message. Slack/Discord/Teams use plain HTTP; Telegram uses the Bot API.
+- **Executive Report Exporter** (`exec`, module 39) produces a print-ready C-level HTML report (`--exec-report`) plus a best-effort PDF (`--exec-pdf`; the first available of `weasyprint` → `reportlab` → `playwright` is used). It summarises exposure score, severity mix, KPIs, top risks, a PCI-DSS / ISO 27001 / SOC 2 compliance snapshot and a prioritised remediation plan.
+- **Scan-diff change tracking** is automatic — every scan is compared against the newest previous scan for the same target, surfacing **new subdomains / ports / paths / APIs** with a 0–100 drift score and verdict.
+- **Smart deduplication** collapses redundant and near-identical findings (repeated INFO items become one entry marked `(×N)`, paths/numbers are normalised) — disable with `--no-dedupe`.
+- **Strict per-module timeouts** guarantee the scan never hangs: `180s` for normal modules and `300s` for crawl/fuzz modules, tunable via `--module-timeout` / `--module-timeout-heavy`.
+
+### v3.5.0 notes (Burp Suite / Caido traffic bridge)
+
+- **`--proxy URL`** routes the **entire scan** through an intercepting proxy (Burp Suite / Caido / mitmproxy / ZAP): the shared httpx client **and** the external subprocesses (`katana -proxy`, `ffuf -x`, `nuclei -proxy`) all go through the listener, so NULLVEIL's automated traffic shows up in the proxy's HTTP history for manual follow-up (Repeater / Caido replay).
+- **`--har FILE`** imports a HAR capture exported from Burp (*Proxy → HTTP history → Save items → HAR*), Caido (*Export HAR*) or a browser's DevTools. Every entry is parsed for **endpoints, query/body parameters, cookies, auth-header names and secrets in responses** — all injected into the unified API pool so `ffuf`, `auth` and `smartfuzz` analyze captured traffic too. Requests outside the target domain are ignored.
+- Module verifies the proxy listener is actually reachable and reports capture status; `--proxy`/`--har` **auto-select** the `burp` module. (module 34)
 
 ### v3.2.2 notes (polish + fixes)
 
@@ -399,6 +532,14 @@ Compliance output is **evidence-based partial mapping**, never a certification c
 | PDF skipped / no PDF produced | PDF uses headless Chromium → `pip install playwright && playwright install chromium` |
 | Screenshots skipped (`-a shot`) | Same as PDF — install `playwright` + Chromium |
 | `nuclei` skipped (`-a nuclei`) | Optional binary: `go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+| `katana` skipped / `ffuf` skipped (`-a katana` / `-a ffuf`) | Optional binaries: `go install github.com/projectdiscovery/katana/cmd/katana@latest` and `go install github.com/ffuf/ffuf/v2@latest` |
+| Proxy unreachable (`--proxy`) | Start the Burp/Caido listener first (Burp: *Proxy → Options → Proxy Listeners*, default `127.0.0.1:8080`) — scan continues but traffic is not captured |
+| `--har` shows 0 entries | Burp needs *Save items → HAR*, Caido *Export HAR*; only requests to the target domain are imported |
+| Executive PDF skipped | Install one of `weasyprint`, `reportlab`, `playwright` (`pip install weasyprint reportlab playwright && python -m playwright install`) — the HTML report is always written |
+| Webhook shows `ConnectError` / `404` | Check the URL/token; Telegram needs `TOKEN:CHATID`, Slack/Discord/Teams need their full incoming-webhook URL. `404` from Telegram usually means a wrong bot token |
+| Module shows `⏱ timeout` | The module exceeded its hard cap (180s normal / 300s crawl-fuzz) — raise `--module-timeout` / `--module-timeout-heavy` for slow targets |
+| Fewer findings than before | Smart deduplication collapsed duplicates (look for `(×N)`) — pass `--no-dedupe` to see every raw finding |
+| PoC commands look generic | The generator matches on the finding text; ensure the relevant modules ran so there is evidence to build commands from |
 | Dashboard: `Address already in use` | Another dashboard is running — use `nullveil --dashboard 9000`, or stop the first one |
 | `crt.sh` 502 / Wayback timeout in the report's `errors` | External services being slow — **not** a tool bug; all other modules still ran |
 | Scan looks thin / target is large | Re-run with `-d` (deep mode: bigger wordlists, more ports & paths) |
@@ -435,6 +576,14 @@ Compliance output is **evidence-based partial mapping**, never a certification c
 - [x] Ctrl+C-safe scans — partial results auto-saved, `--resume` finishes the job
 - [x] Web dashboard (`--dashboard`) — local, offline, zero-dependency
 - [x] Client-ready PDF reports (`--pdf`, `--pdf-from`)
+- [x] Burp Suite / Caido bridge (`--proxy`, `--har`) — full-scan proxy capture + HAR import into the API pool
+- [x] **Scan History & Diff Tracking** — automatic "new since last scan" alerting (subdomains / ports / paths / APIs) with a drift score
+- [x] **Authenticated / role-based admin API audit** — session injection, role-diff and backend/admin surface auditing (`-a auth`)
+- [x] **AI Patch & Remediation Generator** (`-a patch`) — offline template/heuristic fixes (nginx, Cloudflare WAF, code-level)
+- [x] **Read-Only PoC Verification Generator** (`-a poc`) — non-destructive `curl`/`dig`/`openssl` verification commands
+- [x] **Multi-Channel Webhook Notifications** (`--webhook-slack` / `--webhook-telegram` / `--webhook-discord` / `--webhook-teams`)
+- [x] **Executive C-Level Report Exporter** (`-a exec`, `--exec-report`, `--exec-pdf`) — HTML + optional PDF with compliance highlights
+- [x] **Smart deduplication** (`--no-dedupe` to disable) + **strict per-module timeouts** (`--module-timeout`)
 
 Contributions welcome — open an issue or PR.
 
