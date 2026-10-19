@@ -63,7 +63,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.2.1"
+__version__ = "3.2.2"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -4938,9 +4938,15 @@ class WebsiteRecon:
 
     @staticmethod
     def _render_html(d):
-        """Render a report dict to a standalone dark-themed HTML document (no external assets)."""
+        """Render a report dict to a standalone dark-themed HTML document (no external assets).
+
+        Accepts both a raw ``-o`` export and a ``~/.nullveil/history`` entry
+        (which wraps the same report under a ``report`` key).
+        """
         from html import escape as _e
 
+        if isinstance(d, dict) and isinstance(d.get("report"), dict):
+            d = d["report"]          # unwrap history entry
         s = d['summary']
         risk = _risk_meter(d.get('secrets', []),
                            len(d.get('missing_security_headers', [])),

@@ -1,6 +1,6 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.2.1 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.2.2 · **License:** MIT
 
 A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 27 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.2.1   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.2.2   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -198,8 +198,9 @@ python3 nullveil_recon.py example.com -a nuclei --nuclei-templates ~/my-template
 # v3.2.0: client-ready PDF report
 python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
 
-# Convert an old JSON report to PDF
+# Convert an old JSON report to PDF (works with -o exports AND history files)
 python3 nullveil_recon.py --pdf-from old_report.json --pdf client.pdf
+python3 nullveil_recon.py --pdf-from ~/.nullveil/history/20261019-071049-e904a1.json --pdf client.pdf
 
 # v3.2.0: interactive web dashboard (localhost, offline, zero extra deps)
 python3 nullveil_recon.py --dashboard          # http://127.0.0.1:8899
@@ -335,9 +336,10 @@ A few v3 features are **deliberately shaped** so the tool stays defensive & repo
 
 Compliance output is **evidence-based partial mapping**, never a certification claim.
 
-### v3.2.1 notes (polish)
+### v3.2.2 notes (polish + fixes)
 
 - **Cleaner output**: probing deliberately-old TLS 1.0/1.1 no longer prints Python `DeprecationWarning` noise — reports stay readable (findings themselves are unchanged and accurate).
+- **`--pdf-from` now accepts history files**: you can convert either a `-o report.json` export *or* a `~/.nullveil/history/<id>.json` entry straight to PDF (the history wrapper is auto-unwrapped).
 
 ### v3.2.0 notes (dashboard, PDF, robustness)
 
