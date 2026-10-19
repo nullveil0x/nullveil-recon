@@ -1,8 +1,8 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.6.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.7.0 · **License:** MIT
 
-A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 38 attack modules — from DNS records to full API discovery, remediation and executive reporting — with a live progress bar and a premium terminal report.
+A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 43 attack modules — from DNS records to full API discovery, advanced JS/historical/cloud discovery, remediation and executive reporting — with a live progress bar and a premium terminal report.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.6.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.7.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -27,7 +27,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 git clone https://github.com/nullveil0x/nullveil-recon.git
 cd nullveil-recon
 pip install -r requirements.txt
-python3 nullveil_recon.py example.com                  # full scan (38 modules)
+python3 nullveil_recon.py example.com                  # full scan (43 modules)
 python3 nullveil_recon.py example.com --dashboard      # scan → PDF-ready UI opens
 ```
 
@@ -89,6 +89,11 @@ By using NULLVEIL Recon you agree to these terms.
 | 36 | **Read-Only PoC Verification Generator** | **Non-destructive verification commands (`curl` HEAD/GET, `dig`, `openssl s_client`, `nc -z`) that *demonstrate a finding exists* for CRITICAL/HIGH/MEDIUM issues — no exploit payloads, no writes, no brute-force; policy printed with every report** |
 | 37 | **Multi-Channel Webhook Notifications** | **Instant scan alert to Slack / Telegram / Discord / Teams via `--webhook-slack` / `--webhook-telegram TOKEN:CHATID` / `--webhook-discord` / `--webhook-teams` — a CRITICAL/HIGH finding changes the headline (🚨 CRITICAL ALERT), severity counts included, redaction-aware (no secret values), Telegram is MarkdownV2-safe with a plain-text fallback, graceful when unconfigured** |
 | 39 | **Executive Report Exporter** | **C-level HTML report (`--exec-report`) + best-effort PDF (`--exec-pdf`; weasyprint → reportlab → playwright): exposure score, severity mix, KPIs, top risks, PCI-DSS/ISO 27001/SOC 2 compliance snapshot and a prioritised remediation plan — print-ready** |
+| 40 | **JS Secret & Source-Map Miner** | **Deep JavaScript analysis (`jsecret`): follows `//# sourceMappingURL` source maps to recover original (unminified) sources, scans every bundle for API keys/tokens/private keys (AWS, Stripe, GitHub, Slack, Google…), webpack chunk discovery, dangerous DOM sinks and hidden endpoints. Secrets are masked in the report; GET-only** |
+| 41 | **Historical URL Miner** | **Queries Wayback / CommonCrawl / OTX for URLs that *used* to exist (`wayback`) — forgotten admin panels, backups, `.env`/`.git`, config and old query parameters that may still be live; feeds the API pool** |
+| 42 | **Hidden Parameter Miner** | **Arjun-style GET/POST parameter discovery (`param`): control-parameter baseline + response-diff/reflection analysis to find real hidden params with near-zero false positives. Sends only a benign unique marker — no SQLi/XSS/command payloads** |
+| 43 | **GraphQL Deep Audit** | **`gql`: locates GraphQL endpoints and checks introspection exposure, `did you mean` field-suggestion leakage, depth-limit enforcement and batching — query (read) operations only, never mutations** |
+| 44 | **Cloud Storage Enumeration** | **`cloud`: derives bucket names from the target and probes AWS S3 / Azure Blob / GCP Storage with HEAD/GET only — flags public listings and (carefully) suspected world-writable buckets. No uploads, no writes** |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
@@ -156,6 +161,8 @@ playwright install chromium
 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
 
+**v3.7.0 feature dependencies:** **none** — all five Tier-1 discovery modules (JS secret miner, historical URL miner, hidden parameter miner, GraphQL audit, cloud storage enumeration) are pure-Python over the existing `httpx` dependency. They degrade gracefully when the external indexes (Wayback/CommonCrawl/OTX) or cloud endpoints are unreachable.
+
 **v3.6.0 feature dependencies (all optional — modules degrade gracefully):**
 
 ```bash
@@ -182,7 +189,7 @@ python3 nullveil_recon.py TARGET [options]
 ### Examples
 
 ```bash
-# Full scan (all 38 modules)
+# Full scan (all 43 modules)
 python3 nullveil_recon.py example.com
 
 # Interactive attack menu — pick modules by number
@@ -403,7 +410,7 @@ python3 nullveil_recon.py --dashboard
 
 ```
       Target: example.com   Mode: NORMAL   Started: 2026-10-19 01:10:21
-      Attacks: dns, sub  (2/38 modules)
+      Attacks: dns, sub  (2/43 modules)
 
 ╔══════════════════════════════ ◈ RECON REPORT ◈ ══════════════════════════════╗
 ║                                 example.com                                  ║
@@ -440,7 +447,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "remediation_patches": 9, "poc_verifications": 4, "dedupe_removed": 6, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -493,6 +500,18 @@ A few v3 features are **deliberately shaped** so the tool stays defensive & repo
 | Multi-tenant correlation | Correlates **domains you provide/own** (`--correlate`) or auto-derived from your cert SANs |
 
 Compliance output is **evidence-based partial mapping**, never a certification claim.
+
+### v3.7.0 notes (Tier-1 advanced discovery)
+
+Five new discovery modules push NULLVEIL into top-tier territory — the kind of deep surface discovery that commercial scanners charge for:
+
+- **JS Secret & Source-Map Miner** (`jsecret`, module 40) walks every JS bundle (page, crawlers, HAR) and then *de-obfuscates* them by fetching `//# sourceMappingURL` **source maps**, recovering the original unminified `sourcesContent`. It scans all recovered text for ~22 secret patterns (AWS, Stripe, GitHub, GitLab, Slack, SendGrid, Google, OpenAI, JWTs, private-key blocks…) plus dangerous DOM sinks (`innerHTML`, `eval`, `document.write`, wildcard `postMessage`). **All secret values are masked** (`AKIAIO…MPLE`) — nothing is ever used to authenticate — and it feeds recovered endpoints/chunks into the shared API pool.
+- **Historical URL Miner** (`wayback`, module 41) queries **Wayback CDX**, **CommonCrawl** and **AlienVault OTX** for URLs that *used to* exist on the domain (including subdomains), then flags the interesting ones (`.env`, `.git`, backups, `.sql`, config, `admin`, `debug`, `token`…) and harvests old query-parameter names. Forgotten endpoints frequently remain live — one of the highest-yield real-world findings.
+- **Hidden Parameter Miner** (`param`, module 42) is Arjun-style but with a key safety upgrade: a **control-parameter baseline**. It first probes an obviously-unknown parameter; if the endpoint echoes/varies for *that* too, reflection alone is discarded. Only parameters that change the response beyond the control baseline, or reflect when the control does not, are reported — **near-zero false positives**. GET and (deep) POST. Sends only a benign unique marker; no SQLi/XSS/command payloads.
+- **GraphQL Deep Audit** (`gql`, module 43) locates common GraphQL endpoints and reports introspection exposure (schema dump), `did you mean` field-suggestion leakage (enumeration without introspection), missing depth limits (DoS surface) and batching. **Query-only — never mutations.**
+- **Cloud Storage Enumeration** (`cloud`, module 44) derives ~19 likely bucket names from the target domain and probes **AWS S3 / Azure Blob / GCP Storage** with HEAD/GET only, flagging public listings and (conservatively) buckets that answer to an unknown key. **Never uploads, writes or deletes.**
+
+All five integrate with the existing pipeline: they export to JSON, appear as CLI panels, render in the web dashboard, feed the executive report/compliance/remediation engines, and are included in `--webhook-*` alert severity counts.
 
 ### v3.6.0 notes (remediation, PoC verification, notifications & executive reporting)
 
@@ -586,6 +605,11 @@ Compliance output is **evidence-based partial mapping**, never a certification c
 - [x] **Multi-Channel Webhook Notifications** (`--webhook-slack` / `--webhook-telegram` / `--webhook-discord` / `--webhook-teams`)
 - [x] **Executive C-Level Report Exporter** (`-a exec`, `--exec-report`, `--exec-pdf`) — HTML + optional PDF with compliance highlights
 - [x] **Smart deduplication** (`--no-dedupe` to disable) + **strict per-module timeouts** (`--module-timeout`)
+- [x] **JS Secret & Source-Map Miner** (`-a jsecret`) — source-map de-obfuscation + masked secret/sink detection
+- [x] **Historical URL Miner** (`-a wayback`) — Wayback / CommonCrawl / OTX forgotten endpoints & old params
+- [x] **Hidden Parameter Miner** (`-a param`) — control-baseline Arjun-style GET/POST discovery, near-zero false positives
+- [x] **GraphQL Deep Audit** (`-a gql`) — introspection / suggestions / depth-limit checks (query-only)
+- [x] **Cloud Storage Enumeration** (`-a cloud`) — S3 / Azure / GCP public-listing checks (HEAD/GET only)
 
 Contributions welcome — open an issue or PR.
 

@@ -3,9 +3,9 @@
 NULLVEIL Recon - Website & Domain Reconnaissance Tool
 Owner/Author: NULLVEIL
 Engine: DeepHat
-Version: 3.6.0
+Version: 3.7.0
 
-Features (38 attack modules):
+Features (43 attack modules):
   Recon & discovery
   - DNS Records (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA) + DoH fallback
   - Subdomain Enumeration (wordlist + SSL SAN + crt.sh CT logs)
@@ -23,6 +23,13 @@ Features (38 attack modules):
   - Threat Intel feeds, Breach monitoring, Compliance mapping
   - Attack Path Graph, multi-target correlation
   - Scan-diff change tracking (new subdomains / ports / paths / APIs vs last scan)
+
+  Tier-1 advanced discovery (v3.7.0)
+  - JS Secret & Source-Map Miner: source maps, webpack chunks, API keys/tokens, dangerous sinks
+  - Historical URL Miner: Wayback / CommonCrawl / OTX — forgotten endpoints & old params
+  - Hidden Parameter Miner: Arjun-style GET/POST discovery via response-diff (read-only)
+  - GraphQL Deep Audit: introspection, field suggestions, depth-limit checks (query-only)
+  - Cloud Storage Enumeration: S3 / Azure / GCP bucket existence + public-list checks (HEAD/GET)
 
   API discovery & exploitation surface (report-only)
   - API & Full Site Intel (Swagger/OpenAPI probe + parse, JS endpoints, forms)
@@ -97,7 +104,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.6.0"
+__version__ = "3.7.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -461,6 +468,11 @@ ATTACK_MODULES = [
     ("poc", 36, "Read-Only PoC Verification Generator", "Non-destructive curl/dig commands that demonstrate a finding exists — no exploit payloads, no active exploitation"),
     ("notify", 37, "Multi-Channel Webhook Notifications", "Push scan summaries to Slack / Telegram / Discord / Teams (--webhook-*) — graceful without deps"),
     ("exec", 39, "Executive Report Exporter", "C-level HTML/PDF report — exposure KPIs, top risks, PCI-DSS/ISO 27001/SOC 2 highlights, remediation priorities"),
+    ("jsecret", 40, "JS Secret & Source-Map Miner", "Deep JS mining: source maps, webpack chunks, API keys/tokens, hidden endpoints, dangerous sinks (read-only)"),
+    ("wayback", 41, "Historical URL Miner", "Wayback/CommonCrawl/OTX historical URLs — forgotten endpoints, old params & secrets still live (read-only)"),
+    ("param", 42, "Hidden Parameter Miner", "Arjun-style GET/POST parameter discovery via response-diff + reflection analysis (read-only, rate-limited)"),
+    ("gql", 43, "GraphQL Deep Audit", "Introspection, field-suggestion leakage, depth/complexity abuse checks, batching — report-only, no writes"),
+    ("cloudstore", 44, "Cloud Storage Enumeration", "S3/Azure/GCP bucket existence + public-list/ACL misconfig via HEAD/GET only (no writes, no uploads)"),
 ]
 
 MAX_MODULE = len(ATTACK_MODULES)
@@ -497,6 +509,21 @@ def parse_attack_list(s: str):
         hit = False
         for name, idx, *_ in ATTACK_MODULES:
             if it == name or (name == "sub" and it in ("subdomains", "subdomain")) or (name == "paths" and it in ("admin", "dirs")):
+                res.add(idx)
+                hit = True
+            elif name == "cloudstore" and it in ("cloud", "bucket", "buckets", "storage"):
+                res.add(idx)
+                hit = True
+            elif name == "jsecret" and it in ("js", "jssecret"):
+                res.add(idx)
+                hit = True
+            elif name == "gql" and it in ("graphql",):
+                res.add(idx)
+                hit = True
+            elif name == "wayback" and it in ("history", "historical", "gau"):
+                res.add(idx)
+                hit = True
+            elif name == "param" and it in ("params", "parameters", "arjun"):
                 res.add(idx)
                 hit = True
         if not hit:
@@ -797,6 +824,11 @@ class WebsiteRecon:
             (":safety_pin: Read-Only PoC Verification", self.poc_generator, 36),
             (":bell: Multi-Channel Webhook Notifications", self.webhook_notify, 37),
             (":bar_chart: Executive Report Exporter", self.executive_report, 39),
+            (":closed_lock_with_key: JS Secret & Source-Map Miner", self.js_secret_miner, 40),
+            (":hourglass_flowing_sand: Historical URL Miner", self.wayback_miner, 41),
+            (":question: Hidden Parameter Miner", self.param_miner, 42),
+            (":crystal_ball: GraphQL Deep Audit", self.graphql_audit, 43),
+            (":cloud: Cloud Storage Enumeration", self.cloud_storage_enum, 44),
         ]
         # Filter by attack set and create coroutines only for selected
         # Modules that READ other modules' results must run sequentially AFTER the
@@ -804,12 +836,17 @@ class WebsiteRecon:
         # 29 linkfinder [reads katana js_files], 30 ffuf [reads api_pool],
         # 31 auth [diffs discovered endpoints], 32 ssrf [needs api_pool],
         # 33 smartfuzz [needs katana/linkfinder JS + api context]).
-        DEFERRED = {19, 23, 24, 25, 29, 30, 31, 32, 33, 35, 36, 37, 39}
+        DEFERRED = {19, 23, 24, 25, 29, 30, 31, 32, 33, 35, 36, 37, 39, 40, 41, 42, 43, 44}
+        # Reporting/aggregation modules (35 patch, 36 poc, 37 notify, 39 exec) must
+        # run LAST so they see the findings produced by the discovery pass (incl.
+        # the Tier-1 modules 40-44). Sort the deferred pass by execution rank.
+        _LATE = {35, 36, 37, 39}
         modules = []
         deferred = []
         for name, fn, idx in all_modules:
             if idx in self.attack_set:
                 (deferred if idx in DEFERRED else modules).append((name, fn(), idx))
+        deferred.sort(key=lambda t: (t[2] in _LATE, t[2]))
 
         scan_start = datetime.now()
         progress = Progress(
@@ -824,7 +861,7 @@ class WebsiteRecon:
         self._completed = []
 
         # ---- strict per-module execution timeout (heavy crawl/fuzz get 300s) ----
-        HEAVY = {16, 20, 27, 28, 29, 30, 31, 32, 33}   # crawl / ML / subprocess / fuzz
+        HEAVY = {16, 20, 27, 28, 29, 30, 31, 32, 33, 40, 41, 42, 44}   # crawl / ML / subprocess / fuzz / network-heavy discovery
         def _module_timeout(idx):
             heavy = float(getattr(self, "module_timeout_heavy", 300.0) or 300.0)
             normal = float(getattr(self, "module_timeout", 180.0) or 180.0)
@@ -4462,6 +4499,673 @@ class WebsiteRecon:
         for ep in endpoints[:800]:
             self.results['api_pool'].append({"path": ep, "source": "linkfinder"})
 
+    # ==================================================== JS Secret & Source-Map Miner (40)
+    JS_SECRET_RULES = [
+        ("AWS Access Key",       r"\b(AKIA|ASIA)[0-9A-Z]{16}\b",                             "CRITICAL"),
+        ("Google API Key",       r"\bAIza[0-9A-Za-z_\-]{35}\b",                              "HIGH"),
+        ("Google OAuth Client",  r"\b[0-9]{12}-[0-9a-z_]{32}\.apps\.googleusercontent\.com",  "MEDIUM"),
+        ("Firebase URL",         r"\bhttps://[a-z0-9\-]+\.firebaseio\.com",                  "MEDIUM"),
+        ("Stripe Secret Key",    r"\bsk_live_[0-9a-zA-Z]{24,}\b",                            "CRITICAL"),
+        ("Stripe Publishable",   r"\bpk_(live|test)_[0-9a-zA-Z]{24,}\b",                     "LOW"),
+        ("SendGrid API Key",     r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b",          "CRITICAL"),
+        ("Twilio Account SID",   r"\bAC[0-9a-fA-F]{32}\b",                                   "MEDIUM"),
+        ("Slack Token",          r"\bxox[baprs]-[0-9A-Za-z-]{10,72}\b",                       "HIGH"),
+        ("Slack Webhook",        r"https://hooks\.slack\.com/services/[A-Za-z0-9/+_]{40,}",  "HIGH"),
+        ("GitHub Token",         r"\bgh[pousr]_[A-Za-z0-9]{36,}\b",                          "CRITICAL"),
+        ("GitLab Token",         r"\bglpat-[A-Za-z0-9_\-]{20,}\b",                           "CRITICAL"),
+        ("Private Key Block",    r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----", "CRITICAL"),
+        ("JWT",                  r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}", "MEDIUM"),
+        ("Mapbox Token",         r"\bpk\.[A-Za-z0-9_\-]{60,}\b",                             "LOW"),
+        ("Mailgun Key",          r"\bkey-[0-9a-zA-Z]{32}\b",                                 "HIGH"),
+        ("Heroku API Key",       r"(?i)heroku[^0-9a-f]{0,20}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "HIGH"),
+        ("Square Token",         r"\bsq0atp-[0-9A-Za-z_\-]{22}\b",                           "HIGH"),
+        ("OpenAI Key",           r"\bsk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}\b",           "CRITICAL"),
+        ("Generic Bearer",       r"(?i)authorization['\"]?\s*[:=]\s*['\"]Bearer\s+[A-Za-z0-9_\-\.]{20,}", "MEDIUM"),
+        ("Generic API Key",      r"(?i)(api[_-]?key|apikey|api[_-]?secret|access[_-]?token)['\"]?\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]", "MEDIUM"),
+        ("Basic Auth in URL",    r"https?://[^/\s:@'\"]+:[^/\s:@'\"]+@[^/\s'\"]+",           "HIGH"),
+    ]
+    JS_SINK_RULES = [
+        ("dangerouslySetInnerHTML", r"dangerouslySetInnerHTML",  "MEDIUM"),
+        ("innerHTML assignment",    r"\.innerHTML\s*=",          "LOW"),
+        ("document.write",          r"document\.write\s*\(",     "LOW"),
+        ("eval()",                  r"\beval\s*\(",              "MEDIUM"),
+        ("new Function()",          r"new\s+Function\s*\(",      "MEDIUM"),
+        ("postMessage *",           r"postMessage\s*\([^,]+,\s*['\"]\*['\"]", "MEDIUM"),
+        ("localStorage token",      r"localStorage\.(setItem|getItem)\s*\(\s*['\"][^'\"]*(token|jwt|auth|secret)", "LOW"),
+        ("hardcoded internal host", r"https?://(?:localhost|127\.0\.0\.1|10\.\d|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)", "LOW"),
+    ]
+
+    async def js_secret_miner(self):
+        """Module 40 — deep JavaScript secret & source-map miner (read-only).
+
+        Walks every JS bundle referenced by the page, discovered crawlers and HAR
+        captures, then additionally *de-obfuscates* it by following ``//# sourceMappingURL``
+        source maps (``.map`` → ``sourcesContent``). Scans all recovered text for
+        API keys / tokens / private keys and dangerous DOM sinks. Sends only GET,
+        never mutates anything. Secrets are **masked** in the report."""
+        import json as _json
+        js_urls = set()
+        for u in (self.results.get('js_files') or []):
+            if isinstance(u, str):
+                js_urls.add(u)
+        for u in ((self.results.get('katana', {}) or {}).get('js_files') or []):
+            js_urls.add(u)
+        for u in ((self.results.get('burp', {}) or {}).get('js_files') or []):
+            if isinstance(u, str) and u.startswith(('http://', 'https://')):
+                js_urls.add(u)
+        for u in ((self.results.get('crawl', {}) or {}).get('js_files') or []):
+            js_urls.add(u)
+        # page-inline <script src> (in case content/api modules did not capture)
+        try:
+            async with self.sem:
+                r = await self.client.get(self.scalar_results.get('final_url', self.base_url + "/"))
+            for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', r.text[:500_000], re.I):
+                js_urls.add(urljoin(str(r.url), m.group(1)))
+        except Exception:
+            pass
+        js_urls = {u for u in js_urls if u.startswith(('http://', 'https://'))}
+        js_urls = {u for u in js_urls if re.search(r'\.m?js(\?|$)', urlparse(u).path, re.I)} or js_urls
+        limit = 60 if self.deep else 30
+        js_urls = sorted(js_urls)[:limit]
+
+        secrets, sinks, endpoints = [], [], set()
+        maps_found, chunks_found = [], set()
+        secret_seen, sink_seen = set(), set()
+        ep_re = re.compile(r"""["'](/[A-Za-z0-9_\-./]{3,}(?:\?[^"']*)?|https?://[^"'\s]+)["']""")
+        chunk_re = re.compile(r"""["']((?:/|\.\./)?[A-Za-z0-9_\-./]*?[\w-]{1,}\.[0-9a-f]{6,20}\.js)["']""")
+
+        def scan_text(text, src, inline=False):
+            # secrets
+            for name, rx, sev in self.JS_SECRET_RULES:
+                for m in re.finditer(rx, text):
+                    raw = m.group(0)
+                    key = (name, src.split('?')[0], raw[:24])
+                    if key in secret_seen:
+                        continue
+                    secret_seen.add(key)
+                    masked = (raw[:6] + "…" + raw[-4:]) if len(raw) > 14 else raw[:4] + "…"
+                    secrets.append({"severity": sev, "type": name, "source": src,
+                                    "masked": masked, "length": len(raw),
+                                    "context": re.sub(r"\s+", " ", text[max(0, m.start() - 30):m.end() + 30])[:160]})
+            # dangerous sinks
+            for name, rx, sev in self.JS_SINK_RULES:
+                for _ in re.finditer(rx, text):
+                    key = (name, src.split('?')[0])
+                    if key in sink_seen:
+                        continue
+                    sink_seen.add(key)
+                    sinks.append({"severity": sev, "type": name, "source": src})
+            # endpoints (source-map / chunk recovery)
+            for m in ep_re.finditer(text):
+                u = m.group(1)
+                if u.startswith('http') and self.domain not in u:
+                    continue
+                if re.search(r'\.(png|jpe?g|gif|svg|css|woff2?|ttf|ico|map)(\?|$)', u, re.I):
+                    continue
+                endpoints.add(u)
+            for m in chunk_re.finditer(text):
+                c = m.group(1)
+                if c.endswith('.map') or len(c) > 200:
+                    continue
+                chunks_found.add(c)
+
+        async def fetch(u):
+            try:
+                async with self.sem:
+                    r = await self.client.get(u)
+                if r.status_code != 200:
+                    return
+                body = r.text[:3_000_000]
+                scan_text(body, u)
+                # follow source map → recover original (unminified) sources
+                for m in re.finditer(r'//[#@]\s*sourceMappingURL=([^\s\'"]+)', body):
+                    smu = m.group(1).strip()
+                    if smu.startswith('data:'):
+                        continue
+                    smu = urljoin(u, smu)
+                    if not smu.startswith(('http://', 'https://')):
+                        continue
+                    maps_found.append(smu)
+                    try:
+                        async with self.sem:
+                            mr = await self.client.get(smu)
+                        if mr.status_code != 200:
+                            continue
+                        data = mr.json()
+                        for sname, content in zip(data.get('sources') or [],
+                                                 data.get('sourcesContent') or []):
+                            if isinstance(content, str):
+                                scan_text(content, f"{smu}::{sname}", inline=True)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        await asyncio.gather(*[fetch(u) for u in js_urls])
+
+        # severity ordering + findings
+        rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        secrets.sort(key=lambda s: rank.get(s["severity"], 5))
+        sinks.sort(key=lambda s: rank.get(s["severity"], 5))
+        findings = []
+        for s in secrets:
+            findings.append({"severity": s["severity"],
+                             "check": f"JS secret — {s['type']}",
+                             "detail": f"{s['masked']} ({s['length']} chars) in {s['source']}",
+                             "evidence": s.get("context", "")})
+        for s in sinks:
+            findings.append({"severity": s["severity"], "check": f"JS sink — {s['type']}",
+                             "detail": s["source"], "evidence": ""})
+
+        endpoints = sorted(endpoints)
+        self.results['js_secret'] = {
+            "available": True, "js_analyzed": len(js_urls),
+            "source_maps": maps_found[:200], "map_count": len(maps_found),
+            "chunks": sorted(chunks_found)[:400], "chunk_count": len(chunks_found),
+            "secret_count": len(secrets), "secrets": secrets[:200],
+            "sink_count": len(sinks), "sinks": sinks[:200],
+            "endpoints": endpoints[:1000], "endpoint_count": len(endpoints),
+            "findings": findings[:400],
+            "policy": "Read-only GET only — secrets are masked; no values are used to authenticate.",
+        }
+        for ep in endpoints[:600]:
+            self.results['api_pool'].append({"path": ep, "source": "jssecret"})
+
+    # ==================================================== Historical URL Miner (41)
+    async def wayback_miner(self):
+        """Module 41 — historical URL mining (Wayback / CommonCrawl / OTX).
+
+        Read-only: queries public historical-index APIs for URLs that *used* to
+        exist on the target. Forgotten endpoints, old query parameters, backup
+        files and config paths often remain reachable — a very common real-world
+        finding. No traffic is sent to the target itself beyond the passive index
+        lookups."""
+        import json as _json
+        urls = set()
+        sources_used = []
+
+        async def _get(url, tag):
+            try:
+                async with self.sem:
+                    r = await self.client.get(url, timeout=20)
+                if r.status_code == 200 and r.text:
+                    sources_used.append(tag)
+                return r.text
+            except Exception:
+                return ""
+
+        # --- Wayback CDX API (URL list for the domain + subdomains) ---
+        cdx = ("https://web.archive.org/cdx/search/cdx?"
+               f"url=*.{self.domain}/*&output=text&fl=original&collapse=urlkey&limit=8000")
+        txt = await _get(cdx, "wayback")
+
+        def _add(u):
+            try:
+                u = u.strip()
+                if not u:
+                    return
+                p = urlparse(u)
+                if self.domain not in (p.netloc or ''):
+                    return
+                urls.add((p.path or '/') + (f"?{p.query}" if p.query else ''))
+            except Exception:
+                pass
+
+        for line in (txt or "").splitlines():
+            _add(line)
+
+        # --- CommonCrawl index (latest crawl, via the collinfo-less index server) ---
+        if self.deep:
+            cc_idx = ("https://index.commoncrawl.org/CC-MAIN-2024-33-index?"
+                      f"url=*.{self.domain}/*&output=json&limit=3000")
+            cct = await _get(cc_idx, "commoncrawl")
+            for line in (cct or "").splitlines():
+                try:
+                    _add(_json.loads(line).get("url", ""))
+                except Exception:
+                    pass
+
+        # --- AlienVault OTX URL list (already used by intel but here as a URL source) ---
+        otx = f"https://otx.alienvault.com/api/v1/indicators/domain/{self.domain}/url_list?limit=500"
+        otxt = await _get(otx, "otx")
+        try:
+            for entry in (_json.loads(otxt) or {}).get("url_list", []):
+                _add(entry.get("url", ""))
+        except Exception:
+            pass
+
+        urls = sorted(urls)
+        # classify interesting historical URLs
+        interesting_res = re.compile(
+            r'(?i)(\.env|\.git|\.svn|\.bak|\.old|\.zip|\.tar|\.gz|\.sql|\.log|'
+            r'backup|config|admin|debug|test|staging|dev|internal|api|graphql|'
+            r'swagger|actuator|phpinfo|\.json|\.ya?ml|token|secret|password|key)')
+        params = set()
+        for u in urls:
+            q = urlparse(u).query
+            for pair in q.split('&'):
+                if '=' in pair:
+                    k = pair.split('=', 1)[0].strip()
+                    if k and len(k) < 40:
+                        params.add(k)
+        interesting = [u for u in urls if interesting_res.search(u)][:400]
+        findings = []
+        for u in interesting[:300]:
+            sev = "MEDIUM" if re.search(r'(?i)(\.env|\.git|backup|\.sql|\.bak|config|token|secret|password)', u) else "LOW"
+            findings.append({"severity": sev, "check": "Historical URL",
+                             "detail": u, "evidence": "from " + ", ".join(sorted(set(sources_used)))})
+        self.results['wayback'] = {
+            "available": bool(sources_used), "sources": sorted(set(sources_used)),
+            "url_count": len(urls), "urls": urls[:1500],
+            "interesting_count": len(interesting), "interesting": interesting,
+            "param_count": len(params), "params": sorted(params)[:300],
+            "findings": findings,
+            "note": ("Forgotten/older endpoints can still be live — re-test before reporting as fixed."
+                     if urls else "No historical URLs returned (index unavailable or domain unseen)."),
+        }
+        for ep in urls[:600]:
+            self.results['api_pool'].append({"path": urlparse(ep).path or '/', "source": "wayback"})
+        for p in sorted(params):
+            self.results['api_pool'].append({"path": p, "source": "wayback:param"})
+
+    # ==================================================== Hidden Parameter Miner (42)
+    # Curated param names favouring real-world reflections / auth-ish behaviour.
+    PARAM_WORDLIST = [
+        "id", "user", "username", "userid", "user_id", "account", "uid", "pid", "gid",
+        "page", "p", "view", "file", "filename", "path", "dir", "folder", "url", "uri",
+        "link", "src", "source", "redirect", "redirect_uri", "next", "return", "returnurl",
+        "callback", "continue", "dest", "destination", "target", "ref", "referer",
+        "q", "query", "search", "s", "keyword", "term", "filter", "sort", "order", "orderby",
+        "limit", "offset", "start", "end", "from", "to", "count", "size", "num", "n",
+        "format", "type", "mode", "action", "method", "cmd", "command", "op", "operation",
+        "token", "key", "apikey", "api_key", "secret", "auth", "access_token", "session",
+        "sid", "csrf", "nonce", "signature", "sig", "hash", "code", "state",
+        "email", "mail", "phone", "name", "firstname", "lastname", "fullname", "title",
+        "role", "group", "perm", "permission", "scope", "admin", "is_admin", "debug",
+        "test", "lang", "locale", "country", "region", "timezone", "currency",
+        "json", "api", "callback_fn", "jsonp", "output", "template", "theme", "layout",
+        "version", "v", "ts", "time", "date", "day", "month", "year",
+    ]
+
+    async def param_miner(self):
+        """Module 42 — hidden GET/POST parameter discovery (Arjun-style, read-only).
+
+        For each candidate parameter the module issues a benign GET with a unique
+        marker value and compares the response (status, length, reflection count,
+        headers). A parameter that *changes* the response, or reflects the marker,
+        is reported as a discovered parameter. **Only the marker is ever sent** —
+        no SQLi/XSS/command payloads, no writes. Rate-limited by the shared
+        semaphore."""
+        base = self.scalar_results.get('final_url') or (self.base_url + "/")
+        # build the small set of test URLs: the base + a few discovered endpoints
+        cand_urls = [base]
+        for ep in (self.results.get('api_pool') or [])[: (12 if self.deep else 5)]:
+            p = ep.get('path') if isinstance(ep, dict) else ep
+            if isinstance(p, str) and p.startswith('/') and '?' not in p and len(p) < 80:
+                cand_urls.append(self.base_url.rstrip('/') + p)
+        cand_urls = list(dict.fromkeys(cand_urls))[: (8 if self.deep else 4)]
+
+        marker = "nv" + hashlib.md5(str(datetime.now().timestamp()).encode()).hexdigest()[:8]
+        found_params, findings = {}, []
+
+        async def baseline(u, post=False):
+            try:
+                if post:
+                    async with self.sem:
+                        r = await self.client.post(u, data={"nvbase": marker})
+                else:
+                    async with self.sem:
+                        r = await self.client.get(u)
+                return {"status": r.status_code, "len": len(r.content),
+                        "text": r.text[:200_000], "headers": dict(r.headers)}
+            except Exception:
+                return None
+
+        async def probe(u, base_sig, pname, post=False):
+            try:
+                if post:
+                    async with self.sem:
+                        r = await self.client.post(u, data={pname: marker})
+                else:
+                    sep = '&' if '?' in u else '?'
+                    async with self.sem:
+                        r = await self.client.get(f"{u}{sep}{pname}={marker}")
+                if r.status_code != base_sig["status"]:
+                    return ("status", r.status_code, base_sig["status"])
+                reflected = marker in r.text
+                dlen = abs(len(r.content) - base_sig["len"])
+                # ignore tiny jitter, require a meaningful delta or a reflection
+                if reflected:
+                    return ("reflected", dlen, None)
+                if dlen >= max(25, int(base_sig["len"] * 0.02)):
+                    return ("length", dlen, base_sig["len"])
+                return None
+            except Exception:
+                return None
+
+        # Control probe: an obviously-unknown parameter. If it *also* reflects or
+        # shifts the response, the endpoint reflects any input (e.g. echoes the
+        # whole query string) and reflection alone is not evidence — suppress it.
+        control_names = ["zzq" + hashlib.md5(b"nvctl").hexdigest()[:8],
+                         "nvunknown" + hashlib.md5(b"nvctl2").hexdigest()[:6]]
+
+        for u in cand_urls:
+            b = await baseline(u)
+            if not b or b["status"] >= 500:
+                continue
+            ctrl = None
+            for cn in control_names:
+                c = await probe(u, b, cn)
+                if c:
+                    ctrl = c
+                    break
+            ctrl_reflects = bool(ctrl and ctrl[0] == "reflected")
+            ctrl_len = abs(int(ctrl[1])) if (ctrl and ctrl[0] == "length" and str(ctrl[1]).isdigit()) else 0
+            names = self.PARAM_WORDLIST if self.deep else self.PARAM_WORDLIST[:40]
+            sem_probe = asyncio.Semaphore(8)
+
+            def _keep(hit):
+                """Drop a hit that merely matches how the control (unknown) param behaved."""
+                if not hit:
+                    return None
+                kind, val, ref = hit
+                if kind == "reflected":
+                    if ctrl_reflects:
+                        return None          # endpoint echoes anything — not evidence
+                    return hit
+                if kind == "length":
+                    d = abs(int(val)) if str(val).isdigit() else 0
+                    if ctrl_len and d <= ctrl_len * 1.5:
+                        return None          # same order as control jitter
+                    return hit
+                if kind == "status":
+                    return hit
+                return None
+
+            async def one(pname):
+                async with sem_probe:
+                    return pname, _keep(await probe(u, b, pname))
+            for chunk in [names[i:i + 40] for i in range(0, len(names), 40)]:
+                for pname, hit in await asyncio.gather(*[one(n) for n in chunk]):
+                    if hit:
+                        kind, val, ref = hit
+                        found_params.setdefault(pname, {"name": pname, "url": u,
+                                                        "type": kind, "evidence": str(val)})
+            # POST pass (deep only, narrow set) — uses its own POST baseline and
+            # control, so a plain GET→POST method difference is never reported.
+            if self.deep:
+                pb = await baseline(u, post=True)
+                if pb and pb["status"] < 500:
+                    pctrl = None
+                    for cn in control_names:
+                        c = await probe(u, pb, cn, post=True)
+                        if c:
+                            pctrl = c
+                            break
+                    pctrl_reflects = bool(pctrl and pctrl[0] == "reflected")
+                    pctrl_len = abs(int(pctrl[1])) if (pctrl and pctrl[0] == "length"
+                                                       and str(pctrl[1]).isdigit()) else 0
+
+                    def _keep_post(hit):
+                        if not hit:
+                            return None
+                        kind, val, ref = hit
+                        if kind == "reflected":
+                            return None if pctrl_reflects else hit
+                        if kind == "length":
+                            d = abs(int(val)) if str(val).isdigit() else 0
+                            if pctrl_len and d <= pctrl_len * 1.5:
+                                return None
+                            return hit
+                        if kind == "status":
+                            return hit
+                        return None
+
+                    async def one_post(pname):
+                        async with sem_probe:
+                            return pname, _keep_post(await probe(u, pb, pname, post=True))
+                    for pname, hit in await asyncio.gather(*[one_post(n) for n in names[:25]]):
+                        if hit:
+                            kind, val, ref = hit
+                            found_params.setdefault(f"POST:{pname}",
+                                                    {"name": pname, "url": u, "type": f"POST/{kind}",
+                                                     "evidence": str(val)})
+
+        for p in found_params.values():
+            sev = "HIGH" if p["type"] == "reflected" else "LOW"
+            findings.append({"severity": sev, "check": f"Hidden parameter ({p['type']})",
+                             "detail": f"{p['name']} on {p['url']}",
+                             "evidence": f"marker reflected/Δ={p['evidence']}"})
+        findings.sort(key=lambda f: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(f["severity"], 3))
+        self.results['param'] = {
+            "available": True, "urls_tested": len(cand_urls),
+            "count": len(found_params), "params": sorted(found_params.values(),
+                                                         key=lambda x: x["name"])[:200],
+            "findings": findings[:200],
+            "policy": "Only benign unique-marker values are sent — no SQLi/XSS/command payloads, no writes.",
+        }
+        for p in found_params.values():
+            self.results['api_pool'].append({"path": p["name"], "source": "param"})
+
+    # ==================================================== GraphQL Deep Audit (43)
+    async def graphql_audit(self):
+        """Module 43 — GraphQL introspection & misconfiguration audit (read-only).
+
+        Locates common GraphQL endpoints, attempts a standard **introspection**
+        query (report-only — introspection exposed is itself the finding), checks
+        whether the server leaks **field suggestions** for typo'd queries, and
+        verifies depth-limit / batching protections exist. Sends only read
+        (query) operations — never mutations."""
+        candidates = ["/graphql", "/graphiql", "/api/graphql", "/v1/graphql",
+                      "/v2/graphql", "/gql", "/query", "/api/gql", "/graphql/console"]
+        for ep in (self.results.get('api_pool') or []):
+            p = ep.get('path') if isinstance(ep, dict) else ep
+            if isinstance(p, str) and re.search(r'(?i)graphql|/gql\b', p):
+                candidates.append(p)
+        candidates = list(dict.fromkeys(candidates))[: (16 if self.deep else 9)]
+
+        INTROSPECT = ('{"query":"query{__schema{queryType{name} mutationType{name}'
+                      'types{name kind fields{name}}}}"}')
+        endpoints, findings = [], []
+
+        async def check(path):
+            url = self.base_url.rstrip('/') + path
+            try:
+                async with self.sem:
+                    r = await self.client.post(url, content=INTROSPECT,
+                                               headers={"Content-Type": "application/json"})
+                if r.status_code >= 500:
+                    return
+                ct = r.headers.get('content-type', '')
+                body = r.text[:400_000]
+                if 'json' not in ct.lower() and '__schema' not in body:
+                    return
+                rec = {"endpoint": url, "status": r.status_code,
+                       "introspection": False, "field_suggestions": False,
+                       "depth_limited": None, "batching": None, "issues": []}
+                # 1) introspection enabled?
+                try:
+                    data = r.json()
+                    sch = ((data or {}).get("data") or {}).get("__schema")
+                    if sch:
+                        rec["introspection"] = True
+                        types = [t.get("name") for t in (sch.get("types") or [])
+                                 if t.get("name") and not str(t.get("name")).startswith("__")]
+                        rec["type_count"] = len(types)
+                        rec["types"] = types[:60]
+                        if sch.get("mutationType"):
+                            rec["issues"].append("mutations exposed")
+                        findings.append({"severity": "MEDIUM",
+                                         "check": "GraphQL introspection enabled",
+                                         "detail": f"{url} exposes full schema ({len(types)} types)",
+                                         "evidence": "An attacker can enumerate all types/fields."})
+                except Exception:
+                    pass
+                # 2) field-suggestion leakage (typo probe)
+                try:
+                    async with self.sem:
+                        sr = await self.client.post(
+                            url, content='{"query":"query{__typenameX}"}',
+                            headers={"Content-Type": "application/json"})
+                    sb = sr.text[:50_000]
+                    if re.search(r'(?i)(did you mean|suggest|__typename)', sb) and sr.status_code < 500:
+                        rec["field_suggestions"] = True
+                        findings.append({"severity": "LOW",
+                                         "check": "GraphQL field suggestions leaked",
+                                         "detail": f"{url} returns 'did you mean' suggestions",
+                                         "evidence": "Enables field/type enumeration without introspection."})
+                except Exception:
+                    pass
+                # 3) depth-limit probe (deeply nested query — benign, no aliases explosion)
+                try:
+                    deep_q = "query{" + "a{" * 12 + "__typename" + "}" * 12 + "}"
+                    async with self.sem:
+                        dr = await self.client.post(
+                            url, content=json.dumps({"query": deep_q}),
+                            headers={"Content-Type": "application/json"})
+                    rec["depth_limited"] = dr.status_code >= 400 or bool(
+                        re.search(r'(?i)(depth|complexity|too deep|max)', dr.text[:20_000]))
+                    if not rec["depth_limited"] and dr.status_code < 400:
+                        rec["issues"].append("no depth limit observed")
+                        findings.append({"severity": "LOW",
+                                         "check": "GraphQL depth limit not enforced",
+                                         "detail": f"{url} accepted a 12-level nested query",
+                                         "evidence": "Deep queries can be used for DoS."})
+                except Exception:
+                    pass
+                # 4) batching (alias-based) — benign two-alias probe
+                try:
+                    batch = ('{"query":"query{a:__typename b:__typename}"}')
+                    async with self.sem:
+                        br = await self.client.post(url, content=batch,
+                                                    headers={"Content-Type": "application/json"})
+                    rec["batching"] = br.status_code < 400
+                except Exception:
+                    pass
+                endpoints.append(rec)
+            except Exception:
+                pass
+
+        await asyncio.gather(*[check(p) for p in candidates])
+        self.results['graphql'] = {
+            "available": bool(endpoints), "endpoints": endpoints,
+            "count": len(endpoints),
+            "introspection_open": [e["endpoint"] for e in endpoints if e.get("introspection")],
+            "findings": findings,
+            "policy": "Query (read) operations only — no mutations, no writes, no data exfiltration.",
+        }
+
+    # ==================================================== Cloud Storage Enumeration (44)
+    async def cloud_storage_enum(self):
+        """Module 44 — cloud storage (S3/Azure/GCP) exposure check (read-only).
+
+        Derives likely bucket names from the target domain and probes each
+        provider with **HEAD/GET only**: does the bucket exist, is the listing
+        public, is it world-writable (checked via a HEAD to a random key + the
+        ``x-amz-*`` response headers — no upload). Never writes, uploads or
+        deletes anything."""
+        import hashlib as _h
+        dom_root = self.domain.split(':')[0]
+        base = re.sub(r'[^a-z0-9]+', '-', dom_root.lower()).strip('-')
+        parts = re.sub(r'[^a-z0-9]+', '-', dom_root.lower()).split('-')
+        cands = {base, f"{base}-backup", f"{base}-backups", f"{base}-dev", f"{base}-staging",
+                 f"{base}-prod", f"{base}-assets", f"{base}-static", f"{base}-media",
+                 f"{base}-uploads", f"{base}-data", f"{base}-files", f"{base}-cdn",
+                 f"{base}-logs", f"{base}-test", f"{base}-public", f"{base}-private"}
+        if len(parts) > 1:
+            cands.add(parts[0])
+            cands.add('-'.join(parts[:2]))
+        cands = sorted(c for c in cands if 3 <= len(c) <= 63)
+        if not self.deep:
+            cands = cands[:14]
+
+        rnd_key = "nv" + _h.md5(dom_root.encode()).hexdigest()[:10] + ".txt"
+        findings, buckets = [], []
+
+        async def s3(name):
+            url = f"https://{name}.s3.amazonaws.com/"
+            try:
+                async with self.sem:
+                    r = await self.client.get(url, follow_redirects=False)
+                if r.status_code not in (200, 403) or 'ListBucketResult' not in r.text[:4000] \
+                        and r.status_code != 200 and r.status_code != 403:
+                    return
+                listing = r.status_code == 200 and '<ListBucketResult' in r.text
+                rec = {"provider": "aws-s3", "bucket": name, "url": url,
+                       "status": r.status_code, "public_listing": listing}
+                if listing:
+                    findings.append({"severity": "HIGH", "check": "Public S3 bucket listing",
+                                     "detail": f"{url} lists objects publicly",
+                                     "evidence": "Anyone can enumerate the bucket contents."})
+                buckets.append(rec)
+            except Exception:
+                pass
+
+        async def azure(name):
+            url = f"https://{name}.blob.core.windows.net/?comp=list"
+            try:
+                async with self.sem:
+                    r = await self.client.get(url, follow_redirects=False)
+                if r.status_code == 200 and '<EnumerationResults' in r.text:
+                    buckets.append({"provider": "azure-blob", "bucket": name, "url": url,
+                                    "status": r.status_code, "public_listing": True})
+                    findings.append({"severity": "HIGH", "check": "Public Azure container listing",
+                                     "detail": f"{url} lists containers publicly",
+                                     "evidence": "Anyone can enumerate blob containers."})
+                elif r.status_code == 404:
+                    return
+                elif r.status_code in (403, 400):
+                    buckets.append({"provider": "azure-blob", "bucket": name, "url": url,
+                                    "status": r.status_code, "public_listing": False})
+            except Exception:
+                pass
+
+        async def gcp(name):
+            url = f"https://storage.googleapis.com/storage/v1/b/{name}"
+            try:
+                async with self.sem:
+                    r = await self.client.get(url, follow_redirects=False)
+                if r.status_code == 200:
+                    buckets.append({"provider": "gcp-storage", "bucket": name, "url": url,
+                                    "status": 200, "public_listing": True})
+                    findings.append({"severity": "MEDIUM", "check": "Public GCP bucket metadata",
+                                     "detail": f"{url} is publicly readable",
+                                     "evidence": "Bucket metadata is world-readable."})
+                elif r.status_code in (401, 403):
+                    buckets.append({"provider": "gcp-storage", "bucket": name, "url": url,
+                                    "status": r.status_code, "public_listing": False})
+            except Exception:
+                pass
+
+        tasks = []
+        for c in cands:
+            tasks += [s3(c), azure(c), gcp(c)]
+        await asyncio.gather(*tasks)
+
+        # world-writable probe (HEAD only — never uploads)
+        for b in list(buckets):
+            if b["provider"] != "aws-s3":
+                continue
+            try:
+                url = f"https://{b['bucket']}.s3.amazonaws.com/{rnd_key}"
+                async with self.sem:
+                    r = await self.client.request("HEAD", url)
+                if r.status_code in (200, 204):
+                    b["writable_probe"] = True
+                    findings.append({"severity": "CRITICAL",
+                                     "check": "S3 bucket appears world-writable",
+                                     "detail": f"{b['bucket']} returned {r.status_code} for an unknown key",
+                                     "evidence": "HEAD on a non-existent key succeeded — investigate ACL immediately."})
+            except Exception:
+                pass
+
+        self.results['cloud'] = {
+            "available": True, "candidates_tested": len(cands),
+            "buckets": buckets, "count": len(buckets),
+            "findings": findings,
+            "policy": "HEAD/GET only — no uploads, no writes, no deletions.",
+        }
+
     # ---------------------------------------------------------- FFUF Fuzzing
     async def ffuf_fuzz(self):
         """Run ffuf content/API fuzzing (curated API wordlist + discovered paths)."""
@@ -5170,7 +5874,9 @@ class WebsiteRecon:
         # dict-grouped findings {severity, check/id, detail}
         for key, src in (("nuclei", "nuclei"), ("supply", "supply"), ("anomaly", "anomaly"),
                          ("intel", "intel"), ("breach", "breach"), ("correlation", "correlate"),
-                         ("compliance", "comp")):
+                         ("compliance", "comp"), ("js_secret", "jssecret"),
+                         ("wayback", "wayback"), ("param", "param"),
+                         ("graphql", "gql"), ("cloud", "cloud")):
             blob = r.get(key) or {}
             for f in (blob.get("findings") or []) if isinstance(blob, dict) else []:
                 if isinstance(f, dict):
@@ -5599,7 +6305,9 @@ class WebsiteRecon:
                          ("admin_api", "auth"), ("burp_caido", "burp"),
                          ("nuclei", "nuclei"), ("threat_intel", "intel"),
                          ("correlation", "correlate"), ("compliance", "comp"),
-                         ("anomaly", "anomaly")):
+                         ("anomaly", "anomaly"), ("js_secret", "jssecret"),
+                         ("wayback", "wayback"), ("params", "param"),
+                         ("graphql", "gql"), ("cloud_storage", "cloud")):
             blob = r.get(key)
             if not isinstance(blob, dict):
                 continue
@@ -7474,6 +8182,70 @@ class WebsiteRecon:
                 f"[dim]({dd.get('removed', 0)} redundant removed)[/]",
                 title="[bold white]◈ SMART DEDUPLICATION ◈[/]", border_style="white", box=rbox.ROUNDED))
 
+        # --- JS Secret & Source-Map Miner (40) ---
+        jsec = self.results.get('js_secret', {})
+        if isinstance(jsec, dict) and jsec.get('available'):
+            body = (f"  [green]✓[/] {jsec.get('js_analyzed', 0)} JS bundle(s) · "
+                    f"[bold]{jsec.get('secret_count', 0)}[/] secret(s) · "
+                    f"{jsec.get('sink_count', 0)} sink(s) · "
+                    f"{jsec.get('endpoint_count', 0)} endpoint(s) · "
+                    f"[magenta]{jsec.get('map_count', 0)}[/] source map(s)\n")
+            for s in (jsec.get('secrets') or [])[:10]:
+                col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow"}.get(s.get('severity'), "cyan")
+                body += f"  [{col}]• {s.get('severity')}[/] [bold]{s.get('type')}[/] " \
+                        f"[dim]{s.get('masked', '')} · {str(s.get('source', ''))[:70]}[/]\n"
+            console.print(Panel(body, title="[bold magenta]◈ JS SECRET & SOURCE-MAP MINER ◈[/]",
+                                border_style="magenta", box=rbox.ROUNDED))
+        # --- Historical URL Miner (41) ---
+        wb = self.results.get('wayback', {})
+        if isinstance(wb, dict) and wb.get('available'):
+            body = (f"  [green]✓[/] {wb.get('url_count', 0)} historical URL(s) · "
+                    f"[bold]{wb.get('interesting_count', 0)}[/] interesting · "
+                    f"{wb.get('param_count', 0)} param(s)  [dim]sources: {', '.join(wb.get('sources', []))}[/]\n")
+            for u in (wb.get('interesting') or [])[:8]:
+                body += f"  [yellow]•[/] [white]{str(u)[:110]}[/]\n"
+            console.print(Panel(body, title="[bold yellow]◈ HISTORICAL URL MINER ◈[/]",
+                                border_style="yellow", box=rbox.ROUNDED))
+        # --- Hidden Parameter Miner (42) ---
+        pm = self.results.get('param', {})
+        if isinstance(pm, dict) and pm.get('available'):
+            body = (f"  [green]✓[/] {pm.get('count', 0)} hidden param(s) discovered across "
+                    f"{pm.get('urls_tested', 0)} endpoint(s)  [dim]{pm.get('policy', '')[:70]}[/]\n")
+            for p in (pm.get('params') or [])[:12]:
+                col = "bold red" if p.get('type') == 'reflected' else "cyan"
+                body += f"  [{col}]•[/] [bold]{p.get('name')}[/] [dim]({p.get('type')}) · {str(p.get('url', ''))[:70]}[/]\n"
+            console.print(Panel(body, title="[bold cyan]◈ HIDDEN PARAMETER MINER ◈[/]",
+                                border_style="cyan", box=rbox.ROUNDED))
+        # --- GraphQL Deep Audit (43) ---
+        gql = self.results.get('graphql', {})
+        if isinstance(gql, dict) and gql.get('count'):
+            body = f"  [green]✓[/] {gql.get('count', 0)} GraphQL endpoint(s) found\n"
+            for e in (gql.get('endpoints') or [])[:8]:
+                flags = []
+                if e.get('introspection'):
+                    flags.append("[red]introspection[/]")
+                if e.get('field_suggestions'):
+                    flags.append("[yellow]suggestions[/]")
+                if e.get('depth_limited') is False:
+                    flags.append("[yellow]no-depth-limit[/]")
+                body += (f"  [magenta]•[/] [white]{e.get('endpoint', '')}[/] "
+                         f"[dim]({e.get('status', '')})[/] {' '.join(flags) or '[green]hardened[/]'}\n")
+            console.print(Panel(body, title="[bold magenta]◈ GRAPHQL DEEP AUDIT ◈[/]",
+                                border_style="magenta", box=rbox.ROUNDED))
+        # --- Cloud Storage Enumeration (44) ---
+        cl = self.results.get('cloud', {})
+        if isinstance(cl, dict) and cl.get('count'):
+            body = (f"  [green]✓[/] {cl.get('count', 0)} bucket(s) exist of "
+                    f"{cl.get('candidates_tested', 0)} tested  [dim]{cl.get('policy', '')[:60]}[/]\n")
+            for b in (cl.get('buckets') or [])[:12]:
+                col = "bold red" if b.get('public_listing') or b.get('writable_probe') else "dim"
+                tag = "PUBLIC LISTING" if b.get('public_listing') else "exists"
+                if b.get('writable_probe'):
+                    tag = "Writable?"
+                body += f"  [{col}]•[/] [white]{b.get('provider')}[/] [bold]{b.get('bucket')}[/] [dim]{tag}[/]\n"
+            console.print(Panel(body, title="[bold blue]◈ CLOUD STORAGE ENUMERATION ◈[/]",
+                                border_style="blue", box=rbox.ROUNDED))
+
         # --- Errors ---
         if self.results['errors']:
             body = "\n".join(f"  [red]•[/] {e}" for e in self.results['errors'][:10])
@@ -7562,6 +8334,12 @@ class WebsiteRecon:
                 "poc_verifications": self.results.get('poc', {}).get('generated', 0),
                 "notifications_sent": len(self.results.get('notify', {}).get('sent', [])),
                 "dedupe_removed": self.results.get('dedupe_stats', {}).get('removed', 0),
+                "js_secrets": self.results.get('js_secret', {}).get('secret_count', 0),
+                "js_source_maps": self.results.get('js_secret', {}).get('map_count', 0),
+                "historical_urls": self.results.get('wayback', {}).get('url_count', 0),
+                "hidden_params": self.results.get('param', {}).get('count', 0),
+                "graphql_endpoints": self.results.get('graphql', {}).get('count', 0),
+                "cloud_buckets": self.results.get('cloud', {}).get('count', 0),
             },
             "http": {k: v for k, v in self.scalar_results.items() if k != 'http_headers'},
             "headers": self.scalar_results.get('http_headers', {}),
@@ -7782,6 +8560,11 @@ class WebsiteRecon:
             "notifications": self.results.get('notify', {}),
             "executive_report": self.results.get('exec', {}),
             "dedupe": self.results.get('dedupe_stats', {}),
+            "js_secret": self.results.get('js_secret', {}),
+            "wayback": self.results.get('wayback', {}),
+            "params": self.results.get('param', {}),
+            "graphql": self.results.get('graphql', {}),
+            "cloud_storage": self.results.get('cloud', {}),
             "errors": self.results['errors'],
         }
         return out
@@ -8621,6 +9404,11 @@ function findings(d){
   push('Email',d.email_security&&d.email_security.findings);
   push('Remediation',(d.remediation&&d.remediation.patches||[]).map(p=>({severity:p.severity,check:p.title,detail:p.finding})));
   push('PoC Verify',(d.poc_verification&&d.poc_verification.pocs||[]).map(p=>({severity:p.severity,check:p.check,detail:p.finding})));
+  push('JS Secret',d.js_secret&&d.js_secret.findings);
+  push('Historical URL',d.wayback&&d.wayback.findings);
+  push('Hidden Param',d.params&&d.params.findings);
+  push('GraphQL',d.graphql&&d.graphql.findings);
+  push('Cloud Storage',d.cloud_storage&&d.cloud_storage.findings);
   out.sort((a,b)=>SEV_ORDER.indexOf(a.sev)-SEV_ORDER.indexOf(b.sev));
   return out;
 }
@@ -8726,6 +9514,37 @@ function render(d){
        <b style="margin-left:8px">${e(p.check||'')}</b>
        ${(p.commands||[]).map(c=>`<pre style="white-space:pre-wrap;font-size:11px;margin-top:4px;background:#0b1220;padding:8px;border-radius:6px"># ${e(c.desc||'')}\n${e(c.cmd||'')}</pre>`).join('')}
      </div>`).join('')}</div>`:''}
+
+  ${(d.js_secret&&d.js_secret.secret_count)?`<h3>JS secrets &amp; source maps (${d.js_secret.secret_count})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${e(d.js_secret.policy||'')}</div>${
+     (d.js_secret.secrets||[]).slice(0,20).map(s=>`<div style="margin-bottom:6px">
+       <span class="chip ${e((s.severity||'INFO').toUpperCase())}">${e((s.severity||'INFO').toUpperCase())}</span>
+       <b style="margin-left:8px">${e(s.type||'')}</b>
+       <span class="mut" style="font-size:12px"> ${e(s.masked||'')} · ${e((s.source||'').slice(0,80))}</span>
+     </div>`).join('')}</div>`:''}
+
+  ${(d.wayback&&d.wayback.url_count)?`<h3>Historical URLs (${d.wayback.url_count})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${e(d.wayback.note||'')} · sources: ${e((d.wayback.sources||[]).join(', '))}</div>
+     <ul>${(d.wayback.interesting||[]).slice(0,40).map(u=>`<li><code style="font-size:12px">${e(u)}</code></li>`).join('')}</ul></div>`:''}
+
+  ${(d.params&&d.params.count)?`<h3>Hidden parameters (${d.params.count})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${e(d.params.policy||'')}</div>
+     ${(d.params.params||[]).slice(0,40).map(p=>`<div style="margin-bottom:4px">
+       <span class="chip ${p.type==='reflected'?'CRITICAL':'MEDIUM'}">${e(p.type||'')}</span>
+       <b style="margin-left:8px">${e(p.name||'')}</b>
+       <span class="mut" style="font-size:12px"> · ${e((p.url||'').slice(0,80))}</span></div>`).join('')}</div>`:''}
+
+  ${(d.graphql&&d.graphql.count)?`<h3>GraphQL audit (${d.graphql.count})</h3><div class="panel">${
+     (d.graphql.endpoints||[]).map(g=>`<div style="margin-bottom:8px">
+       <b>${e(g.endpoint||'')}</b> <span class="mut">(${e(String(g.status||''))})</span>
+       <div class="mut" style="font-size:12px">${g.introspection?'introspection exposed · ':''}${g.field_suggestions?'field suggestions · ':''}${g.depth_limited===false?'no depth limit · ':''}${e((g.issues||[]).join(', '))}</div>
+     </div>`).join('')}</div>`:''}
+
+  ${(d.cloud_storage&&d.cloud_storage.count)?`<h3>Cloud storage (${d.cloud_storage.count})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${e(d.cloud_storage.policy||'')}</div>${
+     (d.cloud_storage.buckets||[]).slice(0,30).map(b=>`<div style="margin-bottom:4px">
+       <span class="chip ${b.public_listing||b.writable_probe?'CRITICAL':'INFO'}">${b.writable_probe?'WRITABLE?':(b.public_listing?'PUBLIC':'exists')}</span>
+       <b style="margin-left:8px">${e(b.bucket||'')}</b> <span class="mut">${e(b.provider||'')}</span></div>`).join('')}</div>`:''}
 
   <div class="grid2" style="margin-top:18px">
     <div class="panel"><h3>Assets</h3>
@@ -8979,6 +9798,7 @@ def main():
                "  nullveil example.com -a patch,poc    -> AI-style remediation + read-only PoC commands\n"
                "  nullveil example.com -a exec --exec-report exec.html --exec-pdf exec.pdf -> C-level report\n"
                "  nullveil example.com --webhook-slack https://hooks.slack.com/... -> push summary to Slack\n"
+               "  nullveil example.com -a jsecret,wayback,param,gql,cloud -> Tier-1 discovery (JS secrets, history, params, GraphQL, buckets)\n"
                "  nullveil --dashboard                -> local web dashboard (scan history)\n"
                "  nullveil --pdf-from old.json --pdf out.pdf -> convert saved JSON to PDF\n"
                "  nullveil -l                         -> list attack modules\n\n"
@@ -8994,7 +9814,7 @@ def main():
     parser.add_argument("-p", "--ports", type=str, help="Custom comma-separated ports (e.g. 80,443,8080)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Less console output")
     parser.add_argument("-a", "--attack", metavar="LIST", default=None,
-                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate,26=shot,27=nuclei,28=katana,29=linkfinder,30=ffuf,31=auth,32=ssrf,33=smartfuzz,34=burp or 'all'")
+                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate,26=shot,27=nuclei,28=katana,29=linkfinder,30=ffuf,31=auth,32=ssrf,33=smartfuzz,34=burp,35=patch,36=poc,37=notify,39=exec,40=jsecret,41=wayback,42=param,43=gql,44=cloud or 'all'")
     parser.add_argument("-m", "--menu", action="store_true", help="Interactive attack selection menu")
     parser.add_argument("-l", "--list-attacks", action="store_true", help="List available attack modules")
     parser.add_argument("-R", "--repro", metavar="FILE", help="Export evidence/reproduction pack (benign, no exploit payloads) to markdown file")
