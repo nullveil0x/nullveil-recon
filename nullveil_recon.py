@@ -63,7 +63,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -2297,17 +2297,20 @@ class WebsiteRecon:
             """Handshake forcing one TLS version. Returns (cipher, bits) or None."""
             if const is None:
                 return None
+            import warnings as _warnings
             try:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-                # re-enable protocols some builds disable by default
-                for optname in ("OP_NO_TLSv1", "OP_NO_TLSv1_1", "OP_NO_TLSv1_2"):
-                    opt = getattr(ssl, optname, None)
-                    if opt:
-                        ctx.options &= ~opt
-                ctx.minimum_version = const
-                ctx.maximum_version = const
+                with _warnings.catch_warnings():
+                    # probing TLS 1.0/1.1 deliberately → don't spam DeprecationWarnings
+                    _warnings.simplefilter("ignore", DeprecationWarning)
+                    for optname in ("OP_NO_TLSv1", "OP_NO_TLSv1_1", "OP_NO_TLSv1_2"):
+                        opt = getattr(ssl, optname, None)
+                        if opt:
+                            ctx.options &= ~opt
+                    ctx.minimum_version = const
+                    ctx.maximum_version = const
             except (ValueError, AttributeError, ssl.SSLError):
                 return "UNSUPPORTED_BUILD"
             try:
@@ -5839,6 +5842,8 @@ def serve_dashboard(port=8899, open_browser=True, host="127.0.0.1"):
 
 # ---------------------------------------------------------- CLI
 def main():
+    import warnings as _warnings
+    _warnings.filterwarnings("ignore", category=DeprecationWarning)
     parser = argparse.ArgumentParser(
         prog="nullveil",
         description="NULLVEIL Recon - Website & Domain Reconnaissance Tool | Owner: NULLVEIL | Engine: DeepHat",
