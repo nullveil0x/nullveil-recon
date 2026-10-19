@@ -8,6 +8,16 @@ venv/
 !requirements.txt
 .DS_Store
 
+# Python packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# CI workflow kept locally until the push token has 'workflow' scope.
+# Remove this line (or `git add -f`) once the token is re-authorized.
+.github/workflows/
+
 # Scan output / evidence — never commit target screenshots or reports
 nullveil_shots/
 nullveil-exec-*.html

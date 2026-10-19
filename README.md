@@ -1,8 +1,15 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.7.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.7.0 · **License:** MIT (dual-licensed — see [Commercial](LICENSE-COMMERCIAL.md))
 
-A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 43 attack modules — from DNS records to full API discovery, advanced JS/historical/cloud discovery, remediation and executive reporting — with a live progress bar and a premium terminal report.
+[![CI](https://github.com/nullveil0x/nullveil-recon/actions/workflows/ci.yml/badge.svg)](https://github.com/nullveil0x/nullveil-recon/actions/workflows/ci.yml)
+![tests](https://img.shields.io/badge/tests-34%20passing-brightgreen)
+![modules](https://img.shields.io/badge/modules-48-blue)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+
+A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 48 attack modules — from DNS records to full API discovery, advanced JS/historical/cloud discovery, vulnerability verification (CVSS/CWE, MITRE ATT&CK, live CVE intel), remediation and executive reporting — with a live progress bar and a premium terminal report.
+
+**Defensive by design:** read-only, no exploit payloads, no active exploitation. See [`SECURITY.md`](SECURITY.md) and [`docs/AUTHORIZATION.md`](docs/AUTHORIZATION.md) before scanning.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -43,11 +50,12 @@ This tool is for **education, bug bounty, and authorized security testing ONLY**
 - Scanning systems without authorization is illegal in most countries.
 - The authors are not responsible for misuse. **You are responsible for how you use this tool.**
 
-By using NULLVEIL Recon you agree to these terms.
+By using NULLVEIL Recon you agree to the [EULA](EULA.md). Full policy:
+[SECURITY.md](SECURITY.md) · authorization checklist: [docs/AUTHORIZATION.md](docs/AUTHORIZATION.md).
 
 ---
 
-## ✨ Features — 38 Attack Modules
+## ✨ Features — 48 Attack Modules
 
 | # | Module | What it does |
 |---|--------|--------------|
@@ -657,7 +665,51 @@ Contributions welcome — open an issue or PR.
 
 ## 📜 License
 
-MIT © NULLVEIL — see [LICENSE](LICENSE).
+NULLVEIL Recon is **dual-licensed**:
+
+- **MIT** — free for personal, educational, and non-commercial use; see [LICENSE](LICENSE).
+- **Commercial License** — required for commercial use (client work, resale, SaaS,
+  white-label); see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) and
+  [docs/PRICING.md](docs/PRICING.md).
+
+You may use the software under **either** license, but not both at once. The
+[EULA](EULA.md) governs use of the Software generally.
+
+**Disclaimer:** provided "AS IS", without warranty. You are solely responsible for
+ensuring every target you scan is authorized. See [SECURITY.md](SECURITY.md) and
+[docs/AUTHORIZATION.md](docs/AUTHORIZATION.md).
+
+---
+
+## 🧪 Development, Testing & Deployment
+
+**Test suite** (offline, no network required — uses an in-process mock target):
+
+```bash
+pip install pytest
+python -m pytest tests/ -q          # 34 tests: registry, scoring, Tier-2 intel, report, integration
+```
+
+**Install as a package** (console entry point `nullveil-recon`):
+
+```bash
+pip install .                       # from the repo root (pyproject.toml)
+nullveil-recon example.com -a all
+```
+
+**Docker** (non-root, read-only tool):
+
+```bash
+docker build -t nullveil-recon .
+docker run --rm nullveil-recon https://example.com -a all
+```
+
+**CI** runs compile + smoke + the full test suite on Python 3.9–3.12 and builds
+the Docker image — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+**Commercial use / consulting:** [docs/CONSULTING.md](docs/CONSULTING.md) ·
+**pricing:** [docs/PRICING.md](docs/PRICING.md) ·
+**support:** [`.github/FUNDING.yml`](.github/FUNDING.yml).
 
 ---
 

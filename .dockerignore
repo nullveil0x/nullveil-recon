@@ -1,0 +1,6 @@
+# Ignore everything, then re-include only what the image needs.
+**
+!nullveil_recon.py
+!requirements.txt
+!README.md
+!LICENSE

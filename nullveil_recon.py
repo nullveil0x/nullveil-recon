@@ -5,7 +5,7 @@ Owner/Author: NULLVEIL
 Engine: DeepHat
 Version: 3.7.0
 
-Features (43 attack modules):
+Features (48 attack modules):
   Recon & discovery
   - DNS Records (A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA) + DoH fallback
   - Subdomain Enumeration (wordlist + SSL SAN + crt.sh CT logs)
