@@ -742,6 +742,21 @@ class WebsiteRecon:
         self.scalar_results = {}
         self.scan_duration = 0.0
         self.attack_set = list(ALL_MODULE_NUMS)  # all modules
+        self._build_transport(concurrency)
+        # --- authenticated / OOB scanning state (CLI flags wired in main) ---
+        self.auth_cfg = {}     # --auth-* / --login-* / --role flags
+        self.oob_cfg = {}      # --oob / --oob-server / --oob-wait flags
+        self.roles = {}        # multi-role profiles (parsed during auth setup)
+        self._auth_cmd = []    # "Name: value" strings for subprocess tools
+
+    def _build_transport(self, concurrency=None):
+        """Create the shared httpx client + concurrency semaphore.
+
+        Called from ``__init__`` and again at the start of every ``run()`` so
+        continuous ``--watch`` runs get a transport bound to the *current* event
+        loop (a client/semaphore created under a previous ``asyncio.run()`` is
+        dead once that loop closes)."""
+        concurrency = concurrency or self.concurrency
         self.client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=self.timeout,
@@ -756,14 +771,21 @@ class WebsiteRecon:
                                    f"(KHTML, like Gecko) Chrome/124.0 Safari/537.36 NULLVEIL-Recon/{__version__}"}
         )
         self.sem = asyncio.Semaphore(concurrency)
-        # --- authenticated / OOB scanning state (CLI flags wired in main) ---
-        self.auth_cfg = {}     # --auth-* / --login-* / --role flags
-        self.oob_cfg = {}      # --oob / --oob-server / --oob-wait flags
-        self.roles = {}        # multi-role profiles (parsed during auth setup)
-        self._auth_cmd = []    # "Name: value" strings for subprocess tools
 
     # ---------------------------------------------------------- run
     async def run(self):
+        # Fresh transport every run so continuous --watch runs get a client +
+        # semaphore bound to the current event loop (the previous one is dead).
+        old_client = getattr(self, "client", None)
+        if old_client is not None:
+            try:
+                await old_client.aclose()
+            except Exception:
+                pass
+        try:
+            self._build_transport()
+        except Exception:
+            pass
         # ---------- resume support: hydrate from previous scan, run only missing modules ----------
         resume_note = ""
         entry = getattr(self, "resume_entry", None)
@@ -965,7 +987,10 @@ class WebsiteRecon:
 
         self.scan_duration = (datetime.now() - scan_start).total_seconds()
 
-        await self.client.aclose()
+        try:
+            await self.client.aclose()
+        except Exception:
+            pass
         report = self.export_dict()
 
         # --- Change detection vs the previous scan of this target ----------
@@ -11157,6 +11182,17 @@ def main():
                     time.sleep(interval)
                 except KeyboardInterrupt:
                     break
+                # fresh per-run state (results/errors must not accumulate across runs)
+                recon.results = defaultdict(list)
+                recon.scalar_results = {}
+                recon.resume_entry = None
+                for _attr in ("exec_report_path",):
+                    if getattr(recon, _attr, ""):
+                        # avoid overwriting the same exec file each run; suffix by run
+                        base = getattr(recon, _attr)
+                        if run_no == 2:
+                            root, ext = os.path.splitext(base)
+                            setattr(recon, _attr, f"{root}-r{run_no}{ext}")
                 try:
                     report = asyncio.run(recon.run())
                 except Exception as e:
