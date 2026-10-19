@@ -7,3 +7,6 @@ venv/
 *.json
 !requirements.txt
 .DS_Store
+
+# Scan output / evidence — never commit target screenshots or reports
+nullveil_shots/
