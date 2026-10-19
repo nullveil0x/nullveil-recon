@@ -63,7 +63,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -274,6 +274,8 @@ ATTACK_MODULES = [
     ("comp", 23, "Compliance Mapping", "PCI-DSS 4.0, ISO 27001:2022 Annex A, SOC 2 TSC — evidence-based mapping"),
     ("graph", 24, "Attack Path Graph", "Asset graph, attack-path search, exploit-chain hypotheses (report-only)"),
     ("correlate", 25, "Target Correlation", "Multi-target/tenant correlation: shared NS/MX/IP/CDN, --correlate list"),
+    ("shot", 26, "Screenshot Capture", "Headless browser page snapshots (needs optional playwright)"),
+    ("nuclei", 27, "Nuclei Template Scan", "ProjectDiscovery nuclei integration — 9000+ vuln templates (needs nuclei binary)"),
 ]
 
 MAX_MODULE = len(ATTACK_MODULES)
@@ -433,7 +435,29 @@ class WebsiteRecon:
 
     # ---------------------------------------------------------- run
     async def run(self):
+        # ---------- resume support: hydrate from previous scan, run only missing modules ----------
+        resume_note = ""
+        entry = getattr(self, "resume_entry", None)
+        if entry:
+            raw = entry.get("_raw", {})
+            for k, v in (raw.get("results") or {}).items():
+                self.results[k] = v
+            for k, v in (raw.get("scalar") or {}).items():
+                self.scalar_results[k] = v
+            done = set(entry.get("modules_run", []))
+            missing = [i for i in self.attack_set
+                       if ATTACK_MODULES[i - 1][0] not in done]
+            skipped = len(self.attack_set) - len(missing)
+            # keep the already-done selection so the final report shows the full picture
+            self._resume_done = [i for i in self.attack_set
+                                 if ATTACK_MODULES[i - 1][0] in done]
+            self.attack_set = missing
+            resume_note = (f"Resumed from scan [bold cyan]{entry.get('id')}[/] "
+                           f"({entry.get('when', '')[:16]}) — {skipped} module(s) already done, "
+                           f"{len(missing)} remaining.")
         print_banner()
+        if resume_note:
+            console.print(f"      {resume_note}")
         module_names = ", ".join(ATTACK_MODULES[i - 1][0] for i in self.attack_set) if self.attack_set else "none"
         console.print(f"      [dim]Target:[/] [bold magenta]{self.domain}[/]   "
                       f"[dim]Mode:[/] [bold {'red' if self.deep else 'green'}]"
@@ -470,6 +494,8 @@ class WebsiteRecon:
             (":clipboard: Compliance Mapping", self.compliance_map, 23),
             (":spider_web: Attack Path Graph", self.attack_graph, 24),
             (":arrows_counterclockwise: Target Correlation", self.correlate_targets, 25),
+            (":camera: Screenshot Capture", self.screenshot_capture, 26),
+            (":test_tube: Nuclei Template Scan", self.nuclei_scan, 27),
         ]
         # Filter by attack set and create coroutines only for selected
         # Modules that READ other modules' results must run sequentially AFTER the
@@ -530,8 +556,13 @@ class WebsiteRecon:
         self.scan_duration = (datetime.now() - scan_start).total_seconds()
 
         await self.client.aclose()
+        report = self.export_dict()
+        hid = self._history_save(report)
+        if hid and not getattr(self, "quiet", False):
+            console.print(f"[dim]Scan saved to history:[/] [cyan]{hid}[/]  "
+                          f"[dim](list: nullveil <target> --history)[/]")
         self.print_report()
-        return self.export_dict()
+        return report
 
     # ---------------------------------------------------------- DNS
     async def dns_recon(self):
@@ -3684,6 +3715,259 @@ class WebsiteRecon:
             "findings": findings,
         }
 
+    # ---------------------------------------------------------- Screenshot Capture
+    async def screenshot_capture(self):
+        """Headless-browser page snapshots (EyeWitness/Aquatone-style).
+        Optional dependency: pip install playwright && playwright install chromium"""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            self.results['screenshots'] = {
+                "available": False, "shots": [],
+                "note": "playwright not installed — pip install playwright && playwright install chromium",
+            }
+            self.results['errors'].append(
+                "screenshot: playwright missing — run: pip install playwright && playwright install chromium")
+            return
+
+        # pick URLs: homepage + flagged paths + a few discovered (cap 12 normal / 24 deep)
+        urls = [self.base_url + "/"]
+        seen = {urls[0]}
+        for pd in [x for x in self.results.get('paths', []) if isinstance(x, dict)]:
+            if pd.get('flagged') or pd.get('status') in (200, 401, 403):
+                u = urljoin(self.base_url + "/", str(pd.get('path', '')).lstrip('/'))
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+            if len(urls) >= (24 if self.deep else 12):
+                break
+        out_dir = os.path.join(os.getcwd(), "nullveil_shots",
+                                re.sub(r'[^A-Za-z0-9._-]', '_', self.domain))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            self.results['screenshots'] = {"available": False, "shots": [],
+                                           "note": f"cannot create dir: {e}"}
+            return
+
+        shots = []
+        # pre-flight: is a chromium binary actually present?
+        try:
+            import glob as _glob
+            _cache = os.path.expanduser("~/.cache/ms-playwright")
+            _has_browser = bool(_glob.glob(os.path.join(_cache, "chromium*", "chrome*", "chrome")) or
+                                 _glob.glob(os.path.join(_cache, "chromium*")))
+            if not _has_browser and not os.environ.get("NULLVEIL_FORCE_SHOT"):
+                self.results['screenshots'] = {
+                    "available": False, "shots": [],
+                    "note": "browser binary not downloaded — run: playwright install chromium",
+                }
+                self.results['errors'].append(
+                    "screenshot: browser binary missing — run: playwright install chromium")
+                return
+        except Exception:
+            pass
+        try:
+            async with async_playwright() as pw:
+                try:
+                    browser = await pw.chromium.launch(
+                        headless=True, args=["--no-sandbox", "--disable-gpu"])
+                except Exception as e:
+                    self.results['screenshots'] = {
+                        "available": False, "shots": [],
+                        "note": f"chromium unavailable ({type(e).__name__}) — run: playwright install chromium",
+                    }
+                    self.results['errors'].append(
+                        "screenshot: browser binary missing — run: playwright install chromium")
+                    return
+                ctx = await browser.new_context(
+                    viewport={"width": 1366, "height": 900},
+                    user_agent="Mozilla/5.0 (X11; Linux x86_64) NULLVEIL-Recon/3.1 (screenshot)")
+                sem = asyncio.Semaphore(3)   # gentle parallelism
+
+                async def shoot(i, u):
+                    async with sem:
+                        rec = {"url": u, "file": "", "status": "", "title": "", "error": ""}
+                        try:
+                            page = await ctx.new_page()
+                            resp = await page.goto(u, timeout=int(self.timeout * 1000) + 8000,
+                                                   wait_until="domcontentloaded")
+                            rec["status"] = resp.status if resp else ""
+                            await page.wait_for_timeout(600)     # let late JS settle
+                            rec["title"] = (await page.title() or "")[:80]
+                            fname = f"{i:02d}-" + re.sub(r'[^A-Za-z0-9._-]', '_',
+                                                         urlparse(u).path.strip('/') or 'index')[:60] + ".png"
+                            fpath = os.path.join(out_dir, fname)
+                            await page.screenshot(path=fpath, full_page=False)
+                            rec["file"] = fpath
+                            await page.close()
+                        except Exception as e:
+                            rec["error"] = type(e).__name__
+                        return rec
+
+                results_ = await asyncio.gather(*[shoot(i, u) for i, u in enumerate(urls)])
+                shots = [r for r in results_ if r.get("file") or r.get("error")]
+                await browser.close()
+        except Exception as e:
+            self.results['errors'].append(f"screenshot: playwright engine failed: {type(e).__name__} — {e}")
+
+        ok = [s for s in shots if s.get("file")]
+        self.results['screenshots'] = {
+            "available": True, "dir": out_dir,
+            "captured": len(ok), "attempted": len(shots),
+            "shots": shots,
+        }
+
+    # ---------------------------------------------------------- Nuclei Template Scan
+    async def nuclei_scan(self):
+        """Run ProjectDiscovery nuclei (if installed) against the target and parse JSONL findings."""
+        import shutil as _shutil
+        exe = _shutil.which("nuclei") or _shutil.which("nuclei.exe")
+        if not exe:
+            self.results['nuclei'] = {
+                "available": False, "findings": [],
+                "note": "nuclei binary not found — install: "
+                        "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest "
+                        "(or download from github.com/projectdiscovery/nuclei/releases)",
+            }
+            self.results['errors'].append(
+                "nuclei: binary missing — install from projectdiscovery.io, then re-run -a nuclei")
+            return
+
+        cmd = [exe, "-u", self.base_url, "-jsonl", "-silent", "-no-color", "-duc",
+               "-severity", "critical,high,medium",
+               "-timeout", str(max(self.timeout, 8)),
+               "-retries", "1",
+               "-c", str(min(self.concurrency, 25)),
+               "-stats"]
+        custom = str(getattr(self, "nuclei_templates", "") or "")
+        if custom:
+            cmd += ["-t", custom]
+        findings = []
+        stdout_lines = []
+        version = ""
+        wall_limit = 1800 if self.deep else 900
+        try:
+            # version (fast)
+            try:
+                vproc = await asyncio.create_subprocess_exec(
+                    exe, "-version", stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT)
+                vout, _ = await asyncio.wait_for(vproc.communicate(), timeout=15)
+                m = re.search(r'Nuclei(?: Engine)?\s+Version:\s*([^\s]+)', vout.decode('utf-8', 'replace'))
+                version = m.group(1) if m else ""
+            except Exception:
+                pass
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=wall_limit)
+                stdout_lines = stdout_bytes.decode('utf-8', 'replace').splitlines()
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                self.results['errors'].append(f"nuclei: stopped after {wall_limit}s wall-time cap")
+        except Exception as e:
+            self.results['errors'].append(f"nuclei: execution failed: {type(e).__name__} — {e}")
+            self.results['nuclei'] = {"available": False, "findings": [],
+                                      "note": f"execution failed: {type(e).__name__}"}
+            return
+
+        parsed = 0
+        for line in stdout_lines:
+            line = line.strip()
+            if not line or not line.startswith('{'):
+                continue
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            parsed += 1
+            sev = str(j.get("info", {}).get("severity", "info")).upper()
+            tid = j.get("template-id") or j.get("templateID") or "?"
+            name = str(j.get("info", {}).get("name", tid))[:100]
+            matched = str(j.get("matched-at") or j.get("matched") or j.get("host") or "")[:120]
+            cves = j.get("info", {}).get("classification", {}) or {}
+            cve_id = cves.get("cve-id") or cves.get("cve_id") or ""
+            findings.append((sev if sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO") else "INFO",
+                             f"nuclei:{tid}",
+                             f"{name} — matched: {matched}" + (f" [{cve_id}]" if cve_id else "")))
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        self.results['nuclei'] = {
+            "available": True, "binary": exe, "version": version,
+            "templates": custom or "default (nuclei built-in templates)",
+            "severity_filter": "critical,high,medium",
+            "templates_run": parsed,
+            "findings": sorted(findings, key=lambda x: sev_rank.get(x[0], 5)),
+        }
+
+    # ---------------------------------------------------------- Scan History
+    HISTORY_DIR = os.path.join(os.path.expanduser("~"), ".nullveil", "history")
+
+    def _history_save(self, report=None):
+        """Auto-save every completed scan for --history / --resume."""
+        if getattr(self, "no_history", False):
+            return None
+        try:
+            os.makedirs(self.HISTORY_DIR, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            hid = f"{ts}-{hashlib.md5((self.domain + ts).encode()).hexdigest()[:6]}"
+            report = report or self.export_dict()
+            entry = {
+                "id": hid, "target": self.base_url, "domain": self.domain,
+                "when": datetime.now().isoformat(), "duration_s": round(self.scan_duration, 1),
+                "version": __version__,
+                "modules_run": [ATTACK_MODULES[i - 1][0] for i in
+                                sorted(self.attack_set) if 0 < i <= MAX_MODULE],
+                "summary": report.get("summary", {}),
+                "report": report,
+                "_raw": {"results": {k: v for k, v in self.results.items()},
+                         "scalar": dict(self.scalar_results)},
+            }
+            with open(os.path.join(self.HISTORY_DIR, hid + ".json"), "w", encoding="utf-8") as fh:
+                json.dump(entry, fh, ensure_ascii=False, default=str)
+            # prune: keep newest 200 entries
+            files = sorted(f for f in os.listdir(self.HISTORY_DIR) if f.endswith(".json"))
+            for old in files[:-200]:
+                try:
+                    os.remove(os.path.join(self.HISTORY_DIR, old))
+                except Exception:
+                    pass
+            return hid
+        except Exception:
+            return None
+
+    def _history_list(self):
+        """Return scan entries sorted newest-first."""
+        out = []
+        try:
+            for fn in sorted(os.listdir(self.HISTORY_DIR), reverse=True):
+                if not fn.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(self.HISTORY_DIR, fn), encoding="utf-8") as fh:
+                        e = json.load(fh)
+                    out.append(e)
+                except Exception:
+                    continue
+                if len(out) >= 300:
+                    break
+        except FileNotFoundError:
+            pass
+        return out
+
+    def _history_load(self, scan_id=None):
+        """Load one history entry (latest for this target, or explicit id)."""
+        for e in self._history_list():
+            if scan_id:
+                if e.get("id") == scan_id or e.get("id", "").startswith(scan_id):
+                    return e
+            elif e.get("domain", "").lower() == self.domain.lower():
+                return e
+        return None
+
     # ---------------------------------------------------------- Evidence / Repro Pack (-R)
     def export_repro(self, path):
         """Benign evidence pack: exact reproduction commands + verification steps for each
@@ -4316,6 +4600,40 @@ class WebsiteRecon:
         if self.results['js_files']:
             self._simple_table("◈ JS FILES / SOURCE MAPS ◈", sorted(set(self.results['js_files']))[:30], style="dim")
 
+        # --- Nuclei template scan ---
+        nuc = self.results.get('nuclei', [])
+        if isinstance(nuc, dict) and (nuc.get('findings') or nuc.get('note')):
+            if nuc.get('findings'):
+                sev_col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "cyan", "INFO": "dim"}
+                nt = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_red",
+                           title=f"[bold red]◈ NUCLEI FINDINGS ◈[/] [dim]v{nuc.get('version', '') or 'n/a'} · "
+                                 f"{nuc.get('templates_run', 0)} template(s)[/]")
+                nt.add_column("Sev", justify="center")
+                nt.add_column("ID", style="bold")
+                nt.add_column("Detail")
+                for sev, fid, det in nuc.get('findings', [])[:50]:
+                    nt.add_row(f"[{sev_col.get(sev, 'white')}]{sev}[/]", fid, det[:110])
+                console.print(nt)
+            elif nuc.get('note'):
+                console.print(Panel(f"  [yellow]•[/] {nuc['note']}",
+                                    title="[bold yellow]◈ NUCLEI (not available) ◈[/]",
+                                    border_style="yellow", box=rbox.ROUNDED))
+        # --- Screenshots ---
+        shots = self.results.get('screenshots', [])
+        if isinstance(shots, dict) and (shots.get('captured') or shots.get('note')):
+            if shots.get('captured'):
+                body = "\n".join(f"  [green]✓[/] {os.path.basename(str(x.get('file', '')))}  "
+                                  f"[dim]{x.get('url', '')[:70]}[/]"
+                                  + (f"  [red]{x.get('error')}[/]" if x.get('error') else "")
+                                  for x in shots.get('shots', [])[:24])
+                console.print(Panel(body + f"\n\n  [dim]dir: {shots.get('dir', '')}[/]",
+                                    title=f"[bold green]◈ SCREENSHOTS ({shots.get('captured', 0)}/{shots.get('attempted', 0)}) ◈[/]",
+                                    border_style="green", box=rbox.ROUNDED))
+            elif shots.get('note'):
+                console.print(Panel(f"  [yellow]•[/] {shots['note']}",
+                                    title="[bold yellow]◈ SCREENSHOTS (not available) ◈[/]",
+                                    border_style="yellow", box=rbox.ROUNDED))
+
         # --- Errors ---
         if self.results['errors']:
             body = "\n".join(f"  [red]•[/] {e}" for e in self.results['errors'][:10])
@@ -4351,7 +4669,9 @@ class WebsiteRecon:
             "target": self.domain,
             "started": datetime.now().isoformat(),
             "mode": "deep" if self.deep else "normal",
-            "modules_run": [ATTACK_MODULES[i - 1][0] for i in sorted(self.attack_set) if 0 < i <= MAX_MODULE],
+            "modules_run": [ATTACK_MODULES[i - 1][0] for i in
+                            sorted(set(self.attack_set) | set(getattr(self, "_resume_done", [])))
+                            if 0 < i <= MAX_MODULE],
             "summary": {
                 "dns_records": len(self.results['dns']),
                 "subdomains": len(set(self.results['subdomains'])),
@@ -4380,6 +4700,9 @@ class WebsiteRecon:
                 "compliance_fails": self.results.get('compliance', {}).get('total_fail', 0),
                 "attack_chains": len(self.results.get('graph', {}).get('chains', [])),
                 "correlated_targets": len(self.results.get('correlation', {}).get('links', [])),
+                "nuclei_issues": len([f for f in self.results.get('nuclei', {}).get('findings', [])
+                                      if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
+                "screenshots": self.results.get('screenshots', {}).get('captured', 0),
             },
             "http": {k: v for k, v in self.scalar_results.items() if k != 'http_headers'},
             "headers": self.scalar_results.get('http_headers', {}),
@@ -4521,6 +4844,25 @@ class WebsiteRecon:
                 "note": self.results.get('correlation', {}).get('note', ''),
                 "findings": [{"severity": s, "check": c, "detail": d}
                              for s, c, d in self.results.get('correlation', {}).get('findings', [])],
+            },
+            "screenshots": {
+                "available": self.results.get('screenshots', {}).get('available', False),
+                "dir": self.results.get('screenshots', {}).get('dir', ''),
+                "captured": self.results.get('screenshots', {}).get('captured', 0),
+                "attempted": self.results.get('screenshots', {}).get('attempted', 0),
+                "note": self.results.get('screenshots', {}).get('note', ''),
+                "shots": self.results.get('screenshots', {}).get('shots', []),
+            },
+            "nuclei": {
+                "available": self.results.get('nuclei', {}).get('available', False),
+                "binary": self.results.get('nuclei', {}).get('binary', ''),
+                "version": self.results.get('nuclei', {}).get('version', ''),
+                "templates": self.results.get('nuclei', {}).get('templates', ''),
+                "severity_filter": self.results.get('nuclei', {}).get('severity_filter', ''),
+                "templates_run": self.results.get('nuclei', {}).get('templates_run', 0),
+                "note": self.results.get('nuclei', {}).get('note', ''),
+                "findings": [{"severity": sev, "id": fid, "detail": det}
+                             for sev, fid, det in self.results.get('nuclei', {}).get('findings', [])],
             },
             "errors": self.results['errors'],
         }
@@ -4903,6 +5245,41 @@ class WebsiteRecon:
                          _e(l['relation'])] for l in links]
                 parts.append(sec("Correlation Matrix",
                                  tbl(["A", "B", "Shared", "Relation"], rows), "#8b5cf6"))
+        # Nuclei
+        nuc = d.get('nuclei', {})
+        if nuc:
+            nf = nuc.get('findings', [])
+            if nf:
+                parts.append(sec(f"Nuclei Scan (v{nuc.get('version','?')} · {nuc.get('templates_run',0)} templates)",
+                                 tbl(["Severity", "ID", "Detail"],
+                                     [[f"<span class='chip {'red' if f['severity'] in ('CRITICAL','HIGH') else ('yellow' if f['severity']=='MEDIUM' else 'green')}'>{_e(f['severity'])}</span>",
+                                       _e(f['id']), _e(str(f['detail'])[:140])] for f in nf[:80]]), "#ef4444"))
+            elif nuc.get('note'):
+                parts.append(sec("Nuclei Scan", f"<p class='muted'>{_e(nuc['note'])}</p>", "#64748b"))
+        # Screenshots
+        sh = d.get('screenshots', {})
+        if sh and sh.get('captured'):
+            imgs = ""
+            for x in sh.get('shots', [])[:24]:
+                fp = x.get('file', '')
+                b64 = ""
+                try:
+                    if fp and os.path.exists(fp) and os.path.getsize(fp) < 400_000:
+                        with open(fp, 'rb') as fh:
+                            b64 = base64.b64encode(fh.read()).decode()
+                except Exception:
+                    b64 = ""
+                if b64:
+                    imgs += (f"<figure style='display:inline-block;margin:6px;text-align:center'>"
+                             f"<img src='data:image/png;base64,{b64}' style='max-width:340px;border-radius:6px;border:1px solid #334155'/>"
+                             f"<figcaption class='muted' style='font-size:11px'>{_e(x.get('url','')[:60])}</figcaption></figure>")
+            if imgs:
+                parts.append(sec(f"Screenshots ({sh.get('captured', 0)})", imgs, "#22c55e"))
+            else:
+                files = li([x.get('file', '') for x in sh.get('shots', []) if x.get('file')], 40)
+                parts.append(sec("Screenshots (files)", files or "<p class='muted'>saved on disk</p>", "#22c55e"))
+        elif sh and sh.get('note'):
+            parts.append(sec("Screenshots", f"<p class='muted'>{_e(sh['note'])}</p>", "#64748b"))
         # Errors
         errs = d.get('errors', [])
         if errs:
@@ -5018,8 +5395,36 @@ def main():
     parser.add_argument("--correlate", metavar="LIST", default=None, help="Comma-separated extra domains for cross-org correlation (e.g. a.com,b.com)")
     parser.add_argument("--hibp-key", metavar="KEY", default=None, help="HaveIBeenPwned API key (optional; also via HIBP_API_KEY env)")
     parser.add_argument("--dot", metavar="FILE", default=None, help="Export Attack Path Graph as DOT file")
+    parser.add_argument("--history", action="store_true", help="List saved scan history and exit")
+    parser.add_argument("--resume", nargs="?", const="", default=None, metavar="ID",
+                        help="Resume a previous scan (latest for target, or give a history ID) — only missing modules run")
+    parser.add_argument("--no-history", action="store_true", help="Do not auto-save this scan to history")
+    parser.add_argument("--nuclei-templates", metavar="DIR", default=None,
+                        help="Custom nuclei template path/dir (used by -a nuclei)")
     parser.add_argument("-V", "--version", action="version", version=f"NULLVEIL Recon v{__version__} | Owner: NULLVEIL | Engine: DeepHat")
     args = parser.parse_args()
+
+    if args.history:
+        any_recon = WebsiteRecon("example.com")   # only to reach history helpers
+        entries = any_recon._history_list()
+        console.print("[bold cyan]NULLVEIL Scan History[/]  [dim](~/.nullveil/history)[/]\n")
+        if not entries:
+            console.print("  [yellow]No saved scans yet.[/] Run a scan first — every scan auto-saves here.")
+        else:
+            ht = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_blue")
+            ht.add_column("ID", style="bold cyan")
+            ht.add_column("Target", style="bold")
+            ht.add_column("When")
+            ht.add_column("Modules", justify="right")
+            ht.add_column("Dur", justify="right")
+            for e in entries[:40]:
+                ht.add_row(str(e.get("id", "?")), str(e.get("domain", "?"))[:40],
+                           str(e.get("when", ""))[:16],
+                           str(len(e.get("modules_run", []))),
+                           f"{e.get('duration_s', 0)}s")
+            console.print(ht)
+            console.print("\n[dim]Resume: nullveil <target> --resume [ID][/]")
+        return
 
     if args.list_attacks:
         console.print("[bold cyan]NULLVEIL Attack Modules[/]")
@@ -5076,6 +5481,15 @@ def main():
         recon.dot_path = args.dot
     except Exception:
         pass
+    recon.nuclei_templates = args.nuclei_templates
+    recon.no_history = args.no_history
+    if args.resume is not None:
+        entry = recon._history_load(args.resume or None)
+        if entry:
+            recon.resume_entry = entry
+        else:
+            console.print(f"[yellow]No history entry found{' for ' + args.resume if args.resume else ' for ' + recon.domain}[/]"
+                          f" — running a fresh scan.")
 
     try:
         report = asyncio.run(recon.run())

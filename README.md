@@ -1,8 +1,8 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.0.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.1.0 · **License:** MIT
 
-A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 25 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
+A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 27 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.0.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.1.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -33,7 +33,7 @@ By using NULLVEIL Recon you agree to these terms.
 
 ---
 
-## ✨ Features — 25 Attack Modules
+## ✨ Features — 27 Attack Modules
 
 | # | Module | What it does |
 |---|--------|--------------|
@@ -62,6 +62,8 @@ By using NULLVEIL Recon you agree to these terms.
 | 23 | **Compliance Mapping** | **PCI-DSS v4.0 + ISO 27001:2022 Annex A + SOC 2 TSC — 31 controls mapped to scan evidence (PASS/FAIL/PARTIAL) with disclaimer** |
 | 24 | **Attack Path Graph** | **Asset/finding graph, BFS attack-path search (entry → crown jewels), exploit-chain hypotheses, DOT export — report-only narratives** |
 | 25 | **Target Correlation** | **Cross-org/multi-tenant correlation: shared NS / MX / IP / CDN across your domains, auto-derived from cert SANs or `--correlate`** |
+| 26 | **Screenshot Capture** | **Headless-Chromium snapshots of homepage + discovered/flagged paths → `nullveil_shots/<domain>/`, embedded in HTML report (optional: `playwright`)** |
+| 27 | **Nuclei Template Scan** | **ProjectDiscovery nuclei integration — runs the industry-standard template engine (critical/high/medium) and parses JSONL findings (optional: `nuclei` binary)** |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
@@ -107,6 +109,21 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Optional power-ups (v3.1.0)
+
+Screenshot capture (`-a shot`) and Nuclei scanning (`-a nuclei`) use **optional** tools —
+NULLVEIL degrades gracefully with a friendly hint if they are missing:
+
+```bash
+# Screenshots (headless Chromium)
+pip install playwright
+playwright install chromium
+
+# Nuclei — industry-standard vulnerability templates
+# (github.com/projectdiscovery/nuclei/releases or):
+go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+```
+
 ---
 
 ## 🚀 Usage
@@ -118,7 +135,7 @@ python3 nullveil_recon.py TARGET [options]
 ### Examples
 
 ```bash
-# Full scan (all 25 modules)
+# Full scan (all 27 modules)
 python3 nullveil_recon.py example.com
 
 # Interactive attack menu — pick modules by number
@@ -169,6 +186,17 @@ python3 nullveil_recon.py example.com --correlate brand2.com,brand3.com
 # Breach monitoring (free key: haveibeenpwned.com/APIKey)
 HIBP_API_KEY=yourkey python3 nullveil_recon.py example.com -a breach
 
+# v3.1.0: screenshots + nuclei template scan
+python3 nullveil_recon.py example.com -a shot,nuclei
+
+# Custom nuclei templates
+python3 nullveil_recon.py example.com -a nuclei --nuclei-templates ~/my-templates/
+
+# Scan history: list past scans / resume an interrupted one
+python3 nullveil_recon.py --history
+python3 nullveil_recon.py example.com --resume          # latest scan for target
+python3 nullveil_recon.py example.com --resume 20261019 # specific ID prefix
+
 # Custom ports + timeout
 python3 nullveil_recon.py http://192.168.1.10:8080 -p 80,443,8080 -t 15
 
@@ -194,6 +222,10 @@ python3 nullveil_recon.py -l
 | `--dot FILE` | Export Attack Path Graph as Graphviz DOT file |
 | `--correlate LIST` | Extra domains for cross-org correlation, e.g. `a.com,b.com` |
 | `--hibp-key KEY` | HaveIBeenPwned API key (or set `HIBP_API_KEY` env) |
+| `--history` | List saved scan history (`~/.nullveil/history`) |
+| `--resume [ID]` | Resume previous scan — re-runs only the missing modules |
+| `--no-history` | Don't auto-save this scan to history |
+| `--nuclei-templates DIR` | Custom nuclei template path for `-a nuclei` |
 | `-q`, `--quiet` | Suppress console output |
 | `-V`, `--version` | Show version |
 
@@ -240,7 +272,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -266,7 +298,9 @@ python3 nullveil_recon.py example.com -o report.json
   "breach": { "breaches": [...], "checks": [...], "findings": [...] },
   "compliance": { "frameworks": {...}, "coverage_pct": 52, "total_controls": 31 },
   "attack_graph": { "nodes": [...], "edges": [...], "attack_paths": [...], "chains": [...] },
-  "correlation": { "targets": [...], "links": [...], "findings": [...] }
+  "correlation": { "targets": [...], "links": [...], "findings": [...] },
+  "screenshots": { "captured": 5, "shots": [...], "dir": "nullveil_shots/example.com" },
+  "nuclei": { "version": "v3.11.1", "templates_run": 1284, "findings": [...] }
 }
 ```
 
@@ -307,9 +341,9 @@ Compliance output is **evidence-based partial mapping**, never a certification c
 - [x] Attack path graph + chain hypotheses + DOT export (`-a graph`)
 - [x] Multi-target / cross-org correlation (`--correlate`)
 - [x] Evidence / repro pack export (`-R`)
-- [ ] Resume / scan history
-- [ ] Nuclei template integration
-- [ ] Screenshot capture
+- [x] Screenshot capture — headless Chromium (`-a shot`)
+- [x] Nuclei template integration (`-a nuclei`)
+- [x] Scan history + resume (`--history`, `--resume`)
 
 Contributions welcome — open an issue or PR.
 
