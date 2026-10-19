@@ -5525,6 +5525,10 @@ class WebsiteRecon:
 
     # ==================================================== CVE Intelligence Enricher (47)
     # Curated offline intel for the CVEs in CVE_RULES: CVSS + CWE + KEV + exploit.
+    # This is the *offline fallback* — when --cve-live is enabled, the module also
+    # queries NVD 2.0 + FIRST EPSS and merges the live values over these defaults.
+    CVE_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".nullveil", "cve_cache")
+    CVE_CACHE_TTL = 7 * 24 * 3600  # live CVE data is stable; refresh weekly
     CVE_INTEL = {
         "CVE-2021-41773": {"cvss": 9.8, "cwe": "CWE-22", "kev": True, "exploit": True,
                            "epss": 0.97, "desc": "Apache 2.4.49 path traversal/RCE — actively exploited."},
@@ -5569,12 +5573,14 @@ class WebsiteRecon:
     }
 
     async def cve_intel_enrich(self):
-        """Module 47 — enrich fingerprinted versions' CVEs with offline intel.
+        """Module 47 — enrich fingerprinted versions' CVEs with intel.
 
-        Adds CVSS base score, CWE, EPSS-style likelihood, CISA KEV membership and
-        exploit-availability to every CVE surfaced by module 15, then ranks the
-        product exposure by real-world risk (KEV > high-EPSS > CVSS). Fully
-        offline — no CVE API calls, no active checks."""
+        Merges **offline curated intel** (always available) with **live NVD 2.0 +
+        FIRST EPSS** data when ``--cve-live`` is enabled. Live lookups are
+        disk-cached (``~/.nullveil/cve_cache/``, weekly TTL) and degrade silently
+        to the offline values when the network or the upstream API is unavailable.
+        CVSS/CWE/KEV/EPSS are then ranked into real-world patch priorities
+        (KEV > high-EPSS > CVSS). No active checks against the target."""
         versions = self.results.get('versions', []) or []
         cve_hits = self.results.get('cve_findings', []) or []
         intel_rows, findings, seen = [], [], set()
@@ -5582,20 +5588,37 @@ class WebsiteRecon:
         blob = " ".join(str(v) for v in versions) + " " + \
                " ".join(str(f) for f in cve_hits)
         cve_ids = sorted(set(re.findall(r'CVE-\d{4}-\d{4,7}', blob)))
+
+        live = bool(getattr(self, "cve_live", False)) and bool(cve_ids)
+        live_data = {}
+        if live:
+            try:
+                live_data = await self._cve_live_fetch(cve_ids)
+            except Exception as e:
+                self.results['errors'].append(f"cveintel: live fetch failed: {e!r}")
+
         for cid in cve_ids:
             if cid in seen:
                 continue
             seen.add(cid)
             info = self.CVE_INTEL.get(cid, {})
+            lv = live_data.get(cid, {}) if isinstance(live_data, dict) else {}
+            # live values win when present; otherwise fall back to offline intel
+            cvss = lv.get("cvss") or info.get("cvss", 0.0)
+            cwe = lv.get("cwe") or info.get("cwe", "CWE-noinfo")
+            epss = lv.get("epss") if lv.get("epss") is not None else info.get("epss", 0.0)
+            kev = bool(lv.get("kev")) or bool(info.get("kev"))
+            exploit = (bool(lv.get("exploit_available"))
+                       or bool(info.get("exploit"))
+                       or bool(lv.get("kev")))
+            desc = lv.get("desc") or info.get(
+                "desc", "No intel available — verify against NVD.")
+            source = lv.get("source") or ("offline curated" if cid in self.CVE_INTEL
+                                          else "unknown")
             row = {
-                "cve": cid,
-                "cvss": info.get("cvss", 0.0),
-                "cwe": info.get("cwe", "CWE-noinfo"),
-                "kev": bool(info.get("kev")),
-                "exploit_available": bool(info.get("exploit")),
-                "epss": info.get("epss", 0.0),
-                "desc": info.get("desc", "No offline intel available — verify against NVD."),
-                "known": cid in self.CVE_INTEL,
+                "cve": cid, "cvss": cvss, "cwe": cwe, "kev": kev,
+                "exploit_available": exploit, "epss": epss, "desc": desc,
+                "known": cid in self.CVE_INTEL, "source": source,
             }
             sev = ("CRITICAL" if row["kev"] else
                    "CRITICAL" if row["cvss"] >= 9.0 else
@@ -5621,15 +5644,185 @@ class WebsiteRecon:
         sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         findings.sort(key=lambda f: sev_rank.get(f["severity"], 4))
         kev = [r["cve"] for r in intel_rows if r["kev"]]
+        n_live = sum(1 for r in intel_rows if r.get("source", "").startswith("live"))
+        note = (("Offline curated intel (CVSS/CWE/KEV/EPSS-style). "
+                 "Always confirm against NVD + the vendor advisory before patching.")
+                if not live else
+                (f"Merged offline curated intel with LIVE NVD 2.0 + FIRST EPSS "
+                 f"({n_live}/{len(intel_rows)} CVE(s) enriched live, disk-cached; "
+                 f"rest fell back to offline values). Always confirm the vendor "
+                 f"advisory before patching."))
         self.results['cve_intel'] = {
             "available": True, "count": len(intel_rows),
             "kev_count": len(kev), "kev": kev,
+            "live": live, "live_enriched": n_live,
             "cvss_mean": round(sum(r["cvss"] for r in intel_rows) / len(intel_rows), 1)
                          if intel_rows else 0.0,
             "cves": intel_rows, "findings": findings,
-            "note": ("Offline curated intel (CVSS/CWE/KEV/EPSS-style). "
-                     "Always confirm against NVD + the vendor advisory before patching."),
+            "note": note,
         }
+
+    # ---------------------------------------------------------- Live CVE intel (NVD + EPSS)
+    @classmethod
+    def _cve_cache_path(cls, cve_id):
+        return os.path.join(cls.CVE_CACHE_DIR, cve_id.replace('/', '_') + ".json")
+
+    @classmethod
+    def _cve_cache_read(cls, cve_id):
+        """Return cached live intel for a CVE if fresh enough, else None."""
+        try:
+            p = cls._cve_cache_path(cve_id)
+            if not os.path.isfile(p):
+                return None
+            if time.time() - os.path.getmtime(p) > cls.CVE_CACHE_TTL:
+                return None
+            with open(p, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    @classmethod
+    def _cve_cache_write(cls, cve_id, data):
+        try:
+            os.makedirs(cls.CVE_CACHE_DIR, exist_ok=True)
+            with open(cls._cve_cache_path(cve_id), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+        except Exception:
+            pass
+
+    async def _cve_live_fetch(self, cve_ids, max_new=40):
+        """Fetch live CVSS/CWE/KEV/EPSS for the given CVEs (cache-first).
+
+        Sources (no API key required):
+          * NVD 2.0 REST API  — CVSS v3.1/v3.0/v2 metrics + CWE weakness
+          * FIRST EPSS API    — exploit-prediction score (``epss``/``percentile``)
+          * CISA KEV catalog  — known-exploited flag (one download, cached)
+
+        Returns ``{cve_id: {cvss, cwe, epss, kev, exploit_available, desc, source}}``.
+        Only CVEs missing from the fresh cache cause network traffic, capped at
+        ``max_new`` per scan to stay polite to the public APIs."""
+        out, to_fetch = {}, []
+        for cid in cve_ids:
+            cached = self._cve_cache_read(cid)
+            if cached:
+                out[cid] = cached
+            else:
+                to_fetch.append(cid)
+        if not to_fetch:
+            return out
+        to_fetch = to_fetch[:max_new]
+
+        # --- CISA KEV catalog (one request, cached as a set) ---
+        kev_set = await self._kev_set()
+
+        # --- NVD 2.0 (per CVE; the API has no bulk-by-id GET) ---
+        async def _nvd(cid):
+            try:
+                async with self.sem:
+                    r = await self.client.get(
+                        "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                        params={"cveId": cid}, timeout=15.0,
+                        headers={"User-Agent": "NULLVEIL-Recon"})
+                if r.status_code != 200:
+                    return {}
+                v = (r.json().get("vulnerabilities") or [{}])[0].get("cve", {})
+                metrics = v.get("metrics", {}) or {}
+                score, vector = 0.0, ""
+                for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                    arr = metrics.get(key) or []
+                    if arr:
+                        cd = arr[0].get("cvssData", {}) or {}
+                        score = float(cd.get("baseScore") or 0.0)
+                        vector = cd.get("vectorString", "")
+                        break
+                cwe = "CWE-noinfo"
+                for w in (v.get("weaknesses") or []):
+                    for d in (w.get("description") or []):
+                        val = d.get("value", "")
+                        if val.startswith("CWE-"):
+                            cwe = val
+                            break
+                    if cwe != "CWE-noinfo":
+                        break
+                desc = ""
+                for d in (v.get("descriptions") or []):
+                    if d.get("lang") == "en":
+                        desc = re.sub(r"\s+", " ", d.get("value", "")).strip()
+                        break
+                return {"cvss": round(score, 1), "vector": vector, "cwe": cwe,
+                        "desc": desc[:400]}
+            except Exception:
+                return {}
+
+        # --- EPSS (bulk query: one request for all CVEs) ---
+        epss_map = {}
+        try:
+            async with self.sem:
+                er = await self.client.get(
+                    "https://api.first.org/data/v1/epss",
+                    params={"cve": ",".join(to_fetch)}, timeout=15.0,
+                    headers={"User-Agent": "NULLVEIL-Recon"})
+            if er.status_code == 200:
+                for item in (er.json().get("data") or []):
+                    try:
+                        epss_map[item["cve"]] = {
+                            "epss": float(item.get("epss") or 0.0),
+                            "percentile": float(item.get("percentile") or 0.0)}
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        nvd = await asyncio.gather(*[_nvd(c) for c in to_fetch])
+        for cid, nv in zip(to_fetch, nvd):
+            e = epss_map.get(cid, {})
+            row = {
+                "cvss": nv.get("cvss", 0.0),
+                "cwe": nv.get("cwe", "CWE-noinfo"),
+                "epss": e.get("epss", 0.0),
+                "epss_percentile": e.get("percentile", 0.0),
+                "kev": cid in kev_set,
+                "exploit_available": bool(cid in kev_set or e.get("epss", 0) >= 0.5),
+                "desc": nv.get("desc", ""),
+                "source": "live:nvd+epss" if (nv or e) else "unknown",
+            }
+            out[cid] = row
+            # cache only rows that actually carry data (avoid caching total misses)
+            if nv or e or row["kev"]:
+                self._cve_cache_write(cid, row)
+        return out
+
+    @classmethod
+    async def _kev_set(cls):
+        """Download + cache the CISA KEV catalog → set of CVE ids."""
+        cache = os.path.join(cls.CVE_CACHE_DIR, "_kev_catalog.json")
+        try:
+            if os.path.isfile(cache) and time.time() - os.path.getmtime(cache) < cls.CVE_CACHE_TTL:
+                with open(cache, encoding="utf-8") as fh:
+                    return set(json.load(fh))
+        except Exception:
+            pass
+        ids = set()
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as c:
+                r = await c.get(
+                    "https://www.cisa.gov/sites/default/files/feeds/"
+                    "known_exploited_vulnerabilities.json",
+                    headers={"User-Agent": "NULLVEIL-Recon"})
+            if r.status_code == 200:
+                for v in (r.json().get("vulnerabilities") or []):
+                    cid = v.get("cveID")
+                    if cid:
+                        ids.add(cid)
+                try:
+                    os.makedirs(cls.CVE_CACHE_DIR, exist_ok=True)
+                    with open(cache, "w", encoding="utf-8") as fh:
+                        json.dump(sorted(ids), fh)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return ids
 
     # ==================================================== Subdomain Takeover v3 (48)
     # Extended provider fingerprint list — (service, cname_suffixes, http_signature_regex)
@@ -9005,12 +9198,17 @@ class WebsiteRecon:
         # --- CVE Intelligence Enricher (47) ---
         ci = self.results.get('cve_intel', {})
         if isinstance(ci, dict) and ci.get('count'):
+            badge = (f"[bold green]LIVE[/] [dim]({ci.get('live_enriched', 0)}/"
+                     f"{ci.get('count', 0)} from NVD+EPSS)[/]"
+                     if ci.get('live') else "[dim]offline curated[/]")
             body = (f"  [green]✓[/] {ci.get('count', 0)} CVE(s) enriched · "
+                    f"source: {badge} · "
                     f"KEV [bold red]{ci.get('kev_count', 0)}[/] · "
                     f"mean CVSS {ci.get('cvss_mean', 0)}\n")
             for r in (ci.get('cves') or [])[:12]:
                 col = "bold red" if r.get('kev') else "red" if r.get('severity') == 'CRITICAL' else "yellow"
                 tags = " ".join(t for t in ("KEV" if r.get('kev') else "",
+                                            f"EPSS {r.get('epss'):.0%}" if r.get('epss') else "",
                                             "exploit" if r.get('exploit_available') else "") if t)
                 body += (f"  [{col}]• {r.get('cve')} (CVSS {r.get('cvss')})[/] "
                          f"{r.get('cwe')} [magenta]{tags}[/] [dim]{r.get('priority', '')}[/]\n")
@@ -9144,6 +9342,7 @@ class WebsiteRecon:
                 "cvss_mean": self.results.get('cvss', {}).get('mean_score', 0),
                 "attack_techniques": self.results.get('attack_map', {}).get('technique_count', 0),
                 "cve_intel_kev": self.results.get('cve_intel', {}).get('kev_count', 0),
+                "cve_intel_live": self.results.get('cve_intel', {}).get('live_enriched', 0),
                 "takeover_v3_risks": self.results.get('takeover_v3', {}).get('risk_count', 0),
                 "watch_changes": self.results.get('watch', {}).get('added_total', 0),
             },
@@ -10380,10 +10579,10 @@ function render(d){
        <span class="mut" style="font-size:12px"> · ${e(t.tactic||'')} × ${e(String(t.count||0))}</span></div>`).join('')}</div>`:''}
 
   ${(d.cve_intel&&d.cve_intel.count)?`<h3>CVE intelligence (${d.cve_intel.count})</h3><div class="panel">
-     <div class="mut" style="font-size:12px;margin-bottom:8px">KEV ${e(String(d.cve_intel.kev_count||0))} · mean CVSS ${e(String(d.cve_intel.cvss_mean||0))} · ${e(d.cve_intel.note||'')}</div>${
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${d.cve_intel.live?`<span class="chip INFO" style="background:#16a34a">LIVE NVD+EPSS</span> ${e(String(d.cve_intel.live_enriched||0))}/${e(String(d.cve_intel.count||0))} enriched · `:'<span class="chip INFO">offline curated</span> · '}KEV ${e(String(d.cve_intel.kev_count||0))} · mean CVSS ${e(String(d.cve_intel.cvss_mean||0))} · ${e(d.cve_intel.note||'')}</div>${
      (d.cve_intel.cves||[]).slice(0,30).map(c=>`<div style="margin-bottom:5px">
        <span class="chip ${c.kev?'CRITICAL':e((c.severity||'INFO').toUpperCase())}">${c.kev?'KEV':e((c.severity||'INFO').toUpperCase())}</span>
-       <b style="margin-left:8px">${e(c.cve||'')}</b> <span class="mut">CVSS ${e(String(c.cvss||''))} · ${e(c.cwe||'')}</span>
+       <b style="margin-left:8px">${e(c.cve||'')}</b> <span class="mut">CVSS ${e(String(c.cvss||''))} · ${e(c.cwe||'')}${c.epss?(' · EPSS '+e(String(Math.round((c.epss||0)*100))+'%')):''} · ${e(c.source||'')}</span>
        ${c.exploit_available?'<span class="mut" style="color:#f97316"> · exploitable</span>':''}
        <div class="mut" style="font-size:11px">${e(c.desc||'')} · ${e(c.priority||'')}</div></div>`).join('')}</div>`:''}
 
@@ -10768,8 +10967,24 @@ def main():
                         help="Seconds between --watch runs (default: 300)")
     parser.add_argument("--attack-layer", metavar="FILE", default=None,
                         help="Write a MITRE ATT&CK Navigator layer JSON to FILE (module 46)")
+    parser.add_argument("--cve-live", action="store_true",
+                        help="Enrich CVEs with LIVE NVD 2.0 + FIRST EPSS + CISA KEV data "
+                             "(disk-cached, module 47). Without this, curated offline intel is used")
+    parser.add_argument("--cve-cache-clear", action="store_true",
+                        help="Delete the local live-CVE cache (~/.nullveil/cve_cache/) and exit")
     parser.add_argument("-V", "--version", action="version", version=f"NULLVEIL Recon v{__version__} | Owner: NULLVEIL | Engine: DeepHat")
     args = parser.parse_args()
+
+    if args.cve_cache_clear:
+        import shutil as _sh
+        d = WebsiteRecon.CVE_CACHE_DIR
+        if os.path.isdir(d):
+            n = len([f for f in os.listdir(d) if f.endswith(".json")])
+            _sh.rmtree(d, ignore_errors=True)
+            console.print(f"[bold green]Live-CVE cache cleared:[/] {n} file(s) removed from {d}")
+        else:
+            console.print(f"[yellow]No live-CVE cache found at {d}[/]")
+        return
 
     if args.history:
         entries = WebsiteRecon._history_list()
@@ -10911,6 +11126,9 @@ def main():
     recon.attack_layer_path = args.attack_layer or ""
     if args.attack_layer:
         recon.attack_set = sorted(set(recon.attack_set) | {46})
+    recon.cve_live = bool(args.cve_live)
+    if args.cve_live:
+        recon.attack_set = sorted(set(recon.attack_set) | {47})
     if args.watch is not None:
         recon.attack_set = sorted(set(recon.attack_set) | {49})
     recon.watch_runs = args.watch

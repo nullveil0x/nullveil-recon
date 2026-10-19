@@ -96,7 +96,7 @@ By using NULLVEIL Recon you agree to these terms.
 | 44 | **Cloud Storage Enumeration** | **`cloud`: derives bucket names from the target and probes AWS S3 / Azure Blob / GCP Storage with HEAD/GET only — flags public listings and (carefully) suspected world-writable buckets. No uploads, no writes** |
 | 45 | **CVSS 4.0 / CWE Risk Scoring** | **`cvss`: re-scores every finding with a documented CVSS 4.0 macro-vector + legacy CVSS 3.1 base score and a CWE weakness ID — produces an industry-standard, prioritised risk register and flags severity re-banding** |
 | 46 | **MITRE ATT&CK Mapping** | **`attack`: maps every finding to MITRE ATT&CK Enterprise tactics/techniques and exports an importable **ATT&CK Navigator layer** (`--attack-layer FILE`) — SOC / blue-team coverage view; no techniques are executed** |
-| 47 | **CVE Intelligence Enricher** | **`cveintel`: offline enrichment for each fingerprinted CVE — CVSS base score, CWE, EPSS-style likelihood, CISA KEV membership and exploit-availability flags, ranked into P1–P4 patch priorities. No CVE API calls** |
+| 47 | **CVE Intelligence Enricher** | **`cveintel`: enriches each fingerprinted CVE. Curated **offline intel** by default (CVSS, CWE, EPSS-style, CISA KEV, exploit-availability → P1–P4 patch priority); add `--cve-live` to merge **LIVE NVD 2.0 + FIRST EPSS + CISA KEV** data (disk-cached, no API key, graceful offline fallback)** |
 | 48 | **Subdomain Takeover v3** | **`takeover`: dedicated takeover engine with 70+ provider fingerprints (S3/CloudFront/Heroku/GitHub Pages/Netlify/Vercel/Azure/Fastly/Firebase…) — resolves full CNAME chains and matches unclaimed-resource HTTP signatures. Read-only: nothing is registered or claimed** |
 | 49 | **Continuous Change Monitor** | **`watch`: baseline snapshot + drift alerting for repeat scans (`--watch [N] --interval SEC`) — reports new/removed assets and a risk delta/verdict (REGRESSION/IMPROVEMENT/STABLE); also usable as a CI drift gate** |
 
@@ -166,7 +166,7 @@ playwright install chromium
 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
 
-**v3.7.0 feature dependencies:** **none** — both tiers are pure-Python over the existing `httpx` dependency. The five Tier-1 discovery modules (JS secret miner, historical URL miner, hidden parameter miner, GraphQL audit, cloud storage enumeration) and the five Tier-2 intelligence modules (CVSS/CWE scoring, MITRE ATT&CK mapping, CVE intel enricher, subdomain takeover v3, change monitor) need no extra packages, AI keys or remote APIs. They degrade gracefully when external indexes (Wayback/CommonCrawl/OTX) or cloud endpoints are unreachable.
+**v3.7.0 feature dependencies:** **none** — both tiers are pure-Python over the existing `httpx` dependency. The five Tier-1 discovery modules (JS secret miner, historical URL miner, hidden parameter miner, GraphQL audit, cloud storage enumeration) and the five Tier-2 intelligence modules (CVSS/CWE scoring, MITRE ATT&CK mapping, CVE intel enricher, subdomain takeover v3, change monitor) need no extra packages, AI keys or remote APIs. **Live CVE enrichment** (`--cve-live`, module 47) uses public NVD 2.0 + FIRST EPSS + CISA KEV endpoints (no API key required), is **disk-cached** (`~/.nullveil/cve_cache/`, weekly TTL) and **gracefully falls back** to curated offline intel if the network is unreachable. All network touchpoints degrade gracefully when endpoints are unavailable.
 
 **v3.6.0 feature dependencies (all optional — modules degrade gracefully):**
 
@@ -307,6 +307,8 @@ python3 nullveil_recon.py example.com --no-dedupe
 
 # v3.7.0: risk-standardisation + blue-team intelligence + continuous monitoring
 python3 nullveil_recon.py example.com -a cvss,attack,cveintel,takeover,watch
+python3 nullveil_recon.py example.com -a cveintel --cve-live          # live NVD + EPSS + CISA KEV
+python3 nullveil_recon.py example.com --cve-cache-clear              # reset the live-CVE cache
 python3 nullveil_recon.py example.com -a all --attack-layer layer.json   # ATT&CK Navigator layer
 python3 nullveil_recon.py example.com --watch            # loop until Ctrl+C, alert on drift
 python3 nullveil_recon.py example.com --watch 24 --interval 3600         # hourly, 24 runs (CI gate)
@@ -500,7 +502,7 @@ python3 nullveil_recon.py example.com -o report.json
   "cloud_storage": { "candidates_tested": 19, "buckets": [...], "count": 1, "findings": [...] },
   "cvss": { "count": 123, "mean_score": 7.23, "distribution": { "CRITICAL": 41, "HIGH": 33, "MEDIUM": 49, "LOW": 0 }, "top": [ { "score": 9.3, "severity": "CRITICAL", "cwe": "CWE-798", "cvss4_vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:N", "rebanded": "HIGH→CRITICAL" } ], "findings": [...] },
   "mitre_attack": { "technique_count": 9, "tactic_count": 6, "techniques": [ { "id": "T1552.001", "tactic": "Credential Access", "max_severity": "HIGH", "count": 5 } ], "layer": { "techniques": [...] }, "findings": [...] },
-  "cve_intel": { "count": 1, "kev_count": 1, "kev": ["CVE-2021-41773"], "cvss_mean": 9.8, "cves": [ { "cve": "CVE-2021-41773", "cvss": 9.8, "cwe": "CWE-22", "kev": true, "exploit_available": true, "priority": "P1 — patch now" } ], "findings": [...] },
+  "cve_intel": { "count": 1, "kev_count": 1, "kev": ["CVE-2021-41773"], "cvss_mean": 9.8, "live": true, "live_enriched": 1, "cves": [ { "cve": "CVE-2021-41773", "cvss": 9.8, "cwe": "CWE-22", "kev": true, "epss": 0.99992, "exploit_available": true, "source": "live:nvd+epss", "priority": "P1 — patch now" } ], "findings": [...] },
   "takeover_v3": { "hosts_checked": 12, "risk_count": 1, "providers": 73, "risks": [ { "host": "blog.example.com", "service": "GitHub Pages", "status": "LIKELY TAKEOVER", "cname_chain": [...] } ], "findings": [...] },
   "watch": { "baseline": true, "added_total": 3, "removed_total": 0, "risk_delta": 9, "verdict": "REGRESSION", "baseline_when": "2026-10-19T01:10:21", "findings": [...] },
   "dedupe": { "before": 84, "after": 71, "removed": 13 }
@@ -540,7 +542,7 @@ Tier 2 turns raw findings into **standardised, prioritised, blue-team-ready inte
 
 - **CVSS 4.0 / CWE Risk Scoring** (`cvss`, module 45) re-scores **every** finding with a documented **CVSS 4.0 macro-vector**, a legacy **CVSS 3.1 base score** and a **CWE** weakness ID. The combined score drives a prioritised risk register (mean score, severity distribution, top 25), and findings whose score bands differ from the original severity are flagged as **re-banded** (e.g. `HIGH→CRITICAL`). The vector and method are printed/exported so scores are auditable — it is a *reviewed heuristic*, not an authoritative NVD assessment.
 - **MITRE ATT&CK Mapping** (`attack`, module 46) maps each finding category to **ATT&CK Enterprise** tactics and techniques (T1190, T1552.001, T1530, T1078, T1499…) and emits a tactic coverage view plus an importable **ATT&CK Navigator layer** JSON (`--attack-layer FILE`). Pure defensive mapping — no technique is ever executed.
-- **CVE Intelligence Enricher** (`cveintel`, module 47) enriches every CVE surfaced by module 15 with **offline curated intel**: CVSS base score, CWE, **EPSS-style likelihood**, **CISA KEV** membership and exploit-availability, ranked into **P1–P4** patch priorities (KEV › high-EPSS › CVSS). No CVE API calls, no active checks.
+- **CVE Intelligence Enricher** (`cveintel`, module 47) enriches every CVE surfaced by module 15 with **CVSS base score, CWE, EPSS likelihood, CISA KEV** membership and exploit-availability, ranked into **P1–P4** patch priorities (KEV › high-EPSS › CVSS). By default it uses **curated offline intel** (no network); pass **`--cve-live`** to merge **LIVE NVD 2.0 + FIRST EPSS + the CISA KEV catalog** (all public, **no API key**). Live results are **disk-cached** at `~/.nullveil/cve_cache/` with a weekly TTL (only cache-misses hit the network, capped per scan to stay polite), so repeat scans are instant and offline. If the network is unreachable the module **silently falls back** to the offline values and records the error. Clear the cache with `--cve-cache-clear`. No active checks against the target.
 - **Subdomain Takeover v3** (`takeover`, module 48) is a dedicated takeover engine with **70+ provider fingerprints** (AWS S3/CloudFront/Elastic Beanstalk, Heroku, GitHub/GitLab Pages, Netlify, Vercel, Azure App Service/Blob/Front Door, Shopify, Fastly, Firebase, Fly/Render/Railway, Zendesk, Statuspage and many more). It resolves the **full CNAME chain** and matches unclaimed-resource HTTP signatures, reporting LIKELY TAKEOVER (HIGH) and dangling-but-unreachable (MEDIUM) candidates. **Read-only** — nothing is registered, claimed or modified.
 - **Continuous Change Monitor** (`watch`, module 49) snapshots the target's asset sets and compares each run against the newest prior baseline, reporting **new/removed assets** and a **risk delta + verdict** (`REGRESSION` / `IMPROVEMENT` / `CHANGED` / `STABLE`). Drive it with `--watch [N] --interval SEC` (N=0 loops until `Ctrl+C`) or use it as a **CI drift gate**.
 
@@ -645,7 +647,7 @@ All five export to JSON, render as CLI panels and dashboard sections, and feed `
 - [x] **Cloud Storage Enumeration** (`-a cloud`) — S3 / Azure / GCP public-listing checks (HEAD/GET only)
 - [x] **CVSS 4.0 / CWE Risk Scoring** (`-a cvss`) — industry-standard vectors + CWE + severity re-banding
 - [x] **MITRE ATT&CK Mapping** (`-a attack`, `--attack-layer`) — enterprise technique coverage + Navigator layer export
-- [x] **CVE Intelligence Enricher** (`-a cveintel`) — offline CVSS/CWE/EPSS/KEV/exploit prioritisation (P1–P4)
+- [x] **CVE Intelligence Enricher** (`-a cveintel`) — offline CVSS/CWE/EPSS/KEV/exploit prioritisation (P1–P4), plus **live NVD 2.0 + FIRST EPSS + CISA KEV** (`--cve-live`, disk-cached)
 - [x] **Subdomain Takeover v3** (`-a takeover`) — 70+ provider fingerprints + full CNAME-chain proof
 - [x] **Continuous Change Monitor** (`-a watch`, `--watch`, `--interval`) — baseline drift alerting & CI gate
 
