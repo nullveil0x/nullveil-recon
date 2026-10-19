@@ -1,8 +1,8 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 2.0.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.0.0 · **License:** MIT
 
-A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 17 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
+A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 25 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 2.0.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.0.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -33,7 +33,7 @@ By using NULLVEIL Recon you agree to these terms.
 
 ---
 
-## ✨ Features — 17 Attack Modules
+## ✨ Features — 25 Attack Modules
 
 | # | Module | What it does |
 |---|--------|--------------|
@@ -54,6 +54,14 @@ By using NULLVEIL Recon you agree to these terms.
 | 15 | **CVE & Misconfig Scan** | **Version fingerprint (headers / meta / JS) → CVE correlation, exposed `.git` / `.env` / actuator / heapdump / phpinfo / server-status probes** |
 | 16 | **Deep Crawler & Params** | **Multi-page BFS crawl, query + form parameter inventory, JS endpoint discovery, reflection detection (report-only)** |
 | 17 | **TLS Deep Analysis** | **TLS 1.0–1.3 + cipher matrix, weak/legacy cipher flags, RSA/EC key size, OCSP stapling, HSTS audit** |
+| 18 | **Supply Chain / Third-Party Risk** | **External scripts/styles/iframes/vendor mapping (70+ vendors: CDN, analytics, ads, SRI audit), third-party form actions, NS/MX provider identification, CSP gap check** |
+| 19 | **Asset Criticality Classification** | **Rule-based 0–100 scoring → CRITICAL / HIGH / MEDIUM / LOW tiers for subdomains, ports, paths (keyword + finding signals)** |
+| 20 | **Anomaly Detection (ML)** | **Unsupervised: soft-404 content-hash clustering, latency z-score, response-size IQR outliers, k-means (k=2) outlier cluster** |
+| 21 | **Threat Intel Feeds** | **AlienVault OTX pulses, OpenPhish active phishing feed, SSLBL botnet-C2 blacklist, Spamhaus Zen DNSBL (keyless DoH), optional AbuseIPDB** |
+| 22 | **Breach Monitoring** | **HaveIBeenPwned breach enumeration + harvested-email exposure check (free HIBP_API_KEY), phishing cross-check** |
+| 23 | **Compliance Mapping** | **PCI-DSS v4.0 + ISO 27001:2022 Annex A + SOC 2 TSC — 31 controls mapped to scan evidence (PASS/FAIL/PARTIAL) with disclaimer** |
+| 24 | **Attack Path Graph** | **Asset/finding graph, BFS attack-path search (entry → crown jewels), exploit-chain hypotheses, DOT export — report-only narratives** |
+| 25 | **Target Correlation** | **Cross-org/multi-tenant correlation: shared NS / MX / IP / CDN across your domains, auto-derived from cert SANs or `--correlate`** |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
@@ -110,7 +118,7 @@ python3 nullveil_recon.py TARGET [options]
 ### Examples
 
 ```bash
-# Full scan (all 17 modules)
+# Full scan (all 25 modules)
 python3 nullveil_recon.py example.com
 
 # Interactive attack menu — pick modules by number
@@ -143,6 +151,24 @@ python3 nullveil_recon.py example.com -a api,audit
 # Advanced: CT logs + CVE scan + crawler + TLS audit
 python3 nullveil_recon.py example.com -a ext,cve,crawl,tls
 
+# v3.0.0: supply chain + attack graph + compliance mapping
+python3 nullveil_recon.py example.com -a supply,graph,comp
+
+# v3.0.0: full advanced pipeline (intel + breach + anomaly + graph)
+python3 nullveil_recon.py example.com -a intel,breach,anom,graph
+
+# Evidence / repro pack (benign curl/dig commands — no exploit payloads)
+python3 nullveil_recon.py example.com -R repro.md
+
+# Export attack path graph as DOT (render with Graphviz: dot -Tpng graph.dot -o g.png)
+python3 nullveil_recon.py example.com --dot graph.dot
+
+# Cross-org correlation (your own domains)
+python3 nullveil_recon.py example.com --correlate brand2.com,brand3.com
+
+# Breach monitoring (free key: haveibeenpwned.com/APIKey)
+HIBP_API_KEY=yourkey python3 nullveil_recon.py example.com -a breach
+
 # Custom ports + timeout
 python3 nullveil_recon.py http://192.168.1.10:8080 -p 80,443,8080 -t 15
 
@@ -164,6 +190,10 @@ python3 nullveil_recon.py -l
 | `-o`, `--output FILE` | Save JSON report to file |
 | `-H`, `--html FILE` | Save standalone HTML report (open in browser) |
 | `-w`, `--wordlist FILE` | Custom subdomain wordlist (one per line) |
+| `-R`, `--repro FILE` | Export evidence/reproduction pack (markdown, benign — no payloads) |
+| `--dot FILE` | Export Attack Path Graph as Graphviz DOT file |
+| `--correlate LIST` | Extra domains for cross-org correlation, e.g. `a.com,b.com` |
+| `--hibp-key KEY` | HaveIBeenPwned API key (or set `HIBP_API_KEY` env) |
 | `-q`, `--quiet` | Suppress console output |
 | `-V`, `--version` | Show version |
 
@@ -173,7 +203,7 @@ python3 nullveil_recon.py -l
 
 ```
       Target: example.com   Mode: NORMAL   Started: 2026-10-19 01:10:21
-      Attacks: dns, sub  (2/17 modules)
+      Attacks: dns, sub  (2/25 modules)
 
 ╔══════════════════════════════ ◈ RECON REPORT ◈ ══════════════════════════════╗
 ║                                 example.com                                  ║
@@ -210,7 +240,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -228,9 +258,32 @@ python3 nullveil_recon.py example.com -o report.json
   "external_intel": { "ct_subdomains": [...], "wayback": {...}, "takeover_risks": [...] },
   "cve": { "versions": [...], "findings": [...] },
   "crawler": { "pages": [...], "parameters": [...], "forms": [...] },
-  "tls": { "matrix": [...], "certificate": {...}, "findings": [...] }
+  "tls": { "matrix": [...], "certificate": {...}, "findings": [...] },
+  "supply_chain": { "vendors": [...], "findings": [...], "providers": {...} },
+  "criticality": { "tiers": {...}, "assets": [...] },
+  "anomaly": { "samples": [...], "findings": [...], "soft404": true },
+  "threat_intel": { "ips": [...], "sources": [...], "findings": [...] },
+  "breach": { "breaches": [...], "checks": [...], "findings": [...] },
+  "compliance": { "frameworks": {...}, "coverage_pct": 52, "total_controls": 31 },
+  "attack_graph": { "nodes": [...], "edges": [...], "attack_paths": [...], "chains": [...] },
+  "correlation": { "targets": [...], "links": [...], "findings": [...] }
 }
 ```
+
+---
+
+## 🧭 v3.0.0 Design Notes (safe-by-design choices)
+
+A few v3 features are **deliberately shaped** so the tool stays defensive & report-only:
+
+| Requested | How NULLVEIL delivers it |
+|-----------|--------------------------|
+| Exploit chain simulator | **Chain *hypothesis* narratives** built from confirmed facts (graph module) — no exploit payloads, no execution |
+| Dark-web / leaked-credential monitoring | **Breach-intel APIs** (HaveIBeenPwned + phishing feeds) — the same approach commercial monitoring products use; no Tor/marketplace scraping |
+| Automated PoC generation | **Evidence / repro pack** (`-R`): benign `curl`/`dig` commands that reproduce each finding so developers can verify & re-test fixes |
+| Multi-tenant correlation | Correlates **domains you provide/own** (`--correlate`) or auto-derived from your cert SANs |
+
+Compliance output is **evidence-based partial mapping**, never a certification claim.
 
 ---
 
@@ -245,6 +298,15 @@ python3 nullveil_recon.py example.com -o report.json
 - [x] CVE correlation + misconfig scan (`-a cve`)
 - [x] Deep crawler + parameter inventory (`-a crawl`)
 - [x] TLS version / cipher deep analysis (`-a tls`)
+- [x] Supply chain / third-party risk mapping (`-a supply`)
+- [x] Asset criticality classification (`-a crit`)
+- [x] ML anomaly detection — soft-404, z-score, k-means (`-a anom`)
+- [x] Threat intel feeds — OTX, OpenPhish, SSLBL, Spamhaus (`-a intel`)
+- [x] Breach monitoring — HIBP integration (`-a breach`)
+- [x] Compliance mapping — PCI-DSS / ISO 27001 / SOC 2 (`-a comp`)
+- [x] Attack path graph + chain hypotheses + DOT export (`-a graph`)
+- [x] Multi-target / cross-org correlation (`--correlate`)
+- [x] Evidence / repro pack export (`-R`)
 - [ ] Resume / scan history
 - [ ] Nuclei template integration
 - [ ] Screenshot capture

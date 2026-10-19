@@ -34,6 +34,11 @@ from datetime import datetime
 from urllib.parse import urlparse, urljoin, parse_qs, unquote
 from collections import defaultdict, deque
 import ipaddress
+import os
+import time
+import math
+import hashlib
+import statistics
 
 # --- Friendly error if dependencies are missing ---
 try:
@@ -58,7 +63,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -261,6 +266,14 @@ ATTACK_MODULES = [
     ("cve", 15, "CVE & Misconfig Scan", "Version fingerprint -> CVE match, exposed .git/.env/actuator/phpinfo"),
     ("crawl", 16, "Deep Crawler & Params", "Multi-page BFS crawl, parameter inventory, reflection detection"),
     ("tls", 17, "TLS Deep Analysis", "TLS version/cipher matrix, weak crypto, key size, OCSP, HSTS"),
+    ("supply", 18, "Supply Chain / Third-Party Risk", "External scripts, SRI audit, vendor mapping (CDN/analytics/ads/SSO)"),
+    ("crit", 19, "Asset Criticality", "Auto-score subdomains/ports/paths into CRITICAL/HIGH/MEDIUM/LOW tiers"),
+    ("anom", 20, "Anomaly Detection (ML)", "Unsupervised: soft-404 clustering, latency/size z-score, k-means outliers"),
+    ("intel", 21, "Threat Intel Feeds", "AlienVault OTX, OpenPhish, SSLBL, Spamhaus Zen DNSBL (+ optional AbuseIPDB key)"),
+    ("breach", 22, "Breach Monitoring", "HaveIBeenPwned breach enumeration (HIBP_API_KEY), domain exposure, phishing check"),
+    ("comp", 23, "Compliance Mapping", "PCI-DSS 4.0, ISO 27001:2022 Annex A, SOC 2 TSC — evidence-based mapping"),
+    ("graph", 24, "Attack Path Graph", "Asset graph, attack-path search, exploit-chain hypotheses (report-only)"),
+    ("correlate", 25, "Target Correlation", "Multi-target/tenant correlation: shared NS/MX/IP/CDN, --correlate list"),
 ]
 
 MAX_MODULE = len(ATTACK_MODULES)
@@ -449,12 +462,24 @@ class WebsiteRecon:
             (":warning: CVE & Misconfig Scan", self.cve_scan, 15),
             (":spider: Deep Crawler & Params", self.deep_crawler, 16),
             (":lock: TLS Deep Analysis", self.tls_audit, 17),
+            (":package: Supply Chain Risk", self.supply_chain, 18),
+            (":dart: Asset Criticality", self.criticality_classify, 19),
+            (":chart_with_downwards_trend: Anomaly Detection (ML)", self.anomaly_detection, 20),
+            (":safety_vest: Threat Intel Feeds", self.threat_intel, 21),
+            (":card_index_dividers: Breach Monitoring", self.breach_monitor, 22),
+            (":clipboard: Compliance Mapping", self.compliance_map, 23),
+            (":spider_web: Attack Path Graph", self.attack_graph, 24),
+            (":arrows_counterclockwise: Target Correlation", self.correlate_targets, 25),
         ]
         # Filter by attack set and create coroutines only for selected
+        # Modules that READ other modules' results must run sequentially AFTER the
+        # concurrent scan finishes (indices: 19 crit, 23 comp, 24 graph, 25 correlate).
+        DEFERRED = {19, 23, 24, 25}
         modules = []
+        deferred = []
         for name, fn, idx in all_modules:
             if idx in self.attack_set:
-                modules.append((name, fn(), idx))
+                (deferred if idx in DEFERRED else modules).append((name, fn(), idx))
 
         scan_start = datetime.now()
         progress = Progress(
@@ -485,6 +510,22 @@ class WebsiteRecon:
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 self.results['errors'].append(f"{modules[i][0]} crashed: {r!r}")
+
+        # Sequential second pass: analysis modules that depend on scan results
+        if deferred:
+            with Progress(
+                TextColumn("{task.description}"), BarColumn(bar_width=28),
+                TextColumn("{task.fields[status]}"), TimeElapsedColumn(),
+                console=console, transient=True,
+            ) as prog2:
+                for name, coro, idx in deferred:
+                    tid = prog2.add_task(name, total=1, status="[dim]analyzing…[/]")
+                    try:
+                        await coro
+                        prog2.update(tid, completed=1, status="[bold green]✓ done[/]")
+                    except Exception as e:
+                        prog2.update(tid, completed=1, status="[bold red]✗ fail[/]")
+                        self.results['errors'].append(f"{name} crashed: {e!r}")
 
         self.scan_duration = (datetime.now() - scan_start).total_seconds()
 
@@ -2349,6 +2390,1448 @@ class WebsiteRecon:
         self.results['tls_cert'] = cert_info
         self.results['tls_findings'] = sorted(findings, key=lambda x: sev_rank.get(x[0], 5))
 
+    # ---------------------------------------------------------- Supply Chain / Third-Party Risk
+    # (url substring, vendor, category, note)
+    VENDORS = [
+        ("google-analytics.com", "Google Analytics", "Analytics", "page data flows to Google"),
+        ("googletagmanager.com", "Google Tag Manager", "Tag Manager", "executes arbitrary tags — high impact if account is compromised"),
+        ("doubleclick.net", "Google Ads (DoubleClick)", "Advertising", "cross-site ad tracking"),
+        ("googlesyndication.com", "Google AdSense", "Advertising", "third-party ad frames"),
+        ("googleapis.com", "Google APIs", "API/CDN", "fonts/maps/api loads from Google"),
+        ("gstatic.com", "Google Static", "CDN", "static assets from Google"),
+        ("fonts.googleapis.com", "Google Fonts", "Font", "font CSS from Google"),
+        ("facebook.net", "Meta/Facebook", "Advertising", "social pixel — tracking"),
+        ("fbcdn.net", "Meta CDN", "CDN", "Meta-hosted assets"),
+        ("connect.facebook.net", "Meta Pixel", "Advertising", "visitor tracking pixel"),
+        ("hotjar.com", "Hotjar", "Analytics/Replay", "session replay — records user interaction"),
+        ("segment.com", "Segment", "CDN/CDP", "customer data pipeline"),
+        ("segment.io", "Segment", "CDP", "customer data pipeline"),
+        ("mixpanel.com", "Mixpanel", "Analytics", "product analytics"),
+        ("amplitude.com", "Amplitude", "Analytics", "product analytics"),
+        ("clarity.ms", "Microsoft Clarity", "Analytics/Replay", "session replay by Microsoft"),
+        ("newrelic.com", "New Relic", "APM", "JS monitoring"),
+        ("nr-data.net", "New Relic", "APM", "JS monitoring"),
+        ("sentry.io", "Sentry", "Error Tracking", "JS error reporting — may send request data"),
+        ("datadoghq.com", "Datadog", "APM", "RUM monitoring"),
+        ("optimize.google.com", "Google Optimize", "AB Testing", "page variant injection"),
+        ("optimizely.com", "Optimizely", "AB Testing", "page variant injection"),
+        ("unpkg.com", "unpkg", "JS CDN", "npm package CDN — packages change over time"),
+        ("cdn.jsdelivr.net", "jsDelivr", "JS CDN", "npm package CDN"),
+        ("cdnjs.cloudflare.com", "cdnjs", "JS CDN", "public library CDN"),
+        ("ajax.googleapis.com", "Google Hosted Libraries", "JS CDN", "public library CDN"),
+        ("bootstrapcdn.com", "BootstrapCDN", "JS CDN", "public library CDN"),
+        ("code.jquery.com", "jQuery CDN", "JS CDN", "jQuery from jQuery project"),
+        ("stripe.com", "Stripe", "Payments", "payment processing — PCI scope"),
+        ("js.stripe.com", "Stripe", "Payments", "payment processing — PCI scope"),
+        ("paypal.com", "PayPal", "Payments", "payment processing"),
+        ("paypalobjects.com", "PayPal", "Payments", "payment processing"),
+        ("braintreegateway.com", "Braintree", "Payments", "payment processing"),
+        ("recaptcha.net", "reCAPTCHA", "Bot Protection", "Google captcha"),
+        ("google.com/recaptcha", "reCAPTCHA", "Bot Protection", "Google captcha"),
+        ("hcaptcha.com", "hCaptcha", "Bot Protection", "captcha service"),
+        ("cloudflare.com", "Cloudflare", "CDN/Security", "CDN/WAF/DDoS provider"),
+        ("cloudflareinsights.com", "Cloudflare Insights", "Analytics", "RUM beacon"),
+        ("akamai", "Akamai", "CDN", "CDN/edge provider"),
+        ("fastly.net", "Fastly", "CDN", "CDN/edge provider"),
+        ("cloudfront.net", "CloudFront", "CDN", "AWS CDN"),
+        ("intercom.io", "Intercom", "Support Chat", "chat widget — third-party iframe/JS"),
+        ("intercomcdn.com", "Intercom", "Support Chat", "chat widget assets"),
+        ("zendesk.com", "Zendesk", "Support Chat", "support widget"),
+        ("zdassets.com", "Zendesk", "Support Chat", "support widget assets"),
+        ("drift.com", "Drift", "Support Chat", "conversational marketing widget"),
+        ("hubspot.com", "HubSpot", "Marketing", "marketing/forms/tracking"),
+        ("hs-scripts.com", "HubSpot", "Marketing", "marketing tracking"),
+        ("mailchimp.com", "Mailchimp", "Email Marketing", "signup/list forms"),
+        ("mcfeely" , "Mailchimp", "Email Marketing", "signup/list forms"),
+        ("doubleverify", "DoubleVerify", "Ad Verification", "ad verification frames"),
+        ("typekit.net", "Adobe Typekit", "Font", "web fonts from Adobe"),
+        ("js.netmng" , "NetMng", "Advertising", "ad tech"),
+        ("youtube.com", "YouTube", "Embed", "embedded video"),
+        ("ytimg.com", "YouTube", "Embed", "embedded video assets"),
+        ("vimeo.com", "Vimeo", "Embed", "embedded video"),
+        ("twitter.com", "Twitter/X", "Social Embed", "embedded social content"),
+        ("platform.twitter.com", "Twitter/X", "Social Embed", "embedded social content"),
+        ("licdn.com", "LinkedIn", "Social Embed", "insight tag / embeds"),
+        ("snap.licdn.com", "LinkedIn", "Social Embed", "ad insight tag"),
+        ("tiktok.com", "TikTok", "Social Embed", "embed/tracking"),
+        ("criteo.com", "Criteo", "Advertising", "retargeting ads"),
+        ("taboola.com", "Taboola", "Advertising", "content recommendation ads"),
+        ("outbrain.com", "Outbrain", "Advertising", "content recommendation ads"),
+        ("auth0.com", "Auth0", "SSO/Auth", "external identity provider"),
+        ("okta.com", "Okta", "SSO/Auth", "external identity provider"),
+        ("onelogin.com", "OneLogin", "SSO/Auth", "external identity provider"),
+        ("salesforce.com", "Salesforce", "CRM", "CRM embeds/forms"),
+        ("force.com", "Salesforce", "CRM", "CRM-hosted endpoints"),
+        ("zoominfo", "ZoomInfo", "Data/Tracking", "B2B data enrichment"),
+        ("wistia.com", "Wistia", "Embed", "hosted video player"),
+    ]
+
+    async def supply_chain(self):
+        """Map third-party resources (scripts/styles/iframes/forms/DNS) and audit SRI/vendor risk."""
+        findings = []
+        html = ""
+        page_url = str(self.scalar_results.get('final_url', self.base_url + "/"))
+        try:
+            async with self.sem:
+                r = await self.client.get(page_url)
+            html = r.text[:600_000]
+            page_url = str(r.url)
+        except Exception as e:
+            self.results['errors'].append(f"supply: homepage fetch failed: {type(e).__name__}")
+
+        def vendors_in(url):
+            u = url.lower()
+            return [v for v in self.VENDORS if v[0].lower() in u]
+
+        # ---------- scan HTML resources ----------
+        resources = []      # {kind, url, sri, vendor, vendor_known}
+        ext_form_actions = []
+        for kind, pat in (
+            ("script", r'<script[^>]+src=["\']([^"\']+)["\']'),
+            ("stylesheet", r'<link[^>]+rel=["\']stylesheet["\'][^>]+href=["\']([^"\']+)["\']'),
+            ("iframe", r'<iframe[^>]+src=["\']([^"\']+)["\']'),
+        ):
+            for m in re.finditer(pat, html, re.I):
+                raw = m.group(1).strip()
+                full = urljoin(page_url, raw)
+                p = urlparse(full)
+                if p.scheme not in ('http', 'https'):
+                    continue
+                same = p.netloc.lower().split('@')[-1] == self.netloc.lower()
+                if not same:
+                    vs = vendors_in(full)
+                    resources.append({"kind": kind, "url": full, "raw": raw, "same_origin": False,
+                                      "sri": None,
+                                      "vendor": vs[0][1] if vs else None,
+                                      "vendor_known": bool(vs)})
+        # SRI presence needs tag context — re-scan with tag bodies
+        sri_map = {}
+        for m in re.finditer(r'<(script|link)\b[^>]*>', html, re.I):
+            tag = m.group(0)
+            src_m = re.search(r'(?:src|href)=["\']([^"\']+)["\']', tag)
+            if src_m and 'integrity=' in tag.lower():
+                sri_map[src_m.group(1)] = True
+        for rec in resources:
+            raw = rec.get("raw", "")
+            rec["sri"] = bool(sri_map.get(raw) or sri_map.get(raw.split('?')[0]) or
+                              sri_map.get(rec["url"].split('?')[0]))
+            if rec["kind"] == "iframe":
+                rec["sri"] = True    # SRI not applicable to iframes
+        # third-party form actions
+        for m in re.finditer(r'<form[^>]+action=["\']([^"\']+)["\']', html, re.I):
+            action = m.group(1).strip()
+            if not action:
+                continue
+            full = urljoin(page_url, action)
+            p = urlparse(full)
+            if p.scheme in ('http', 'https') and p.netloc and \
+                    p.netloc.lower().split('@')[-1] != self.netloc.lower():
+                ext_form_actions.append((p.scheme, full))
+        # dns-prefetch / preconnect hosts
+        preconnect = sorted(set(re.findall(r'rel=["\'](?:preconnect|dns-prefetch)["\'][^>]*href=["\'](?:https?:)?//([^"\']+)', html, re.I)))
+
+        # ---------- DNS-level providers ----------
+        providers = {"ns": [], "mx": [], "spf_includes": []}
+        try:
+            resolver = dns.asyncresolver.Resolver()
+            resolver.lifetime = self.timeout
+            try:
+                ans = await resolver.resolve(self.domain, 'NS')
+                providers["ns"] = sorted({str(x.target).rstrip('.').lower() for x in ans})
+            except Exception:
+                pass
+            try:
+                ans = await resolver.resolve(self.domain, 'MX')
+                providers["mx"] = sorted({str(x.exchange).rstrip('.').lower() for x in ans if str(x.exchange) != '.'})
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            async with self.sem:
+                r = await self.client.get(self.base_url + "/")
+            for txt in re.findall(r'(?i)v=spf1([^"\'>]+)', r.text + " " + " ".join(
+                    v for k, v in r.headers.items() if 'spf' in str(v).lower())):
+                for inc in re.findall(r'include:([\w.\-]+)', txt):
+                    providers["spf_includes"].append(inc.lower())
+        except Exception:
+            pass
+
+        # ---------- vendor rollup ----------
+        vend = {}
+        for rec in resources:
+            if not rec.get("vendor"):
+                continue
+            v = vend.setdefault(rec["vendor"], {"name": rec["vendor"], "category": "?", "count": 0,
+                                                "resources": [], "sri_missing": 0, "note": ""})
+            v["count"] += 1
+            if len(v["resources"]) < 6:
+                v["resources"].append(rec["url"])
+            if not rec.get("sri"):
+                v["sri_missing"] += 1
+        for name, _, cat, note in self.VENDORS:
+            if name in vend and vend[name]["category"] == "?":
+                vend[name]["category"] = cat
+                vend[name]["note"] = note
+        vendors = sorted(vend.values(), key=lambda x: -x["count"])
+
+        # ---------- findings ----------
+        exec_res = [r for r in resources if r["kind"] in ("script", "stylesheet")]
+        no_sri = [r for r in exec_res if not r.get("sri")]
+        unknown = [r for r in exec_res if r.get("vendor_known") is False]
+        if exec_res and no_sri:
+            sev = "HIGH" if unknown else "MEDIUM"
+            findings.append((sev, "No Subresource Integrity",
+                             f"{len(no_sri)}/{len(exec_res)} third-party executable resources lack SRI — "
+                             f"a CDN/vendor compromise can inject code (add integrity=...)"))
+        for r in unknown[:8]:
+            findings.append(("HIGH", "Unknown third-party script source",
+                             f"{r['kind']} loaded from unrecognized host: {r['url'][:100]}"))
+        if ext_form_actions:
+            for scheme, u in ext_form_actions[:6]:
+                sev = "CRITICAL" if scheme == "http" else "MEDIUM"
+                findings.append((sev, "Form submits to third party",
+                                 f"form action → {u[:100]} (submitted data leaves this origin)"))
+        scripts3p = [r for r in resources if r["kind"] == "script"]
+        if scripts3p:
+            try:
+                hdrs = self.scalar_results.get('http_headers') or {}
+                csp = hdrs.get('content-security-policy', '')
+            except Exception:
+                csp = ""
+            if not csp:
+                findings.append(("MEDIUM", "Third-party scripts without CSP",
+                                 f"{len(scripts3p)} external scripts execute with no Content-Security-Policy"))
+        iframes3p = [r for r in resources if r["kind"] == "iframe"]
+        if iframes3p:
+            findings.append(("INFO", "Third-party iframes",
+                             f"{len(iframes3p)} external iframe(s): " +
+                             ", ".join((r.get('vendor') or urlparse(r['url']).netloc) for r in iframes3p[:5])))
+        self.results['supply'] = {
+            "page": page_url,
+            "vendors": vendors,
+            "resources": resources[:60],
+            "resources_total": len(resources),
+            "third_party_exec": len(exec_res),
+            "sri_missing": len(no_sri),
+            "unknown_sources": [r["url"] for r in unknown],
+            "external_form_actions": [u for _, u in ext_form_actions],
+            "preconnect": preconnect,
+            "providers": providers,
+            "findings": findings,
+        }
+
+    # ---------------------------------------------------------- Asset Criticality Classification
+    CRIT_WORDS = {
+        "admin": 90, "administrator": 92, "login": 88, "signin": 85, "auth": 84, "sso": 90, "oauth": 82,
+        "vpn": 86, "panel": 80, "dashboard": 76, "manage": 78, "console": 78, "cpanel": 88,
+        "api": 70, "graphql": 68, "rest": 55, "pay": 90, "billing": 86, "checkout": 92, "cart": 74,
+        "bank": 95, "db": 95, "sql": 90, "database": 92, "phpmyadmin": 97, "adminer": 95,
+        "wp-admin": 92, "wp-login": 90, "mail": 78, "webmail": 86, "owa": 88, "exchange": 84,
+        "staging": 72, "stage": 72, "dev": 60, "test": 56, "demo": 42, "beta": 56, "uat": 72,
+        "sandbox": 66, "internal": 86, "intranet": 88, "portal": 76, "crm": 82, "erp": 86,
+        "upload": 76, "backup": 92, "bak": 88, "grafana": 80, "jenkins": 86, "gitlab": 80,
+        "gitea": 74, "kibana": 80, "elastic": 74, "k8s": 86, "kube": 86, "prometheus": 74,
+        "monitor": 64, "metrics": 60, "status": 54, "shop": 76, "store": 76, "account": 76,
+        "user": 60, "member": 66, "remote": 82, "gateway": 74, "jira": 76, "confluence": 76,
+        "jenkins": 86, "sonar": 74, "registry": 78, "docker": 78, "harbor": 76, "backend": 74,
+        "internal-api": 84, "cms": 66, "editor": 70, "config": 82, "setup": 76, "install": 80,
+        "search": 40, "cdn": 40, "static": 30, "img": 28, "assets": 30, "blog": 32, "news": 34,
+        "docs": 36, "doc": 36, "help": 40, "support": 52, "www": 46, "mail-in": 74, "smtp": 72,
+        "autodiscover": 82, "secure": 74, "billing-api": 90,
+    }
+    CRIT_PORTS = {
+        22: 72, 21: 66, 23: 88, 25: 56, 110: 70, 143: 70, 445: 92, 1433: 95, 3306: 96, 3389: 92,
+        5432: 96, 5900: 76, 6379: 92, 8080: 54, 8443: 56, 8500: 82, 9090: 62, 9200: 86, 11211: 74,
+        2375: 96, 2376: 90, 5672: 72, 9092: 72, 27017: 94, 11211: 74, 5984: 82, 15672: 76,
+    }
+
+    async def criticality_classify(self):
+        """Rule-based criticality scoring (0-100) for discovered assets."""
+        assets = {}      # name -> {score, tier, reasons, type}
+
+        def add(name, atype, score, reason):
+            if not name:
+                return
+            name = name.strip().lower().rstrip('.')
+            if not name or name in ('-',):
+                return
+            a = assets.setdefault(name, {"asset": name, "type": atype, "score": 0, "reasons": []})
+            if score > a["score"]:
+                a["score"] = score
+            if reason and reason not in a["reasons"] and len(a["reasons"]) < 5:
+                a["reasons"].append(reason)
+
+        # subdomains / host
+        hosts = set()
+        for s in self.results.get('subdomains', []):
+            hosts.add(str(s).split(' ')[0].split(' -> ')[0].strip().lower())
+        hosts.add(self.domain.lower())
+        for h in hosts:
+            labels = h.split('.')
+            for lab in labels:
+                for w, sc in self.CRIT_WORDS.items():
+                    if w in lab:
+                        add(h, "host", sc, f"keyword '{w}'")
+                        break
+        # main target baseline score
+        add(self.domain, "target", 60, "primary target")
+
+        # ports (against main host)
+        for p in self.results.get('open_ports', []):
+            try:
+                port = int(str(p).split('/')[0])
+            except Exception:
+                continue
+            if port in self.CRIT_PORTS:
+                add(self.domain, "target", self.CRIT_PORTS[port], f"open risky port {port}")
+
+        # paths
+        for p in self.results.get('paths', []):
+            if not isinstance(p, dict):
+                continue
+            path = str(p.get('path', ''))
+            st = p.get('status')
+            best = 0
+            why = ""
+            for w, sc in self.CRIT_WORDS.items():
+                if w in path.lower() and sc > best:
+                    best, why = sc, f"path keyword '{w}'"
+            if best:
+                add(f"{self.netloc}{path}", "path", best, why)
+                if st == 200 and best >= 80:
+                    add(f"{self.netloc}{path}", "path", min(best + 5, 100), "accessible (HTTP 200)")
+                elif st in (401, 403) and best >= 70:
+                    add(f"{self.netloc}{path}", "path", best, f"auth wall (HTTP {st})")
+
+        # findings raise attached-asset score
+        critical_findings = [f for f in (list(self.results.get('cve_findings', [])) +
+                                         [(x[0], x[1], x[2], '') for x in self.results.get('ext_findings', [])
+                                          if isinstance(x, (list, tuple)) and len(x) >= 3])
+                             if isinstance(f, (list, tuple)) and len(f) >= 2 and f[0] in ('CRITICAL', 'HIGH')]
+        if critical_findings:
+            add(self.domain, "target", max(65, assets.get(self.domain, {}).get("score", 0)),
+                f"{len(critical_findings)} critical/high findings attached")
+
+        # tiers
+        def tier(sc):
+            if sc >= 80:
+                return "CRITICAL"
+            if sc >= 60:
+                return "HIGH"
+            if sc >= 35:
+                return "MEDIUM"
+            return "LOW"
+
+        out = sorted(assets.values(), key=lambda x: (-x["score"], x["asset"]))
+        for a in out:
+            a["tier"] = tier(a["score"])
+        counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        for a in out:
+            counts[a["tier"]] += 1
+        self.results['criticality'] = {"assets": out[:150], "tiers": counts,
+                                       "method": "rule-based scoring (keyword/port/finding signals, 0-100)"}
+
+    # ---------------------------------------------------------- Behavioral Anomaly Detection (ML)
+    async def anomaly_detection(self):
+        """Lightweight unsupervised anomaly detection on HTTP response behaviour:
+        content-hash clustering (soft-404), latency/size z-scores, IQR outliers, k-means (k=2)."""
+        findings = []
+        n_rand = 10 if self.deep else 6
+        static_paths = ["", "index.html", "about", "contact", "products", "news", "login",
+                        "images/", "assets/", "css/", "js/", "api/", "robots.txt", "favicon.ico",
+                        "admin", "backup", "config", "sitemap.xml", ".git/HEAD", ".env"]
+        rand_tokens = ["nv-a" + hashlib.md5(f"anom{i}".encode()).hexdigest()[:9] for i in range(n_rand)]
+        probes = [(p, False) for p in static_paths[: (20 if self.deep else 14)]]
+        probes += [(t, True) for t in rand_tokens]                    # known-nonexistent
+        # add flagged/discovered paths if available (up to 10)
+        for pd in [x for x in self.results.get('paths', []) if isinstance(x, dict)][:10]:
+            u = str(pd.get('path', '')).lstrip('/')
+            if u and (u, False) not in probes:
+                probes.append((u, False))
+
+        async def probe(path, is_random):
+            url = urljoin(self.base_url + "/", path)
+            t0 = time.time()
+            try:
+                async with self.sem:
+                    r = await self.client.get(url, follow_redirects=True)
+                latency = (time.time() - t0) * 1000
+                body = r.text[:200_000]
+                norm = re.sub(r'[a-f0-9]{8,}', '@', re.sub(r'\d+', '#', body.lower()))
+                h = hashlib.sha1(norm.encode('utf-8', 'replace')).hexdigest()[:12]
+                title_m = re.search(r'<title[^>]*>(.*?)</title>', body, re.I | re.S)
+                return {"path": path, "random": is_random, "status": r.status_code,
+                        "size": len(r.content), "latency_ms": round(latency, 1),
+                        "hash": h, "title": (title_m.group(1).strip()[:60] if title_m else ""),
+                        "final_url": str(r.url)}
+            except Exception:
+                return None
+
+        rows = [x for x in await asyncio.gather(*[probe(*p) for p in probes]) if x]
+        if not rows:
+            self.results['errors'].append("anomaly: no responses collected")
+            return
+
+        # ---------- soft-404 detection ----------
+        rand_ok = [r for r in rows if r["random"] and r["status"] == 200]
+        rand_total = len([r for r in rows if r["random"]])
+        soft404 = bool(rand_total and len(rand_ok) / rand_total >= 0.5)
+        masked = []
+        if soft404:
+            groups = defaultdict(list)
+            for r in rows:
+                if r["status"] == 200:
+                    groups[r["hash"]].append(r)
+            for h, members in groups.items():
+                if any(m["random"] for m in members) and len(members) >= 3:
+                    masked = members
+                    findings.append(("MEDIUM", "Soft-404 behaviour",
+                                     f"{len(members)} paths return an identical '200 OK' page "
+                                     f"(hash {h}) even for random/nonexistent URLs — path discovery "
+                                     f"will report false 200s"))
+                    break
+            if not masked:
+                findings.append(("MEDIUM", "Soft-404 behaviour",
+                                 f"{len(rand_ok)}/{rand_total} random nonexistent URLs returned HTTP 200"))
+        elif rand_total:
+            findings.append(("INFO", "Clean 404s ✅",
+                             f"random URLs correctly return non-200 ({rand_total - len(rand_ok)}/{rand_total})"))
+
+        # ---------- latency z-score ----------
+        lats = [r["latency_ms"] for r in rows if r["latency_ms"] > 0]
+        if len(lats) >= 6:
+            mean = statistics.fmean(lats)
+            sd = statistics.pstdev(lats) or 1.0
+            slow = [r for r in rows if r["latency_ms"] and (r["latency_ms"] - mean) / sd > 3]
+            for r in slow[:5]:
+                findings.append(("LOW", "Latency outlier",
+                                 f"{r['path']} took {r['latency_ms']}ms (z={(r['latency_ms'] - mean) / sd:.1f}) — "
+                                 f"may be dynamic/behind extra processing"))
+        # ---------- size IQR outliers (among same status) ----------
+        by_status = defaultdict(list)
+        for r in rows:
+            by_status[r["status"]].append(r)
+        for st, group in by_status.items():
+            if len(group) < 6:
+                continue
+            sizes = sorted(x["size"] for x in group)
+            q1 = statistics.median(sizes[:len(sizes) // 2]) or 0
+            q3 = statistics.median(sizes[len(sizes) - len(sizes) // 2:]) or 0
+            iqr = q3 - q1
+            if iqr <= 0:
+                continue
+            for x in group:
+                if x["size"] > q3 + 1.5 * iqr and x["size"] > 2000:
+                    findings.append(("LOW", "Response-size outlier",
+                                     f"{x['path']} returned {x['size']:,}B vs IQR fence {int(q3 + 1.5 * iqr):,}B (status {st})"))
+        # ---------- status anomalies ----------
+        for r in rows:
+            if r["status"] >= 500:
+                findings.append(("MEDIUM", "Server error response",
+                                 f"{r['path']} → HTTP {r['status']} (server-side errors on probe)"))
+            elif r["status"] in (401, 403) and not r["random"]:
+                findings.append(("INFO", "Auth-gated path",
+                                 f"{r['path']} → HTTP {r['status']}"))
+
+        # ---------- k-means (k=2) on [status/100, log2(size), log2(latency)] ----------
+        pts = []
+        for r in rows:
+            pts.append((r, [r["status"] / 100.0,
+                            math.log2(r["size"] + 1),
+                            math.log2(max(r["latency_ms"], 1.0))]))
+        centroids = [pts[0][1][:], max(pts, key=lambda x: x[1][1])[1][:]]
+        assign = [0] * len(pts)
+        for _ in range(12):
+            changed = False
+            for i, (_, v) in enumerate(pts):
+                d0 = sum((v[j] - centroids[0][j]) ** 2 for j in range(3))
+                d1 = sum((v[j] - centroids[1][j]) ** 2 for j in range(3))
+                a = 0 if d0 <= d1 else 1
+                if a != assign[i]:
+                    assign[i] = a
+                    changed = True
+            if not changed:
+                break
+            for k in (0, 1):
+                members = [v for i, (_, v) in enumerate(pts) if assign[i] == k]
+                if members:
+                    centroids[k] = [sum(m[j] for m in members) / len(members) for j in range(3)]
+        small = 0 if assign.count(0) <= assign.count(1) else 1
+        outliers = [pts[i][0] for i, a in enumerate(assign) if a == small and assign.count(small) < len(pts) * 0.35]
+        if outliers and len(outliers) <= max(6, len(pts) // 4):
+            findings.append(("INFO", "k-means outlier cluster",
+                             f"{len(outliers)} response(s) grouped as statistically distinct: " +
+                             ", ".join(o["path"] for o in outliers[:6])))
+
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        self.results['anomaly'] = {
+            "probed": len(rows),
+            "soft404": soft404,
+            "masked_paths": [m["path"] for m in masked][:40],
+            "samples": rows[:80],
+            "kmeans_outliers": [o["path"] for o in outliers][:20],
+            "findings": sorted(findings, key=lambda x: sev_rank.get(x[0], 5)),
+        }
+
+    # ---------------------------------------------------------- Threat Intel Feeds
+    async def threat_intel(self):
+        """Keyless public feeds: AlienVault OTX, OpenPhish, SSLBL, Spamhaus Zen (DoH).
+        Optional: ABUSEIPDB_KEY for AbuseIPDB check."""
+        findings = []
+        sources = []
+
+        # ---------- IPs to check ----------
+        ips = sorted({str(i) for i in self.results.get('ips', []) if str(i)})[:6]
+        if not ips:
+            try:
+                resolver = dns.asyncresolver.Resolver()
+                resolver.lifetime = self.timeout
+                ans = await resolver.resolve(self.domain, 'A')
+                ips = sorted({x.address for x in ans})[:6]
+            except Exception:
+                try:
+                    async with httpx.AsyncClient(timeout=8) as c:
+                        rr = await c.get("https://cloudflare-dns.com/dns-query",
+                                         params={"name": self.domain, "type": "A"},
+                                         headers={"Accept": "application/dns-json"})
+                        ips = sorted({a["data"] for a in rr.json().get("Answer", [])
+                                      if a.get("type") == 1})[:6]
+                except Exception:
+                    pass
+
+        # ---------- 1) AlienVault OTX ----------
+        for indicator, itype in ([(self.domain, "domain")] + [(ip, "IPv4") for ip in ips[:3]]):
+            try:
+                async with self.sem:
+                    r = await self.client.get(
+                        f"https://otx.alienvault.com/api/v1/indicators/{itype}/{indicator}/general",
+                        timeout=15.0, headers={"Accept": "application/json"})
+                if r.status_code == 200:
+                    data = r.json()
+                    pc = data.get("pulse_info", {}).get("count", 0) or 0
+                    pulse_names = [p.get("name", "") for p in
+                                   (data.get("pulse_info", {}).get("pulses") or [])[:4]]
+                    sources.append({"source": "AlienVault OTX", "target": indicator,
+                                    "status": "listed" if pc else "clean",
+                                    "detail": f"{pc} pulse(s)" + (": " + "; ".join(pulse_names) if pulse_names else "")})
+                    if pc:
+                        sev = "HIGH" if pc >= 5 else "MEDIUM"
+                        findings.append((sev, "OTX pulse match",
+                                         f"{indicator} appears in {pc} AlienVault threat pulse(s)"
+                                         + (f" — {', '.join(pulse_names)}" if pulse_names else "")))
+                    break       # OTX working → skip remaining retries
+            except Exception:
+                continue
+        if not sources:
+            sources.append({"source": "AlienVault OTX", "target": "-", "status": "unavailable",
+                            "detail": "request failed (network/limits)"})
+
+        # ---------- 2) OpenPhish phishing feed ----------
+        try:
+            async with self.sem:
+                r = await self.client.get("https://openphish.com/feed.txt", timeout=20.0)
+            if r.status_code == 200:
+                hits = [ln.strip() for ln in r.text.splitlines()
+                        if self.domain in ln.lower()][:5]
+                total = len(r.text.splitlines())
+                sources.append({"source": "OpenPhish", "target": self.domain,
+                                "status": "listed" if hits else "clean",
+                                "detail": f"{total} active phishing URLs scanned"})
+                if hits:
+                    findings.append(("CRITICAL", "Active phishing",
+                                     f"{len(hits)} open phish URL(s) targeting this domain: {hits[0][:90]}"))
+        except Exception:
+            sources.append({"source": "OpenPhish", "target": "-", "status": "unavailable",
+                            "detail": "feed download failed"})
+
+        # ---------- 3) SSLBL (abuse.ch) IP blacklist ----------
+        if ips:
+            try:
+                async with self.sem:
+                    r = await self.client.get("https://sslbl.abuse.ch/blacklist/sslipblacklist.txt",
+                                              timeout=25.0)
+                if r.status_code == 200:
+                    text = r.text
+                    hits = [ip for ip in ips if f'"{ip}"' in text]
+                    sources.append({"source": "SSLBL", "target": ", ".join(ips),
+                                    "status": "listed" if hits else "clean",
+                                    "detail": "SSL cert blacklist scan"})
+                    for ip in hits:
+                        m = re.search(rf'"{re.escape(ip)}",\s*"([^"]+)"', text)
+                        findings.append(("HIGH", "SSLBL listed IP",
+                                         f"{ip} is on abuse.ch SSLBL as botnet C2"
+                                         + (f" ({m.group(1)})" if m else "")))
+            except Exception:
+                sources.append({"source": "SSLBL", "target": "-", "status": "unavailable",
+                                "detail": "blacklist download failed"})
+
+        # ---------- 4) Spamhaus Zen via DoH ----------
+        for ip in ips[:4]:
+            try:
+                if ':' in ip:
+                    continue      # IPv6 reverse zones unsupported here
+                rev = ".".join(reversed(ip.split('.')))
+                async with httpx.AsyncClient(timeout=10) as c:
+                    r = await c.get("https://cloudflare-dns.com/dns-query",
+                                    params={"name": f"{rev}.zen.spamhaus.org", "type": "TXT"},
+                                    headers={"Accept": "application/dns-json"})
+                answers = [a for a in r.json().get("Answer", []) if a.get("type") == 16]
+                if not answers:
+                    sources.append({"source": "Spamhaus Zen", "target": ip, "status": "clean",
+                                    "detail": "no TXT answer (not listed)"})
+                    continue
+                data = str(answers[0].get("data", "")).strip('"')
+                if data.startswith("127.255.255."):
+                    sources.append({"source": "Spamhaus Zen", "target": ip, "status": "skipped",
+                                    "detail": f"resolver refused ({data}) — public resolver not permitted"})
+                elif data.startswith("127.0.0."):
+                    code = data.split(".")[-1]
+                    reasons = {"2": "explicit drop zone", "3": "CBL", "4": "DSBL",
+                               "6": "systems compromised", "7": "house", "8": "SOULL",
+                               "9": "CSS prefix/proxy", "10": "missing PTR"}
+                    findings.append(("HIGH", "Spamhaus listed",
+                                     f"{ip} listed in Spamhaus Zen (127.0.0.{code}"
+                                     + (f": {reasons.get(code, 'listed')}" if code in reasons else "") + ")"))
+                    sources.append({"source": "Spamhaus Zen", "target": ip, "status": "listed",
+                                    "detail": data})
+                else:
+                    sources.append({"source": "Spamhaus Zen", "target": ip, "status": "clean",
+                                    "detail": f"TXT {data[:40]}"})
+            except Exception:
+                sources.append({"source": "Spamhaus Zen", "target": ip, "status": "unavailable",
+                                "detail": "DoH query failed"})
+
+        # ---------- 5) AbuseIPDB (optional key) ----------
+        key = os.environ.get("ABUSEIPDB_KEY", "").strip()
+        if key and ips:
+            try:
+                async with self.sem:
+                    r = await self.client.get(
+                        "https://api.abuseipdb.com/api/v2/check",
+                        params={"ipAddress": ips[0], "maxAgeInDays": 90},
+                        headers={"Key": key, "Accept": "application/json"}, timeout=12.0)
+                d = r.json().get("data", {})
+                score = d.get("abuseConfidenceScore", 0)
+                sources.append({"source": "AbuseIPDB", "target": ips[0], "status": "listed" if score else "clean",
+                                "detail": f"{score}% confidence, {d.get('totalReports', 0)} reports"})
+                if score >= 25:
+                    findings.append(("HIGH", "AbuseIPDB reports",
+                                     f"{ips[0]} has {score}% abuse confidence ({d.get('totalReports', 0)} reports, "
+                                     f"usage: {d.get('usageType', '?')})"))
+            except Exception:
+                sources.append({"source": "AbuseIPDB", "target": ips[0], "status": "unavailable",
+                                "detail": "check failed"})
+        elif not key:
+            sources.append({"source": "AbuseIPDB", "target": "-", "status": "skipped",
+                            "detail": "set ABUSEIPDB_KEY to enable (optional)"})
+
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        self.results['intel'] = {"ips": ips, "sources": sources,
+                                 "findings": sorted(findings, key=lambda x: sev_rank.get(x[0], 5))}
+
+    # ---------------------------------------------------------- Breach / Credential Monitoring
+    async def breach_monitor(self):
+        """Domain/credential exposure monitoring via Have I Been Pwned (API key required for
+        enumeration — free at haveibeenpwned.com/APIKey). Keyless mode reports setup guidance
+        plus any phishing exposure already found in threat intel."""
+        findings = []
+        checks = []
+        key = os.environ.get("HIBP_API_KEY", "").strip()
+        breaches = []
+
+        if not key:
+            checks.append({
+                "check": "HIBP API key",
+                "status": "NOT CONFIGURED",
+                "detail": "Set HIBP_API_KEY (free for non-commercial use at haveibeenpwned.com/APIKey) "
+                          "to enable breach + credential monitoring",
+            })
+        else:
+            # 1) domain breach enumeration
+            try:
+                async with self.sem:
+                    r = await self.client.get(
+                        "https://haveibeenpwned.com/api/v3/breaches",
+                        params={"domain": self.domain},
+                        headers={"hibp-api-key": key, "user-agent": "NULLVEIL-Recon"}, timeout=20.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    for b in data[:40]:
+                        breaches.append({"name": b.get("Name"), "title": b.get("Title"),
+                                         "date": b.get("BreachDate"),
+                                         "pwn_count": b.get("PwnCount"),
+                                         "classes": (b.get("DataClasses") or [])[:8],
+                                         "verified": b.get("IsVerified")})
+                    checks.append({"check": "Domain breach records (HIBP)", "status": "OK",
+                                   "detail": f"{len(breaches)} breach record(s) matched to {self.domain}"})
+                    for b in breaches[:12]:
+                        findings.append(("CRITICAL" if (b["pwn_count"] or 0) >= 1_000_000 else "HIGH",
+                                         "Breach exposure",
+                                         f"{b['title']} ({b['date']}) — {b['pwn_count']:,} accounts, "
+                                         f"data: {', '.join(b['classes']) or 'n/a'}"))
+                elif r.status_code == 401:
+                    checks.append({"check": "HIBP API key", "status": "INVALID",
+                                   "detail": "HIBP rejected the key (401) — check HIBP_API_KEY"})
+                else:
+                    checks.append({"check": "Domain breach records (HIBP)", "status": "ERROR",
+                                   "detail": f"HTTP {r.status_code}"})
+            except Exception as e:
+                checks.append({"check": "Domain breach records (HIBP)", "status": "ERROR",
+                               "detail": type(e).__name__})
+
+            # 2) harvested target emails (module 6/12) — exposure check, capped
+            emails = [e for e in sorted(set(self.results.get('emails', [])))
+                      if re.match(r'^[\w.+\-]+@[\w.\-]+\.\w{2,}$', str(e))][:10]
+            for em in emails:
+                try:
+                    async with self.sem:
+                        r = await self.client.get(
+                            f"https://haveibeenpwned.com/api/v3/breachedaccount/{em}",
+                            params={"truncateResponse": "true"},
+                            headers={"hibp-api-key": key, "user-agent": "NULLVEIL-Recon"}, timeout=15.0)
+                    if r.status_code == 200:
+                        names = [b.get("Name") for b in r.json()][:10]
+                        findings.append(("HIGH", "Email in breaches",
+                                         f"{em} found in {len(names)} breach(es): {', '.join(names)}"))
+                    elif r.status_code == 404:
+                        pass      # not found — good
+                    elif r.status_code == 429:
+                        checks.append({"check": "Email enumeration", "status": "RATE LIMITED",
+                                       "detail": "HIBP throttled — remaining emails skipped"})
+                        break
+                except Exception:
+                    pass
+            if emails:
+                checks.append({"check": "Email enumeration (HIBP)", "status": "OK",
+                               "detail": f"{len(emails)} harvested target email(s) checked"})
+
+        # 3) keyless: re-surface phishing exposure from threat intel if present
+        for f in self.results.get('intel', {}).get('findings', []):
+            if isinstance(f, (list, tuple)) and len(f) == 3 and f[1] == "Active phishing":
+                findings.append(f)      # (severity, check, detail) — same shape as ours
+        if not key and not findings:
+            findings.append(("INFO", "Monitoring not active",
+                             "Breach/credential monitoring needs a free HIBP_API_KEY — "
+                             "dark-web marketplace scraping is intentionally not performed"))
+
+        self.results['breach'] = {"key_present": bool(key), "provider": "Have I Been Pwned",
+                                  "checks": checks, "breaches": breaches,
+                                  "findings": findings}
+
+    # ---------------------------------------------------------- Compliance Mapping
+    async def compliance_map(self):
+        """Map collected technical evidence to PCI-DSS v4.0 / ISO 27001:2022 Annex A / SOC 2 TSC.
+        Evidence-based partial assessment only — NOT a certification or audit."""
+        ran = {ATTACK_MODULES[i - 1][0] for i in self.attack_set if 0 < i <= MAX_MODULE}
+        ev = {}
+        # TLS / crypto
+        tls_m = self.results.get('tls_matrix', [])
+        ev['tls_run'] = bool(tls_m)
+        ev['tls10'] = any(m[0] == "TLS 1.0" and m[1] == "yes" for m in tls_m)
+        ev['tls11'] = any(m[0] == "TLS 1.1" and m[1] == "yes" for m in tls_m)
+        ev['tls12'] = any(m[0] == "TLS 1.2" and m[1] == "yes" for m in tls_m)
+        ev['tls13'] = any(m[0] == "TLS 1.3" and m[1] == "yes" for m in tls_m)
+        ev['weak_crypto'] = any(f[1] in ("Weak cipher", "Short RSA key", "Short EC key",
+                                         "Weak cert signature", "No TLS 1.3") and f[0] in ("HIGH", "CRITICAL")
+                                for f in self.results.get('tls_findings', []))
+        ev['no_legacy_tls'] = ev['tls_run'] and not ev['tls10'] and not ev['tls11']
+        # headers
+        ev['http_run'] = 'http' in ran
+        ev['hdr_present'] = len(self.results.get('security_headers', []))
+        ev['hdr_missing'] = len(self.results.get('missing_security_headers', []))
+        ev['hsts'] = any('strict-transport-security' in h for h in self.results.get('security_headers', []))
+        ev['csp'] = any('content-security-policy' in h for h in self.results.get('security_headers', []))
+        # vulnerabilities / exposure
+        ev['cve_run'] = 'cve' in ran
+        cve_high = [f for f in self.results.get('cve_findings', []) if f[0] in ('CRITICAL', 'HIGH')]
+        cve_med = [f for f in self.results.get('cve_findings', []) if f[0] == 'MEDIUM']
+        ev['vuln_high'] = len(cve_high)
+        ev['vuln_med'] = len(cve_med)
+        ev['exposed_debug'] = any(f[1] in ('Exposed .git', 'Exposed .env', 'Exposed .svn', 'phpinfo()',
+                                           'Heapdump', 'Spring Actuator /env', 'Apache server-status',
+                                           'Apache server-info', 'Directory Listing', 'web.config',
+                                           'H2 Console', 'Laravel Ignition')
+                                  for f in self.results.get('cve_findings', []))
+        ev['secrets_found'] = len(self.results.get('secrets', []))
+        ev['secrets_run'] = 'content' in ran
+        # email auth
+        ev['email_run'] = 'email' in ran
+        ev['spf'] = bool(self.results.get('spf', ''))
+        ev['dmarc'] = bool(self.results.get('dmarc', ''))
+        ev['dmarc_enforce'] = str(self.results.get('dmarc_policy', '')).lower() in ('reject', 'quarantine')
+        # API audit
+        ev['audit_run'] = 'audit' in ran
+        audit = self.results.get('api_audit_findings', [])
+        ev['audit_high'] = len([f for f in audit if f[0] in ('CRITICAL', 'HIGH')])
+        # supply chain
+        ev['supply_run'] = 'supply' in ran
+        sup = self.results.get('supply', {})
+        ev['sri_missing'] = sup.get('sri_missing', 0)
+        ev['third_party_exec'] = sup.get('third_party_exec', 0)
+        # threat intel / breach
+        ev['intel_run'] = 'intel' in ran
+        ev['intel_listed'] = len([f for f in self.results.get('intel', {}).get('findings', [])
+                                  if f[0] in ('CRITICAL', 'HIGH')])
+        ev['breach_run'] = 'breach' in ran
+        ev['breach_findings'] = len([f for f in self.results.get('breach', {}).get('findings', [])
+                                     if f[0] in ('CRITICAL', 'HIGH')])
+        # anomaly
+        ev['anom_run'] = 'anom' in ran
+        ev['soft404'] = self.results.get('anomaly', {}).get('soft404', False)
+        # criticality
+        crit = self.results.get('criticality', {})
+        ev['assets_classified'] = len(crit.get('assets', []))
+
+        YES, NO, PART, NEED = "PASS", "FAIL", "PARTIAL", "EVIDENCE REQUIRED"
+
+        def run(key):
+            return key in ran
+
+        # (framework, ref, title, fn(ev)->(status, evidence))
+        CONTROLS = [
+            # ---------------- PCI-DSS v4.0 ----------------
+            ("PCI-DSS v4.0", "2.2.5", "System components have only necessary functions enabled",
+             lambda e: (NO, "debug/admin surfaces exposed (.git/.env/actuator/phpinfo/server-status)")
+             if e['exposed_debug'] else
+             (PART, f"{e['hdr_missing']} security headers missing") if run('http') and e['hdr_missing'] else
+             (YES, "no exposed debug/config surfaces in probe scope") if e['cve_run'] else (NEED, "run -a cve,http")),
+            ("PCI-DSS v4.0", "4.2.1", "Strong cryptography protects cardholder data in transit",
+             lambda e: (NO, "legacy TLS 1.0/1.1 accepted") if e['tls10'] or e['tls11'] else
+             (NO, "weak crypto negotiated") if e['weak_crypto'] else
+             (YES, "TLS 1.2+ only, modern ciphers") if e['tls_run'] else (NEED, "run -a tls")),
+            ("PCI-DSS v4.0", "6.2.4", "Secure coding techniques mitigate common software attacks",
+             lambda e: (PART, f"CSP: {'yes' if e['csp'] else 'missing'}; "
+                              f"reflected params / XSS candidates reported separately") if e['http_run'] else (NEED, "run -a http,crawl")),
+            ("PCI-DSS v4.0", "6.3.1", "Vulnerabilities are identified and remediated",
+             lambda e: (NO, f"{e['vuln_high']} critical/high finding(s)") if e['vuln_high'] else
+             (PART, f"{e['vuln_med']} medium finding(s)") if e['vuln_med'] else
+             (YES, "no critical/high CVE-class findings") if e['cve_run'] else (NEED, "run -a cve")),
+            ("PCI-DSS v4.0", "6.5.1", "Software engineering techniques prevent code injection",
+             lambda e: (NO, "insecure config surfaces (.git/.env) leak code/config") if e['exposed_debug'] else
+             (PART, "no CSP/secret-scan baseline available") if not run('content') else (YES, "no exposed source/config"),),
+            ("PCI-DSS v4.0", "8.4.2", "MFA for all access into the CDE",
+             lambda e: (PART, f"API auth findings: {e['audit_high']} high/critical (MFA itself not network-testable)")
+             if e['audit_run'] else (NEED, "MFA is org-policy evidence; run -a audit for API auth posture")),
+            ("PCI-DSS v4.0", "10.2.1", "Audit logs capture all access to network resources",
+             lambda e: (NEED, "log pipeline is organizational evidence — not assessable externally")),
+            ("PCI-DSS v4.0", "11.3.1", "Internal/external vulnerability scans performed",
+             lambda e: (YES, f"this scan = technical evidence ({e['cve_run'] and 'cve module run' or 'partial'})")
+             if e['cve_run'] else (PART, "recon-only; schedule authenticated ASV scans")),
+            ("PCI-DSS v4.0", "12.8.5", "Third-party service provider management",
+             lambda e: (PART, f"{e['third_party_exec']} third-party executable resources; "
+                              f"SRI missing on {e['sri_missing']}") if e['supply_run'] else (NEED, "run -a supply")),
+            # ---------------- ISO 27001:2022 (Annex A) ----------------
+            ("ISO 27001:2022", "A.5.10", "Inventory of information and associated assets",
+             lambda e: (YES, f"{e['assets_classified']} assets classified + subdomains/ports inventoried")
+             if e['assets_classified'] else (PART, "run -a crit to classify the inventory")),
+            ("ISO 27001:2022", "A.5.15", "Access control",
+             lambda e: (NO, f"{e['audit_high']} high/critical API auth/access findings") if e['audit_high'] else
+             (PART, "external view only — run -a audit") if e['audit_run'] else (NEED, "run -a audit")),
+            ("ISO 27001:2022", "A.5.16", "Identity management",
+             lambda e: (PART, "user/author enumeration results in -a users report") if run('users') else (NEED, "run -a users")),
+            ("ISO 27001:2022", "A.5.7", "Threat intelligence",
+             lambda e: (NO, f"{e['intel_listed']} malicious listing(s) on public feeds") if e['intel_listed'] else
+             (YES, "feeds checked, no listings") if e['intel_run'] else (NEED, "run -a intel")),
+            ("ISO 27001:2022", "A.5.23", "Information security for cloud services",
+             lambda e: (PART, "cloud/CDN providers identified in -a supply") if e['supply_run'] else (NEED, "run -a supply")),
+            ("ISO 27001:2022", "A.5.29", "Information security during supplier development",
+             lambda e: (NO, "third-party executable code without SRI") if e['sri_missing'] else
+             (YES, "third-party scripts carry integrity checks") if e['supply_run'] else (NEED, "run -a supply")),
+            ("ISO 27001:2022", "A.8.8", "Management of technical vulnerabilities",
+             lambda e: (NO, f"{e['vuln_high']} critical/high vulnerabilities identified") if e['vuln_high'] else
+             (PART, f"{e['vuln_med']} medium finding(s)") if e['vuln_med'] else
+             (YES, "no critical/high vulnerabilities in scope") if e['cve_run'] else (NEED, "run -a cve")),
+            ("ISO 27001:2022", "A.8.9", "Configuration management",
+             lambda e: (NO, "debug/directory-listing/server-status surfaces exposed") if e['exposed_debug'] else
+             (PART, "headers baseline only") if e['http_run'] else (NEED, "run -a cve,http")),
+            ("ISO 27001:2022", "A.8.16", "Monitoring activities",
+             lambda e: (PART, "external monitoring evidence: threat feeds + anomaly module")
+             if e['intel_run'] or e['anom_run'] else (NEED, "run -a intel,anom")),
+            ("ISO 27001:2022", "A.8.19", "Installation of software on operational systems",
+             lambda e: (PART, f"soft-404 masking {'present' if e['soft404'] else 'absent'} in probe baseline")
+             if e['anom_run'] else (NEED, "run -a anom")),
+            ("ISO 27001:2022", "A.8.24", "Use of cryptography",
+             lambda e: (NO, "legacy TLS/weak ciphers enabled") if (e['tls10'] or e['tls11'] or e['weak_crypto']) else
+             (YES, "TLS 1.2+ with modern cipher suites") if e['tls_run'] else (NEED, "run -a tls")),
+            ("ISO 27001:2022", "A.8.26", "Application security requirements",
+             lambda e: (PART, f"security headers present: {e['hdr_present']}, missing: {e['hdr_missing']}")
+             if e['http_run'] else (NEED, "run -a http")),
+            ("ISO 27001:2022", "A.5.14", "Information transfer",
+             lambda e: (NO, "form submits data to third-party origin") if
+             any(f[1] == "Form submits to third party" for f in sup.get('findings', [])) else
+             (PART, "email transport auth (SPF/DMARC) reviewed") if e['email_run'] else (NEED, "run -a email,supply")),
+            # ---------------- SOC 2 TSC ----------------
+            ("SOC 2 TSC", "CC6.1", "Logical access security software / infrastructure",
+             lambda e: (NO, f"{e['audit_high']} unprotected/weak-auth API endpoints") if e['audit_high'] else
+             (PART, "external API posture only") if e['audit_run'] else (NEED, "run -a audit")),
+            ("SOC 2 TSC", "CC6.6", "Threats outside system boundaries",
+             lambda e: (NO, "legacy TLS accepted — boundary encryption weakened") if (e['tls10'] or e['tls11']) else
+             (YES, "modern TLS baseline") if e['tls_run'] else (NEED, "run -a tls")),
+            ("SOC 2 TSC", "CC6.7", "Transmission and movement of data",
+             lambda e: (NO, "cleartext (http) third-party form action") if
+             any(f[0] == "CRITICAL" and f[1] == "Form submits to third party" for f in sup.get('findings', [])) else
+             (YES, "no cleartext third-party submission found") if e['supply_run'] else (NEED, "run -a supply")),
+            ("SOC 2 TSC", "CC7.1", "Detection of configuration events / vulnerabilities",
+             lambda e: (PART, f"feeds checked: {'listed' if e['intel_listed'] else 'clean'}") if e['intel_run'] else (NEED, "run -a intel,cve")),
+            ("SOC 2 TSC", "CC7.2", "Monitoring for anomalies",
+             lambda e: (YES, "anomaly baseline computed (soft-404/latency/size/k-means)") if e['anom_run']
+             else (NEED, "run -a anom")),
+            ("SOC 2 TSC", "CC8.1", "Change management",
+             lambda e: (PART, "exposed staging/dev/test subdomains indicate unmanaged environments") if
+             any(re.search(r'(?i)(staging|stage|dev|test|uat|sandbox)', a.get('asset', ''))
+                 for a in crit.get('assets', [])) else
+             (YES, "no staging/dev hosts flagged") if e['assets_classified'] else (NEED, "run -a crit")),
+            ("SOC 2 TSC", "CC9.2", "Vendor and business partner risk",
+             lambda e: (PART, f"{e['third_party_exec']} third-party resources, SRI gaps: {e['sri_missing']}")
+             if e['supply_run'] else (NEED, "run -a supply")),
+            ("SOC 2 TSC", "C1.1", "Encryption in transit",
+             lambda e: (NO, "weak/legacy transport crypto") if (e['tls10'] or e['tls11'] or e['weak_crypto']) else
+             (YES, "TLS 1.2+ enforced in tested handshakes") if e['tls_run'] else (NEED, "run -a tls")),
+            ("SOC 2 TSC", "P4.2", "Disposal of data / sensitive data exposure",
+             lambda e: (NO, f"{e['secrets_found']} secret/leak indicator(s) in public content") if e['secrets_found'] else
+             (YES, "no secret patterns in public content") if e['secrets_run'] else (NEED, "run -a content")),
+        ]
+
+        frameworks = defaultdict(lambda: {"pass": 0, "fail": 0, "partial": 0, "needed": 0, "controls": []})
+        for fw, ref, title, fn in CONTROLS:
+            try:
+                status, evid = fn(ev)
+            except Exception:
+                status, evid = NEED, "error evaluating evidence"
+            rec = {"ref": ref, "title": title, "status": status, "evidence": evid}
+            frameworks[fw]["controls"].append(rec)
+            if status == YES:
+                frameworks[fw]["pass"] += 1
+            elif status == NO:
+                frameworks[fw]["fail"] += 1
+            elif status == PART:
+                frameworks[fw]["partial"] += 1
+            else:
+                frameworks[fw]["needed"] += 1
+        total_c = sum(len(v["controls"]) for v in frameworks.values())
+        assessable = sum(v["pass"] + v["fail"] + v["partial"] for v in frameworks.values())
+        fails = sum(v["fail"] for v in frameworks.values())
+        coverage = round(100 * assessable / total_c) if total_c else 0
+        self.results['compliance'] = {
+            "frameworks": {k: dict(v) for k, v in frameworks.items()},
+            "coverage_pct": coverage,
+            "total_controls": total_c,
+            "total_fail": fails,
+            "disclaimer": ("Evidence-based partial technical mapping only. This is NOT a certification, "
+                           "audit, or gap assessment — most controls require organizational evidence "
+                           "(policies, contracts, logs, personnel). Use as input to a real audit program."),
+        }
+
+    # ---------------------------------------------------------- Attack Path Graph + Chain Hypotheses
+    CHAIN_RULES = [
+        # (id, title, required fact keys, narrative steps, impact, confidence)
+        ("src-to-creds", "Source/config disclosure → credential replay",
+         ["exposed_git_or_env"],
+         ["{target} serves repository/environment files publicly",
+          "history & config likely contain keys, tokens, DB credentials",
+          "recovered credentials replayed against login/admin surfaces"],
+         "Full account or database compromise", "HIGH (facts confirmed)"),
+        ("takeover-session", "Dangling subdomain takeover → session/token theft",
+         ["takeover"],
+         ["DNS points {takeover} at an unclaimed service",
+          "attacker claims the host and serves content on your domain",
+          "same-site cookies/tokens scoped to parent domain become reachable"],
+         "Session hijack / SSO abuse on parent domain", "MEDIUM — verify ownership first"),
+        ("cors-auth-bypass", "CORS reflection + credentials → cross-origin data theft",
+         ["cors_reflect_creds"],
+         ["API reflects arbitrary Origin with Access-Control-Allow-Credentials: true",
+          "authenticated browser sessions permit cross-origin reads",
+          "victim data exfiltrated by a malicious page while logged in"],
+         "Authenticated data theft at scale", "HIGH (headers observed)"),
+        ("verbose-error-recon", "Verbose errors → internal recon → targeted exploit",
+         ["verbose_errors"],
+         ["stack traces/DB errors expose versions, paths, framework internals",
+          "internal topology & versions mapped without access",
+          "combined with known-version CVEs → focused exploitation"],
+         "Accelerated intrusion path", "MEDIUM — depends on disclosed detail"),
+        ("xss-chain", "Reflected input + weak headers → account takeover chain",
+         ["reflected_param", "no_csp"],
+         ["parameter echo found (no output encoding evidence)",
+          "no CSP to constrain injected script",
+          "successful XSS steals session tokens / performs actions as victim"],
+         "Account takeover via victim browser", "MEDIUM — payload not executed (manual verification)"),
+        ("transport-intercept", "Legacy TLS → MITM of session cookies",
+         ["legacy_tls"],
+         ["TLS 1.0/1.1 or weak cipher accepted",
+          "network attacker downgrades/intercepts transport",
+          "session cookies / credentials captured in transit"],
+         "Credential & session interception", "HIGH (handshake observed)"),
+        ("supply-inject", "Third-party script without SRI → supply-chain execution",
+         ["thirdparty_no_sri"],
+         ["executable script loaded from third party without integrity pin",
+          "compromised CDN/vendor can run arbitrary JS on your origin",
+          "script runs with full same-origin privileges (cookies, DOM, API calls)"],
+         "Mass client-side compromise", "MEDIUM — requires vendor incident"),
+        ("exposed-ops-surface", "Exposed ops/debug surface → server takeover primitive",
+         ["exposed_ops"],
+         ["ops endpoints reachable (heapdump/actuator/phpinfo/h2/server-status)",
+          "memory/config/secrets recovered from dumps or verbose output",
+          "recovered secrets feed directly into admin access attempts"],
+         "Server-side compromise path", "HIGH — reachable ops surface confirmed"),
+        ("open-redirect-login", "Open/insecure auth flow → credential harvesting",
+         ["auth_weak"],
+         ["API auth weaknesses detected (missing/expired token checks)",
+          "auth flows abusable for token forgery or brute force staging",
+          "harvested credentials reused across services (password spraying)"],
+         "Unauthorized access to protected resources", "MEDIUM — depends on exact weakness"),
+    ]
+
+    async def attack_graph(self):
+        """Build asset/finding graph, enumerate attack paths (BFS), generate chain hypotheses.
+        Report-only: no exploitation is performed or simulated beyond narrative reasoning."""
+        nodes = {}
+        edges = []
+
+        def node(nid, label, ntype, sev="INFO", score=None):
+            if nid not in nodes:
+                nodes[nid] = {"id": nid, "label": label[:60], "type": ntype,
+                              "sev": sev, "score": score}
+            return nid
+
+        def edge(a, b, rel):
+            if a and b and a != b:
+                edges.append({"from": a, "to": b, "rel": rel})
+
+        critmap = {a["asset"]: a for a in self.results.get('criticality', {}).get('assets', [])}
+        tid = node("host:" + self.domain, self.domain, "target",
+                   score=critmap.get(self.domain, {}).get("score", 60))
+
+        # subdomains + IPs
+        for s in list(self.results.get('subdomains', []))[:120]:
+            host = str(s).split(' ')[0].split(' -> ')[0].strip().lower()
+            if not host or host == self.domain:
+                continue
+            c = critmap.get(host, {})
+            sid = node("host:" + host, host, "subdomain",
+                       sev="HIGH" if c.get("tier") in ("CRITICAL", "HIGH") else "INFO",
+                       score=c.get("score"))
+            edge(tid, sid, "exposes")
+            m = re.search(r'->\s*([\d.]+)', str(s))
+            if m:
+                ipid = node("ip:" + m.group(1), m.group(1), "ip")
+                edge(sid, ipid, "resolves-to")
+        for ip in [str(x) for x in self.results.get('ips', [])][:12]:
+            edge(tid, node("ip:" + ip, ip, "ip"), "resolves-to")
+
+        # ports on target
+        for p in self.results.get('open_ports', []):
+            port = str(p).split('/')[0]
+            pscore = self.CRIT_PORTS.get(int(port), 40) if port.isdigit() else 40
+            pid = node(f"port:{port}", f":{port}", "port",
+                       sev="HIGH" if pscore >= 80 else "INFO", score=pscore)
+            edge(tid, pid, "listens")
+
+        # flagged paths
+        for pd in [x for x in self.results.get('paths', []) if isinstance(x, dict)][:60]:
+            if not (pd.get('flagged') or pd.get('status') in (401, 403)):
+                continue
+            pth = str(pd.get('path'))
+            pnode = node("path:" + pth, pth, "path", sev="HIGH" if pd.get('flagged') else "INFO")
+            edge(tid, pnode, "hosts")
+
+        # findings nodes
+        all_findings = []
+        all_findings += [(f[0], f[1], f[3] if len(f) > 3 else "", "cve") for f in self.results.get('cve_findings', [])]
+        all_findings += [(f[0], f[1], f[2], "ext") for f in self.results.get('ext_findings', [])]
+        all_findings += [(f[0], f[1], f[2], "audit") for f in self.results.get('api_audit_findings', [])]
+        all_findings += [(f[0], f[1], f[2], "tls") for f in self.results.get('tls_findings', [])]
+        all_findings += [(f[0], f[1], f[2], "supply") for f in self.results.get('supply', {}).get('findings', [])]
+        all_findings += [(f[0], f[1], f[2], "intel") for f in self.results.get('intel', {}).get('findings', [])]
+        for sev, fid, det, src in all_findings:
+            if sev in ("CRITICAL", "HIGH"):
+                fnode = node("find:" + fid, fid, "finding", sev=sev)
+                edge(tid, fnode, f"has-finding ({src})")
+
+        # ---------- facts for chain rules ----------
+        cve_ids = {f[1] for f in self.results.get('cve_findings', [])}
+        audit_ids = {f[1] for f in self.results.get('api_audit_findings', [])}
+        ext_ids = {f[1] for f in self.results.get('ext_findings', [])}
+        sup_find = self.results.get('supply', {}).get('findings', [])
+        facts = {
+            "exposed_git_or_env": bool(cve_ids & {'Exposed .git', 'Exposed .env', 'Exposed .svn'}) or self.results.get('secrets'),
+            "takeover": bool(self.results.get('takeover')),
+            "cors_reflect_creds": any("CORS" in str(a) and "credential" in str(a).lower()
+                                      for a in audit_ids) or any("CORS" in str(a) for a in audit_ids),
+            "verbose_errors": any("verbose" in str(a).lower() or "stack" in str(a).lower()
+                                  or "error" in str(a).lower() for a in audit_ids),
+            "reflected_param": bool(self.results.get('reflected_params')),
+            "no_csp": 'content-security-policy' in [h.lower() for h in self.results.get('missing_security_headers', [])],
+            "legacy_tls": any(f[1] in ("TLS 1.0 enabled", "TLS 1.1 enabled")
+                              for f in self.results.get('tls_findings', [])),
+            "thirdparty_no_sri": any(f[1] == "No Subresource Integrity" for f in sup_find),
+            "exposed_ops": bool(cve_ids & {'phpinfo()', 'Heapdump', 'Spring Actuator /env',
+                                           'Apache server-status', 'Apache server-info', 'H2 Console',
+                                           'Laravel Ignition', 'Directory Listing'}),
+            "auth_weak": bool(audit_ids & {'Missing auth on endpoint', 'Weak/expired token acceptance',
+                                           'Broken object-level auth (BOLA)'}),
+        }
+        facts["takeover"] = facts["takeover"] or any("Takeover" in t for t in ext_ids)
+
+        # ---------- chain hypotheses ----------
+        tk = self.results.get('takeover', [])
+        tk_name = tk[0].split(' ')[0] if tk else self.domain
+        chains = []
+        for cid, title, req, steps, impact, conf in self.CHAIN_RULES:
+            if not all(facts.get(k) for k in req):
+                continue
+            narrative = [s.format(target=self.domain, takeover=tk_name) for s in steps]
+            sev = "CRITICAL" if conf.startswith("HIGH") and cid in (
+                "src-to-creds", "cors-auth-bypass", "exposed-ops-surface") else "HIGH"
+            chains.append({"id": cid, "severity": sev, "title": title, "steps": narrative,
+                           "impact": impact, "confidence": conf,
+                           "action": "Validate manually on an authorized target; remediate the first step "
+                                     "to break the chain."})
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+        chains.sort(key=lambda c: (sev_rank.get(c["severity"], 3), c["id"]))
+
+        # ---------- BFS attack paths (entry → crown jewels) ----------
+        adj = defaultdict(set)
+        for e in edges:
+            adj[e["from"]].add(e["to"])
+            adj[e["to"]].add(e["from"])
+        entries = [nid for nid, n in nodes.items()
+                   if (n["type"] == "finding" and n["sev"] in ("CRITICAL", "HIGH"))
+                   or (n["type"] == "path" and n["sev"] == "HIGH")]
+        crowns = [nid for nid, n in nodes.items()
+                  if n["type"] == "target" or (n.get("score") or 0) >= 80]
+        paths = []
+        seen_paths = set()
+        for src in entries[:12]:
+            queue = deque([(src, [src])])
+            hops = 0
+            while queue and hops < 400:
+                hops += 1
+                cur, path = queue.popleft()
+                if len(path) > 5:
+                    continue
+                for nxt in adj.get(cur, ()):
+                    if nxt in path:
+                        continue
+                    newp = path + [nxt]
+                    if nxt in crowns:
+                        key = tuple(newp)
+                        if key not in seen_paths:
+                            seen_paths.add(key)
+                            paths.append(newp)
+                    else:
+                        queue.append((nxt, newp))
+                if len(paths) >= 15:
+                    break
+            if len(paths) >= 15:
+                break
+        attack_paths = []
+        for p in paths[:15]:
+            labels = [nodes[x]["label"] for x in p]
+            worst = max((nodes[x].get("sev") == "CRITICAL" and 3 or
+                         nodes[x].get("sev") == "HIGH" and 2 or 1) for x in p)
+            attack_paths.append({"hops": labels,
+                                 "severity": "CRITICAL" if worst >= 3 and len(p) >= 3 else
+                                             ("HIGH" if worst >= 2 else "MEDIUM"),
+                                 "length": len(p)})
+
+        # ---------- DOT export ----------
+        colors = {"CRITICAL": "#ef4444", "HIGH": "#f97316", "MEDIUM": "#eab308",
+                  "LOW": "#38bdf8", "INFO": "#94a3b8"}
+        dot = ["digraph NULLVEIL {", "  rankdir=LR;", '  node [shape=box, style="rounded,filled", '
+                                                     'fontname="Helvetica", fontsize=10];']
+        for n in nodes.values():
+            fill = colors.get(n["sev"], "#94a3b8")
+            label = n["label"].replace('"', "'")
+            dot.append(f'  "{n["id"]}" [label="{label}\\n({n["type"]})" fillcolor="{fill}"];')
+        for e in edges:
+            dot.append(f'  "{e["from"]}" -> "{e["to"]}" [label="{e["rel"]}"];')
+        dot.append("}")
+        dot_text = "\n".join(dot)
+        if getattr(self, "dot_path", None):
+            try:
+                with open(self.dot_path, "w", encoding="utf-8") as fh:
+                    fh.write(dot_text)
+            except Exception as e:
+                self.results['errors'].append(f"dot export failed: {e}")
+
+        self.results['graph'] = {
+            "nodes": list(nodes.values()),
+            "edges": edges[:400],
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "facts": {k: bool(v) for k, v in facts.items()},
+            "attack_paths": attack_paths,
+            "chains": chains,
+            "dot_exported": bool(getattr(self, "dot_path", None)),
+        }
+
+    # ---------------------------------------------------------- Multi-Target / Cross-Org Correlation
+    async def correlate_targets(self):
+        """Correlate the primary target with related/extra domains (own estate):
+        shared NS / MX / IP / CDN / cert-SAN → relationship matrix.
+        Extra domains come from --correlate or are auto-derived from certificate SANs."""
+
+        def apex(host):
+            parts = str(host).lower().rstrip('.').split('.')
+            if len(parts) >= 2:
+                return ".".join(parts[-2:])
+            return str(host).lower()
+
+        # ---------- gather candidate targets ----------
+        explicit = []
+        for d in str(getattr(self, "correlate_list", "") or "").split(","):
+            d = d.strip().lower().lstrip("*.")
+            if d and d not in explicit:
+                explicit.append(d)
+        auto = []
+        for san in self.scalar_results.get('ssl_san', []) or []:
+            a = apex(re.sub(r'^\*', '', str(san)))
+            if a and a != apex(self.domain) and a not in auto:
+                auto.append(a)
+        auto = auto[:4]
+        extra = [t for t in explicit if t != self.domain][:7]
+        targets = list(dict.fromkeys([self.domain] + auto + extra))[:9]
+        if len(targets) <= 1 and not explicit:
+            self.results['correlation'] = {
+                "targets": [{"domain": self.domain, "ns": [], "mx": [], "ips": [], "title": "",
+                             "server": "", "note": "primary"}],
+                "links": [], "findings": [],
+                "note": "no related domains found (cert SANs are single-org) — "
+                        "use --correlate a.com,b.com to compare your own domains",
+            }
+            return
+
+        # ---------- light profile per target ----------
+        async def profile(dom):
+            info = {"domain": dom, "ns": [], "mx": [], "ips": [], "title": "", "server": "", "error": ""}
+            try:
+                resolver = dns.asyncresolver.Resolver()
+                resolver.lifetime = min(self.timeout, 8)
+                for rtype, key in (("NS", "ns"), ("MX", "mx"), ("A", "ips")):
+                    try:
+                        ans = await resolver.resolve(dom, rtype)
+                        if rtype == "NS":
+                            info[key] = sorted({str(x.target).rstrip('.').lower() for x in ans})
+                        elif rtype == "MX":
+                            info[key] = sorted({str(x.exchange).rstrip('.').lower()
+                                                for x in ans if str(x.exchange) != '.'})[:4]
+                        else:
+                            info[key] = sorted({x.address for x in ans})[:4]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                async with self.sem:
+                    r = await self.client.get(f"https://{dom}/", follow_redirects=True, timeout=12.0)
+                info["server"] = str(r.headers.get("server", ""))[:40]
+                m = re.search(r'<title[^>]*>(.*?)</title>', r.text[:200_000], re.I | re.S)
+                if m:
+                    info["title"] = m.group(1).strip()[:70]
+            except Exception:
+                try:
+                    async with self.sem:
+                        r = await self.client.get(f"http://{dom}/", follow_redirects=True, timeout=12.0)
+                    info["server"] = str(r.headers.get("server", ""))[:40]
+                    m = re.search(r'<title[^>]*>(.*?)</title>', r.text[:200_000], re.I | re.S)
+                    if m:
+                        info["title"] = m.group(1).strip()[:70]
+                except Exception as e:
+                    info["error"] = type(e).__name__
+            return info
+
+        profiles = await asyncio.gather(*[profile(d) for d in targets])
+
+        # ---------- pairwise correlation ----------
+        findings = []
+        links = []
+        for i in range(len(profiles)):
+            for j in range(i + 1, len(profiles)):
+                a, b = profiles[i], profiles[j]
+                shared = {}
+                for key, label in (("ns", "nameservers"), ("mx", "mail providers"),
+                                   ("ips", "IP addresses")):
+                    common = sorted(set(a.get(key, [])) & set(b.get(key, [])))
+                    if common:
+                        shared[label] = common
+                if a.get("server") and a.get("server") == b.get("server"):
+                    shared["server banner"] = [a["server"]]
+                if not shared:
+                    continue
+                conf = len(shared)
+                rel = ("likely same organization" if conf >= 2 or ("nameservers" in shared and "mail providers" in shared)
+                       else "shared infrastructure (verify ownership)")
+                links.append({"a": a["domain"], "b": b["domain"], "shared": shared,
+                              "relation": rel, "confidence": conf})
+                findings.append(("INFO", "Shared infrastructure",
+                                 f"{a['domain']} ↔ {b['domain']}: " +
+                                 "; ".join(f"{k}: {', '.join(v[:3])}" for k, v in shared.items()) +
+                                 f" → {rel}"))
+                if "IP addresses" in shared and conf == 1:
+                    findings.append(("LOW", "Shared hosting",
+                                     f"{a['domain']} & {b['domain']} co-hosted on {', '.join(shared['IP addresses'])} "
+                                     f"(co-tenant risk: compromise of one exposes the other)"))
+        if explicit and not links:
+            findings.append(("INFO", "No shared infra",
+                             "explicit targets share no NS/MX/IP — separate estates"))
+
+        self.results['correlation'] = {
+            "targets": profiles,
+            "auto_derived": auto,
+            "explicit": extra,
+            "links": links,
+            "findings": findings,
+        }
+
+    # ---------------------------------------------------------- Evidence / Repro Pack (-R)
+    def export_repro(self, path):
+        """Benign evidence pack: exact reproduction commands + verification steps for each
+        finding, so developers can re-verify without any exploit payload."""
+        o = self.base_url.rstrip('/')
+        lines = [
+            "# NULLVEIL — Evidence & Reproduction Pack",
+            "",
+            f"**Target:** {self.base_url}  ",
+            f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC  ",
+            f"**Version:** {__version__}",
+            "",
+            "> Every command below is a **benign request** (GET/DNS query) — the same traffic the",
+            "> scanner sent. No exploit payloads are included. Run only against systems you own",
+            "> or are authorized to test.",
+            "",
+        ]
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        sections = []
+
+        def sec(title, sev, finding_id, detail, cmds, verify):
+            sections.append((sev_rank.get(sev, 5), [
+                f"## [{sev}] {title}",
+                "",
+                f"- **ID:** {finding_id}",
+                f"- **Evidence:** {detail}",
+                "",
+                "**Reproduce:**",
+                "```bash",
+                *cmds,
+                "```",
+                "",
+                f"**Verify:** {verify}",
+                "",
+            ]))
+
+        # exposed paths / CVE probes with paths
+        for f in self.results.get('cve_findings', []):
+            sev, fid, title = f[0], f[1], f[2]
+            detail = f[3] if len(f) > 3 else ""
+            m = re.search(r'(/[^\s,\)\'"]+)', str(detail))
+            if m:
+                p = m.group(1)
+                sec(f"{title}", sev, fid, detail,
+                    [f"curl -sI {o}{p} | head -20",
+                     f"curl -s {o}{p} | head -40"],
+                    f"expected: HTTP {p} content reachable without auth → finding confirmed; "
+                    f"after fix expect 401/403/404.")
+            elif "version" in title.lower() or "Version" in title:
+                sec(f"{title}", sev, fid, detail,
+                    [f"curl -sI {o}/ | grep -iE 'server|x-powered-by|frame|generator'",
+                     f"curl -s {o}/ | grep -ioE 'ver=[0-9.]+' | head"],
+                    "banner/meta should be stripped or updated after remediation.")
+            else:
+                sec(f"{title}", sev, fid, detail,
+                    [f"curl -sI {o}/"],
+                    "re-check after remediation; finding detail above documents observed evidence.")
+        # flagged paths not already covered
+        covered = " ".join(x[1][2] for x in sections)
+        for pd in [x for x in self.results.get('paths', []) if isinstance(x, dict)][:40]:
+            if not pd.get('flagged'):
+                continue
+            pth = str(pd.get('path'))
+            if pth in covered:
+                continue
+            sec(f"Exposed path {pth} ({pd.get('type', 'sensitive')})", pd.get('severity', 'HIGH') if isinstance(pd.get('severity'), str) else 'HIGH',
+                f"path:{pth}",
+                f"HTTP {pd.get('status')} · {pd.get('size', 0)} bytes · type={pd.get('type', '?')}",
+                [f"curl -sI {o}{pth}",
+                 f"curl -s {o}{pth} | head -40"],
+                f"expected now: HTTP {pd.get('status')} → after fix: 401/403/404 with no body.")
+        # API audit
+        for f in self.results.get('api_audit_findings', []):
+            sev, fid, detail = f[0], f[1], f[2]
+            m = re.search(r'(https?://[^\s,]+|/[a-z0-9_\-/\.]+)', str(detail), re.I)
+            target = m.group(1) if m else o + "/"
+            cmds = [f"curl -sI '{target}'"]
+            if "CORS" in fid or "cors" in fid.lower():
+                cmds = [f"curl -sI -H 'Origin: https://evil.example' '{target}' | grep -i access-control"]
+            if "rate" in fid.lower() or "Rate" in fid:
+                cmds.append("for i in $(seq 1 30); do curl -s -o /dev/null -w '%{http_code}\\n' '" + target + "'; done | sort | uniq -c")
+            sec(fid, sev, f"audit:{fid}", detail, cmds,
+                "compare response headers/codes; after fix the risky condition disappears.")
+        # TLS
+        for f in self.results.get('tls_findings', []):
+            sev, fid, detail = f[0], f[1], f[2]
+            cmds = [f"openssl s_client -connect {self.domain}:443 -tls1_2 </dev/null 2>/dev/null | grep -E 'Protocol|Cipher'"]
+            if "TLS 1.0" in fid or "TLS 1.1" in fid:
+                flag = "tls1" if "1.0" in fid else "tls1_1"
+                cmds = [f"openssl s_client -connect {self.domain}:443 -{flag} </dev/null 2>&1 | head -8",
+                        f"nmap --script ssl-enum-ciphers -p 443 {self.domain} | head -30"]
+            elif "key" in fid.lower():
+                cmds = [f"echo | openssl s_client -connect {self.domain}:443 2>/dev/null | openssl x509 -noout -text | grep -E 'Public-Key|Signature Algorithm'"]
+            sec(fid, sev, f"tls:{fid}", detail, cmds,
+                "re-run the same handshake after remediation: legacy protocol/weak cipher should refuse.")
+        # DNS / email
+        for sev, msg in self.results.get('email_findings', []):
+            dig = f"dig TXT {self.domain} +short"
+            if "DMARC" in msg:
+                dig = f"dig TXT _dmarc.{self.domain} +short"
+            elif "SPF" in msg:
+                dig = dig
+            elif "DKIM" in msg:
+                dig = "dig TXT <selector>._domainkey." + self.domain + " +short"
+            sec(msg, sev, "email-auth", msg, [dig],
+                "record absent → finding confirmed; publish the record to remediate.")
+        # takeover
+        for t in self.results.get('takeover', []):
+            host = t.split(' ')[0]
+            sec("Dangling subdomain (takeover risk)", "HIGH", "ext:takeover", t,
+                [f"dig CNAME {host} +short", f"curl -sI https://{host}/ | head -10"],
+                "CNAME → unclaimed service + distinct error page → confirm with the vendor's "
+                "claim flow (authorized only).")
+        # threat intel
+        for f in self.results.get('intel', {}).get('findings', []):
+            if len(f) >= 3:
+                sec(f[1], f[0], "intel", f[2],
+                    [f"curl -s 'https://otx.alienvault.com/api/v1/indicators/domain/{self.domain}/general' | head -c 400"],
+                    "open the feed URL manually to confirm listing.")
+        # breaches
+        for f in self.results.get('breach', {}).get('findings', []):
+            if len(f) >= 3 and f[1] in ("Breach exposure", "Email in breaches"):
+                sec(f[1], f[0], "breach", f[2],
+                    ["# requires HIBP_API_KEY; then: "
+                     "curl -s -H \"hibp-api-key: $HIBP_API_KEY\" "
+                     f"'https://haveibeenpwned.com/api/v3/breaches?domain={self.domain}' | head -c 600"],
+                    "non-empty JSON array confirms breach record association.")
+        # secrets
+        for kind, where, where2 in self.results.get('secrets', [])[:15]:
+            sec(f"Exposed secret pattern ({kind})", "HIGH", "secret", f"{where} {where2}".strip()[:160],
+                [f"curl -s {o}/ | grep -ioE '.{{0,30}}({re.escape(str(kind))[:18]}).{{0,20}}' | head"],
+                "value must disappear from public responses after rotation + removal.")
+
+        if not sections:
+            lines.append("_No findings to reproduce — scan produced no issues in scope._")
+        else:
+            sections.sort(key=lambda x: x[0])
+            for _, block in sections:
+                lines.extend(block)
+        lines += [
+            "---",
+            "**Remediation triage:** fix CRITICAL/HIGH first; re-run NULLVEIL to confirm each "
+            "`Reproduce` command now returns the expected 'after fix' result.",
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+
 
 
 
@@ -2889,6 +4372,14 @@ class WebsiteRecon:
                 "cve_issues": len([f for f in self.results.get('cve_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
                 "crawled_pages": self.results.get('crawl', {}).get('pages_crawled', 0),
                 "tls_issues": len([f for f in self.results.get('tls_findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
+                "supply_issues": len([f for f in self.results.get('supply', {}).get('findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
+                "critical_assets": len(self.results.get('criticality', {}).get('assets', [])),
+                "anomaly_issues": len([f for f in self.results.get('anomaly', {}).get('findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
+                "intel_issues": len([f for f in self.results.get('intel', {}).get('findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
+                "breach_issues": len([f for f in self.results.get('breach', {}).get('findings', []) if f[0] in ('CRITICAL', 'HIGH', 'MEDIUM')]),
+                "compliance_fails": self.results.get('compliance', {}).get('total_fail', 0),
+                "attack_chains": len(self.results.get('graph', {}).get('chains', [])),
+                "correlated_targets": len(self.results.get('correlation', {}).get('links', [])),
             },
             "http": {k: v for k, v in self.scalar_results.items() if k != 'http_headers'},
             "headers": self.scalar_results.get('http_headers', {}),
@@ -2963,6 +4454,73 @@ class WebsiteRecon:
                 "certificate": self.results.get('tls_cert', {}),
                 "findings": [{"severity": s, "check": c, "detail": d}
                              for s, c, d in self.results.get('tls_findings', [])],
+            },
+            "supply_chain": {
+                "page": self.results.get('supply', {}).get('page', ''),
+                "vendors": self.results.get('supply', {}).get('vendors', []),
+                "resources": self.results.get('supply', {}).get('resources', []),
+                "third_party_exec": self.results.get('supply', {}).get('third_party_exec', 0),
+                "sri_missing": self.results.get('supply', {}).get('sri_missing', 0),
+                "unknown_sources": self.results.get('supply', {}).get('unknown_sources', []),
+                "external_form_actions": self.results.get('supply', {}).get('external_form_actions', []),
+                "preconnect": self.results.get('supply', {}).get('preconnect', []),
+                "providers": self.results.get('supply', {}).get('providers', {}),
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('supply', {}).get('findings', [])],
+            },
+            "criticality": {
+                "method": self.results.get('criticality', {}).get('method', ''),
+                "tiers": self.results.get('criticality', {}).get('tiers', {}),
+                "assets": self.results.get('criticality', {}).get('assets', []),
+            },
+            "anomaly": {
+                "probed": self.results.get('anomaly', {}).get('probed', 0),
+                "soft404": self.results.get('anomaly', {}).get('soft404', False),
+                "masked_paths": self.results.get('anomaly', {}).get('masked_paths', []),
+                "kmeans_outliers": self.results.get('anomaly', {}).get('kmeans_outliers', []),
+                "samples": self.results.get('anomaly', {}).get('samples', []),
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('anomaly', {}).get('findings', [])],
+            },
+            "threat_intel": {
+                "ips": self.results.get('intel', {}).get('ips', []),
+                "sources": self.results.get('intel', {}).get('sources', []),
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('intel', {}).get('findings', [])],
+            },
+            "breach": {
+                "key_present": self.results.get('breach', {}).get('key_present', False),
+                "provider": self.results.get('breach', {}).get('provider', ''),
+                "checks": self.results.get('breach', {}).get('checks', []),
+                "breaches": self.results.get('breach', {}).get('breaches', []),
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('breach', {}).get('findings', [])],
+            },
+            "compliance": {
+                "coverage_pct": self.results.get('compliance', {}).get('coverage_pct', 0),
+                "total_controls": self.results.get('compliance', {}).get('total_controls', 0),
+                "total_fail": self.results.get('compliance', {}).get('total_fail', 0),
+                "frameworks": self.results.get('compliance', {}).get('frameworks', {}),
+                "disclaimer": self.results.get('compliance', {}).get('disclaimer', ''),
+            },
+            "attack_graph": {
+                "node_count": self.results.get('graph', {}).get('node_count', 0),
+                "edge_count": self.results.get('graph', {}).get('edge_count', 0),
+                "nodes": self.results.get('graph', {}).get('nodes', []),
+                "edges": self.results.get('graph', {}).get('edges', []),
+                "facts": self.results.get('graph', {}).get('facts', {}),
+                "attack_paths": self.results.get('graph', {}).get('attack_paths', []),
+                "chains": self.results.get('graph', {}).get('chains', []),
+                "dot_exported": self.results.get('graph', {}).get('dot_exported', False),
+            },
+            "correlation": {
+                "targets": self.results.get('correlation', {}).get('targets', []),
+                "auto_derived": self.results.get('correlation', {}).get('auto_derived', []),
+                "explicit": self.results.get('correlation', {}).get('explicit', []),
+                "links": self.results.get('correlation', {}).get('links', []),
+                "note": self.results.get('correlation', {}).get('note', ''),
+                "findings": [{"severity": s, "check": c, "detail": d}
+                             for s, c, d in self.results.get('correlation', {}).get('findings', [])],
             },
             "errors": self.results['errors'],
         }
@@ -3220,6 +4778,131 @@ class WebsiteRecon:
             parts.append(sec("Tech Stack",
                              "<div class='chips'>" + "".join(f"<span class='chip purple'>{_e(t)}</span>" for t in tech) + "</div>",
                              "#8b5cf6"))
+
+        # ===== v3.0.0 new sections =====
+        # Supply Chain / Third-Party Risk
+        sup = d.get('supply_chain', {})
+        if sup:
+            vend = sup.get('vendors', [])
+            if vend:
+                parts.append(sec("Supply Chain Vendors",
+                                 tbl(["Vendor", "Category", "Resources", "SRI Missing", "Note"],
+                                     [[_e(v['name']), _e(v['category']), v['count'], v['sri_missing'], _e(v['note'][:70])]
+                                      for v in vend[:30]]), "#f97316"))
+            ext_f = sup.get('findings', [])
+            if ext_f:
+                parts.append(sec("Supply Chain Findings",
+                                 tbl(["Severity", "Check", "Detail"],
+                                     [[f"<span class='chip {'red' if f['severity'] in ('CRITICAL','HIGH') else ('yellow' if f['severity'] in ('MEDIUM','LOW') else 'green')}'>{_e(f['severity'])}</span>",
+                                       _e(f['check']), _e(f['detail'])] for f in ext_f[:50]]), "#f97316"))
+        # Criticality
+        crit = d.get('criticality', {})
+        if crit:
+            tiers = crit.get('tiers', {})
+            tchips = "".join(f"<span class='chip {'red' if k in ('CRITICAL','HIGH') else 'yellow'}'>{k}: {v}</span>"
+                             for k, v in tiers.items() if v)
+            if tchips:
+                parts.append(sec("Criticality Tier Summary", f"<div class='chips'>{tchips}</div>", "#eab308"))
+            assets = crit.get('assets', [])
+            if assets:
+                parts.append(sec("Criticality Classification",
+                                 tbl(["Asset", "Type", "Score", "Tier", "Reasons"],
+                                     [[_e(str(a['asset'])[:80]), _e(a['type']), a['score'],
+                                       f"<span class='chip {'red' if a['tier'] in ('CRITICAL','HIGH') else 'yellow'}'>{_e(a['tier'])}</span>",
+                                       _e(', '.join(a['reasons'])[:80])] for a in assets[:60]]), "#eab308"))
+        # Anomaly Detection
+        anom = d.get('anomaly', {})
+        if anom:
+            sm = anom.get('samples', [])
+            if sm:
+                parts.append(sec(f"Response Samples ({anom.get('probed', len(sm))} probed)",
+                                 tbl(["Path", "Status", "Size", "Latency ms", "Hash", "Title"],
+                                     [[_e(str(x['path'])[:60]), x['status'], x['size'], x['latency_ms'], _e(x['hash']), _e(x['title'][:40])]
+                                      for x in sm[:60]]), "#8b5cf6"))
+            af = anom.get('findings', [])
+            if af:
+                parts.append(sec("Anomaly Findings",
+                                 tbl(["Severity", "Check", "Detail"],
+                                     [[f"<span class='chip {'red' if f['severity'] in ('CRITICAL','HIGH') else ('yellow' if f['severity'] in ('MEDIUM','LOW') else 'green')}'>{_e(f['severity'])}</span>",
+                                       _e(f['check']), _e(f['detail'])] for f in af[:40]]), "#8b5cf6"))
+        # Threat Intel
+        ti = d.get('threat_intel', {})
+        if ti:
+            srcs = ti.get('sources', [])
+            if srcs:
+                parts.append(sec("Threat Intel Sources",
+                                 tbl(["Source", "Target", "Status", "Detail"],
+                                     [[_e(s['source']), _e(s['target'][:40]),
+                                       f"<span class='chip {'red' if s['status']=='listed' else ('green' if s['status']=='clean' else 'yellow')}'>{_e(s['status'])}</span>",
+                                       _e(s['detail'][:90])] for s in srcs[:40]]), "#ef4444"))
+        # Breach
+        br = d.get('breach', {})
+        if br:
+            checks = br.get('checks', [])
+            brk = br.get('breaches', [])
+            rows = [[_e(str(c.get('check'))), _e(str(c.get('status'))), _e(str(c.get('detail'))[:120])] for c in checks]
+            rows += [[_e(str(b.get('name',''))), "BREACHED", _e(f"{b.get('date','')} · {b.get('pwn_count',0)} accounts · {', '.join(b.get('classes', []))[:80]}")] for b in brk]
+            if rows:
+                parts.append(sec("Breach / Credential Monitoring",
+                                 tbl(["Check", "Status", "Detail"], rows), "#ef4444"))
+        # Compliance
+        comp = d.get('compliance', {})
+        if comp:
+            cov = comp.get('coverage_pct', 0)
+            tf = comp.get('total_controls', 0)
+            nf = comp.get('total_fail', 0)
+            parts.append(sec("Compliance Coverage",
+                             f"<div class='chips'>"
+                             f"<span class='chip {'green' if cov>=80 else 'yellow' if cov>=50 else 'red'}'>Coverage: {cov}%</span>"
+                             f"<span class='chip green'>Pass: {cov}</span>"
+                             f"<span class='chip red'>Fail: {nf}</span>"
+                             f"<span class='chip yellow'>Controls: {tf}</span></div>"
+                             f"<p class='muted'>{_e(comp.get('disclaimer', ''))}</p>", "#3b82f6"))
+            fw = comp.get('frameworks', {})
+            for fname, fv in fw.items():
+                ctrls = fv.get('controls', [])
+                if ctrls:
+                    parts.append(sec(f"Compliance: {fname}",
+                                     tbl(["Ref", "Title", "Status", "Evidence"],
+                                         [[_e(str(c['ref'])), _e(str(c['title'])[:80]),
+                                           f"<span class='chip {'green' if c['status']=='PASS' else 'red' if c['status']=='FAIL' else 'yellow'}'>{_e(c['status'])}</span>",
+                                           _e(str(c['evidence'])[:120])] for c in ctrls[:40]]), "#3b82f6"))
+        # Attack Graph
+        ag = d.get('attack_graph', {})
+        if ag:
+            ap = ag.get('attack_paths', [])
+            if ap:
+                rows = [[p['severity'], " → ".join(_e(str(h)) for h in p['hops'])[:140]] for p in ap[:20]]
+                parts.append(sec("Attack Paths",
+                                 tbl(["Severity", "Path"], rows), "#ef4444"))
+            ch = ag.get('chains', [])
+            if ch:
+                for c in ch[:20]:
+                    steps = "<ol>" + "".join(f"<li>{_e(s)}</li>" for s in c['steps']) + "</ol>"
+                    parts.append(sec(f"Chain: {c['title']} (confidence: {c['confidence']})",
+                                     steps + f"<p><strong>Impact:</strong> {_e(c['impact'])}</p>", "#ef4444"))
+            dot = ag.get('dot_exported')
+            if dot:
+                parts.append(sec("Graph Export", "<p class='muted'>DOT file exported (--dot flag)</p>", "#64748b"))
+        # Correlation
+        corr = d.get('correlation', {})
+        if corr:
+            tgts = corr.get('targets', [])
+            if tgts:
+                parts.append(sec("Correlated Targets",
+                                 tbl(["Domain", "NS", "MX", "IPs", "Title", "Server"],
+                                     [[_e(str(t['domain'])), _e(', '.join(t.get('ns', []))[:60]),
+                                       _e(', '.join(t.get('mx', []))[:50]),
+                                       _e(', '.join(t.get('ips', []))[:50]),
+                                       _e(str(t.get('title', ''))[:40]), _e(str(t.get('server', ''))[:30])]
+                                      for t in tgts]), "#8b5cf6"))
+            links = corr.get('links', [])
+            if links:
+                rows = [[_e(l['a']), _e(l['b']),
+                         _e('; '.join(f"{k}: {', '.join(v)}" for k, v in l['shared'].items())[:100]),
+                         _e(l['relation'])] for l in links]
+                parts.append(sec("Correlation Matrix",
+                                 tbl(["A", "B", "Shared", "Relation"], rows), "#8b5cf6"))
         # Errors
         errs = d.get('errors', [])
         if errs:
@@ -3310,6 +4993,11 @@ def main():
                "  nullveil https://site.com --deep -o report.json\n"
                "  nullveil example.com -H report.html -> standalone HTML report\n"
                "  nullveil example.com -w mysubs.txt  -> custom subdomain wordlist\n"
+               "  nullveil example.com -a supply,graph,comp -> supply chain + attack graph + compliance\n"
+               "  nullveil example.com -R repro.md    -> evidence/repro pack (benign, no payloads)\n"
+               "  nullveil example.com --dot graph.dot -> export attack path graph as DOT\n"
+               "  nullveil example.com --correlate a.com,b.com -> cross-org correlation\n"
+               "  HIBP_API_KEY=xxx nullveil example.com -a breach -> breach monitoring\n"
                "  nullveil -l                         -> list attack modules\n\n"
                "Owner: NULLVEIL | Use only on authorized targets."
     )
@@ -3323,9 +5011,13 @@ def main():
     parser.add_argument("-p", "--ports", type=str, help="Custom comma-separated ports (e.g. 80,443,8080)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Less console output")
     parser.add_argument("-a", "--attack", metavar="LIST", default=None,
-                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls or 'all'")
+                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate or 'all'")
     parser.add_argument("-m", "--menu", action="store_true", help="Interactive attack selection menu")
     parser.add_argument("-l", "--list-attacks", action="store_true", help="List available attack modules")
+    parser.add_argument("-R", "--repro", metavar="FILE", help="Export evidence/reproduction pack (benign, no exploit payloads) to markdown file")
+    parser.add_argument("--correlate", metavar="LIST", default=None, help="Comma-separated extra domains for cross-org correlation (e.g. a.com,b.com)")
+    parser.add_argument("--hibp-key", metavar="KEY", default=None, help="HaveIBeenPwned API key (optional; also via HIBP_API_KEY env)")
+    parser.add_argument("--dot", metavar="FILE", default=None, help="Export Attack Path Graph as DOT file")
     parser.add_argument("-V", "--version", action="version", version=f"NULLVEIL Recon v{__version__} | Owner: NULLVEIL | Engine: DeepHat")
     args = parser.parse_args()
 
@@ -3374,6 +5066,16 @@ def main():
         wordlist=args.wordlist,
     )
     recon.attack_set = attack_indices
+    if args.hibp_key:
+        os.environ.setdefault('HIBP_API_KEY', args.hibp_key)
+    try:
+        recon.correlate_list = args.correlate
+    except Exception:
+        pass
+    try:
+        recon.dot_path = args.dot
+    except Exception:
+        pass
 
     try:
         report = asyncio.run(recon.run())
@@ -3395,6 +5097,13 @@ def main():
             console.print(f"[bold green]HTML report saved:[/] {args.html}")
         except Exception as e:
             console.print(f"[bold red]Could not save HTML report:[/] {e}")
+
+    try:
+        if getattr(args, 'repro', None):
+            outp = recon.export_repro(args.repro)
+            console.print(f"[bold green]Repro pack saved:[/] {outp}")
+    except Exception as e:
+        console.print(f"[bold red]Failed to export repro:[/] {type(e).__name__} — {e}")
 
 
 if __name__ == "__main__":
