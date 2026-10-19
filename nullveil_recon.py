@@ -770,7 +770,23 @@ class WebsiteRecon:
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                    f"(KHTML, like Gecko) Chrome/124.0 Safari/537.36 NULLVEIL-Recon/{__version__}"}
         )
-        self.sem = asyncio.Semaphore(concurrency)
+        self.sem = None
+        try:
+            self.sem = asyncio.Semaphore(concurrency)
+        except RuntimeError:
+            # Python 3.9 requires a running event loop to construct a Semaphore
+            # (3.10+ binds lazily). Defer creation to the first run() inside a loop.
+            self._sem_concurrency = concurrency
+
+    def _ensure_sem(self):
+        """Bind the concurrency semaphore to the current event loop if needed.
+
+        On Python 3.9 ``asyncio.Semaphore()`` cannot be constructed without a
+        running loop, so it is created lazily here — called from ``run()`` where
+        a loop is guaranteed."""
+        if self.sem is None:
+            self.sem = asyncio.Semaphore(
+                getattr(self, "_sem_concurrency", self.concurrency))
 
     # ---------------------------------------------------------- run
     async def run(self):
@@ -786,6 +802,7 @@ class WebsiteRecon:
             self._build_transport()
         except Exception:
             pass
+        self._ensure_sem()
         # ---------- resume support: hydrate from previous scan, run only missing modules ----------
         resume_note = ""
         entry = getattr(self, "resume_entry", None)
