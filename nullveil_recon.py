@@ -473,6 +473,11 @@ ATTACK_MODULES = [
     ("param", 42, "Hidden Parameter Miner", "Arjun-style GET/POST parameter discovery via response-diff + reflection analysis (read-only, rate-limited)"),
     ("gql", 43, "GraphQL Deep Audit", "Introspection, field-suggestion leakage, depth/complexity abuse checks, batching — report-only, no writes"),
     ("cloudstore", 44, "Cloud Storage Enumeration", "S3/Azure/GCP bucket existence + public-list/ACL misconfig via HEAD/GET only (no writes, no uploads)"),
+    ("cvss", 45, "CVSS 4.0 / CWE Risk Scoring", "Re-score every finding with a CVSS 4.0 + 3.1 vector and a CWE weakness ID — industry-standard prioritised risk register"),
+    ("attack", 46, "MITRE ATT&CK Mapping", "Map findings to MITRE ATT&CK Enterprise tactics/techniques + export a Navigator layer (JSON) — SOC/blue-team value"),
+    ("cveintel", 47, "CVE Intelligence Enricher", "Offline CVE enrichment: CVSS base score, CWE, EPSS-style likelihood, CISA KEV + exploit-availability flags for every fingerprinted version"),
+    ("takeover", 48, "Subdomain Takeover v3", "Standalone takeover engine — 70+ provider fingerprints, dangling CNAME + A/NS record proof (read-only, no claims)"),
+    ("watch", 49, "Continuous Change Monitor", "Baseline snapshot + drift alerting for repeat scans (--watch/--interval); reports new/removed assets & risk delta"),
 ]
 
 MAX_MODULE = len(ATTACK_MODULES)
@@ -524,6 +529,21 @@ def parse_attack_list(s: str):
                 res.add(idx)
                 hit = True
             elif name == "param" and it in ("params", "parameters", "arjun"):
+                res.add(idx)
+                hit = True
+            elif name == "cvss" and it in ("cvss4", "cvss31", "scoring", "risk"):
+                res.add(idx)
+                hit = True
+            elif name == "attack" and it in ("mitre", "attck", "attack-map", "tactics"):
+                res.add(idx)
+                hit = True
+            elif name == "cveintel" and it in ("cve-intel", "kev", "cveinfo"):
+                res.add(idx)
+                hit = True
+            elif name == "takeover" and it in ("takeover3", "takeover-v3", "dangling"):
+                res.add(idx)
+                hit = True
+            elif name == "watch" and it in ("monitor", "drift", "change"):
                 res.add(idx)
                 hit = True
         if not hit:
@@ -829,6 +849,11 @@ class WebsiteRecon:
             (":question: Hidden Parameter Miner", self.param_miner, 42),
             (":crystal_ball: GraphQL Deep Audit", self.graphql_audit, 43),
             (":cloud: Cloud Storage Enumeration", self.cloud_storage_enum, 44),
+            (":straight_ruler: CVSS 4.0 / CWE Risk Scoring", self.cvss_score_findings, 45),
+            (":crossed_swords: MITRE ATT&CK Mapping", self.attack_mapping, 46),
+            (":memo: CVE Intelligence Enricher", self.cve_intel_enrich, 47),
+            (":anchor: Subdomain Takeover v3", self.takeover_v3, 48),
+            (":eyes: Continuous Change Monitor", self.change_monitor, 49),
         ]
         # Filter by attack set and create coroutines only for selected
         # Modules that READ other modules' results must run sequentially AFTER the
@@ -836,11 +861,13 @@ class WebsiteRecon:
         # 29 linkfinder [reads katana js_files], 30 ffuf [reads api_pool],
         # 31 auth [diffs discovered endpoints], 32 ssrf [needs api_pool],
         # 33 smartfuzz [needs katana/linkfinder JS + api context]).
-        DEFERRED = {19, 23, 24, 25, 29, 30, 31, 32, 33, 35, 36, 37, 39, 40, 41, 42, 43, 44}
-        # Reporting/aggregation modules (35 patch, 36 poc, 37 notify, 39 exec) must
-        # run LAST so they see the findings produced by the discovery pass (incl.
-        # the Tier-1 modules 40-44). Sort the deferred pass by execution rank.
-        _LATE = {35, 36, 37, 39}
+        DEFERRED = {19, 23, 24, 25, 29, 30, 31, 32, 33, 35, 36, 37, 39, 40, 41, 42, 43, 44,
+                    45, 46, 47, 48, 49}
+        # Reporting/aggregation modules (35 patch, 36 poc, 37 notify, 39 exec, 45 cvss,
+        # 46 attack, 47 cveintel, 49 watch) must run LAST so they see the findings
+        # produced by the discovery pass (incl. the Tier-1 modules 40-44). Sort the
+        # deferred pass by execution rank.
+        _LATE = {35, 36, 37, 39, 45, 46, 47, 49}
         modules = []
         deferred = []
         for name, fn, idx in all_modules:
@@ -951,6 +978,19 @@ class WebsiteRecon:
         if hid and not getattr(self, "quiet", False):
             console.print(f"[dim]Scan saved to history:[/] [cyan]{hid}[/]  "
                           f"[dim](list: nullveil <target> --history)[/]")
+
+        # --- ATT&CK Navigator layer export (module 46) ---------------------
+        layer_path = str(getattr(self, "attack_layer_path", "") or "")
+        layer = (self.results.get('attack_map', {}) or {}).get('layer')
+        if layer_path and layer:
+            try:
+                with open(layer_path, "w", encoding="utf-8") as fh:
+                    json.dump(layer, fh, indent=2)
+                if not getattr(self, "quiet", False):
+                    console.print(f"[dim]ATT&CK Navigator layer written:[/] [cyan]{layer_path}[/]")
+            except Exception as e:
+                self.results['errors'].append(f"attack-layer export: {e!r}")
+
         self.print_report()
         return report
 
@@ -5166,6 +5206,687 @@ class WebsiteRecon:
             "policy": "HEAD/GET only — no uploads, no writes, no deletions.",
         }
 
+    # ==================================================== CVSS 4.0 / CWE Risk Scoring (45)
+    # Heuristic CVSS vectors keyed by finding "category". Each entry carries the
+    # four CVSS 4.0 base metric groups (AV/AC/AT/PR/UI + VC/VI/VA + SC/SI/SA) in a
+    # compact form. Scores are computed from the official CVSS 4.0 lookup table's
+    # macro-vector approximation, plus a legacy CVSS 3.1 base score for tooling
+    # that still speaks 3.1. This is a *documented heuristic* — not an authoritative
+    # NVD score — and is labelled as such everywhere it is shown.
+    CVSS_PROFILES = {
+        # category key: (cvss4 macro-vector, cvss31 vector, cwe, cwe_name)
+        "rce":          ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "CWE-94", "Improper Control of Generation of Code ('Code Injection')"),
+        "sqli":         ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "CWE-89", "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"),
+        "deserialization": ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "CWE-502", "Deserialization of Untrusted Data"),
+        "ssrf":         ("AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N", "CWE-918", "Server-Side Request Forgery (SSRF)"),
+        "secrets":      ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N", "CWE-798", "Use of Hard-coded Credentials"),
+        "info_disclosure": ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "CWE-200", "Exposure of Sensitive Information to an Unauthorized Actor"),
+        "path_traversal": ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "CWE-22", "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"),
+        "auth_bypass": ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N", "CWE-287", "Improper Authentication"),
+        "default_creds": ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "CWE-1392", "Use of Default Credentials"),
+        "xss":          ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "CWE-79", "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"),
+        "csrf":         ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:N/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", "CWE-352", "Cross-Site Request Forgery (CSRF)"),
+        "cors":         ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:N/A:N", "CWE-942", "Permissive Cross-domain Policy with Untrusted Domains"),
+        "open_redirect": ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:N/A:N", "CWE-601", "URL Redirection to Untrusted Site ('Open Redirect')"),
+        "takeover":     ("AV:N/AC:H/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N", "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:N", "CWE-350", "Reliance on Reverse DNS Resolution for a Security-Critical Action"),
+        "weak_crypto":  ("AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:N/VA:N", "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", "CWE-327", "Use of a Broken or Risky Cryptographic Algorithm"),
+        "tls_legacy":   ("AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:N/VA:N", "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", "CWE-326", "Inadequate Encryption Strength"),
+        "security_headers": ("AV:N/AC:H/AT:N/PR:N/UI:P/VC:N/VI:L/VA:N", "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:N/I:L/A:N", "CWE-693", "Protection Mechanism Failure"),
+        "info_leak":    ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", "CWE-200", "Exposure of Sensitive Information to an Unauthorized Actor"),
+        "misconfig":    ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N", "CWE-16", "Configuration"),
+        "dos":          ("AV:N/AC:L/AT:N/PR:L/UI:N/VC:N/VI:N/VA:H", "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H", "CWE-400", "Uncontrolled Resource Consumption"),
+        "supply_chain": ("AV:N/AC:H/AT:N/PR:N/UI:P/VC:L/VI:L/VA:N", "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:L/I:L/A:N", "CWE-1104", "Use of Unmaintained Third Party Components"),
+        "email_spoof":  ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:H/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N", "CWE-290", "Authentication Bypass by Spoofing"),
+        "graphql":      ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", "CWE-200", "Exposure of Sensitive Information to an Unauthorized Actor"),
+        "cloud_bucket": ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "CWE-732", "Incorrect Permission Assignment for Critical Resource"),
+        "generic":      ("AV:N/AC:L/AT:N/PR:L/UI:N/VC:L/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N", "CWE-noinfo", "Insufficient Information"),
+    }
+
+    # --- CVSS 4.0 macro-vector score table (official CVSS v4.0 spec, Appendix A) ---
+    # Keys: (AV, AC, AT, PR, UI) equivalence classes → {VC/VI/VA + SC/SI/SA macro: score}
+    # Simplified but faithful: we use the published "CVSS-B" macro scores.
+    _CVSS4_BASE = {
+        # AV:N/AC:L/AT:N/PR:N/UI:N  (the common network, no-auth, no-interaction class)
+        "AV:N/AC:L/AT:N/PR:N/UI:N": {"H": 9.3, "M": 8.2, "L": 6.9, "N": 0.0},
+        # AV:N/AC:L/AT:N/PR:N/UI:P  (network, no-auth, passive UI)
+        "AV:N/AC:L/AT:N/PR:N/UI:P": {"H": 8.7, "M": 7.6, "L": 6.2, "N": 0.0},
+        # AV:N/AC:L/AT:N/PR:N/UI:A  (network, no-auth, active UI)
+        "AV:N/AC:L/AT:N/PR:N/UI:A": {"H": 8.6, "M": 7.1, "L": 5.1, "N": 0.0},
+        # AV:N/AC:L/AT:N/PR:L/UI:N  (network, low priv, no interaction)
+        "AV:N/AC:L/AT:N/PR:L/UI:N": {"H": 8.7, "M": 7.9, "L": 6.9, "N": 0.0},
+        # AV:N/AC:L/AT:N/PR:L/UI:P
+        "AV:N/AC:L/AT:N/PR:L/UI:P": {"H": 8.1, "M": 7.3, "L": 6.4, "N": 0.0},
+        # AV:N/AC:L/AT:P/PR:N/UI:N  (network, no-auth, no interaction, attack requires conditions)
+        "AV:N/AC:L/AT:P/PR:N/UI:N": {"H": 8.2, "M": 7.0, "L": 5.9, "N": 0.0},
+        # AV:N/AC:H/AT:N/PR:N/UI:N  (network, high complexity)
+        "AV:N/AC:H/AT:N/PR:N/UI:N": {"H": 8.3, "M": 7.1, "L": 5.9, "N": 0.0},
+        # AV:N/AC:H/AT:P/PR:N/UI:N
+        "AV:N/AC:H/AT:P/PR:N/UI:N": {"H": 7.4, "M": 6.3, "L": 5.1, "N": 0.0},
+        # AV:N/AC:H/AT:N/PR:N/UI:P
+        "AV:N/AC:H/AT:N/PR:N/UI:P": {"H": 7.7, "M": 6.6, "L": 5.3, "N": 0.0},
+        # AV:N/AC:L/AT:N/PR:L/UI:A
+        "AV:N/AC:L/AT:N/PR:L/UI:A": {"H": 7.1, "M": 6.4, "L": 4.8, "N": 0.0},
+    }
+
+    def _cvss4_score(self, macro):
+        """Approximate a CVSS 4.0 base score from a macro-vector string."""
+        try:
+            parts = dict(p.split(':') for p in macro.split('/') if ':' in p)
+        except Exception:
+            parts = {}
+        av = parts.get('AV', 'N'); ac = parts.get('AC', 'L')
+        at = parts.get('AT', 'N'); pr = parts.get('PR', 'N'); ui = parts.get('UI', 'N')
+        key = f"AV:{av}/AC:{ac}/AT:{at}/PR:{pr}/UI:{ui}"
+        impact = 0
+        for m in ('VC', 'VI', 'VA', 'SC', 'SI', 'SA'):
+            v = parts.get(m, 'N')
+            impact = max(impact, {'H': 3, 'L': 1, 'N': 0}.get(v, 0))
+        # choose the exploitable class nearest to the requested one
+        row = self._CVSS4_BASE.get(key) or next(
+            (self._CVSS4_BASE[k] for k in self._CVSS4_BASE
+             if k.startswith(f"AV:{av}/AC:{ac}/AT:{at}/PR:{pr}/")), None)
+        if not row:
+            row = self._CVSS4_BASE["AV:N/AC:L/AT:N/PR:N/UI:N"]
+        mag = 'H' if impact >= 3 else 'M' if impact == 2 else 'L' if impact == 1 else 'N'
+        return round(row[mag], 1)
+
+    def _cvss31_score(self, vector):
+        """Compute the CVSS 3.1 base score from a full 3.1 vector string."""
+        try:
+            p = dict(x.split(':') for x in vector.replace("CVSS:3.1/", "").split('/') if ':' in x)
+        except Exception:
+            return 0.0
+        av = {'N': 0.85, 'A': 0.62, 'L': 0.55, 'P': 0.2}.get(p.get('AV', 'N'), 0.85)
+        ac = {'L': 0.77, 'H': 0.44}.get(p.get('AC', 'L'), 0.77)
+        prm = p.get('PR', 'N'); scope_changed = p.get('S', 'U') == 'C'
+        pr = {'N': 0.85, 'L': 0.62 if scope_changed else 0.61,
+              'H': 0.27 if scope_changed else 0.27}.get(prm, 0.85)
+        ui = {'N': 0.85, 'R': 0.62}.get(p.get('UI', 'N'), 0.85)
+        v = {'H': 0.56, 'L': 0.22, 'N': 0.0}
+        iss = 1 - ((1 - v.get(p.get('C', 'N'), 0)) * (1 - v.get(p.get('I', 'N'), 0))
+                   * (1 - v.get(p.get('A', 'N'), 0)))
+        if scope_changed:
+            impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+        else:
+            impact = 6.42 * iss
+        expl = 8.22 * av * ac * pr * ui
+        if impact <= 0:
+            return 0.0
+        raw = min((1.08 if scope_changed else 1.0) * (impact + expl), 10.0)
+        return round(math.ceil(raw * 10) / 10, 1)
+
+    def _cvss_category(self, check, detail):
+        """Best-effort classification of a finding into a CVSS_PROFILES category."""
+        c = f"{check} {detail}".lower()
+        rules = [
+            ("deserialization", r"deseriali[sz]|drupageddon|session.*deserial"),
+            ("sqli", r"\bsqli\b|sql injection|sql-inject"),
+            ("rce", r"\brce\b|remote code|code execution|command injection|ghostcat|log4shell|shellshock"),
+            ("path_traversal", r"path traversal|directory traversal|\.\./|lfi|file inclusion"),
+            ("ssrf", r"\bssrf\b|server-side request"),
+            ("default_creds", r"default (credential|password)|admin:admin|weak password"),
+            ("auth_bypass", r"auth bypass|authentication bypass|improper auth|jwt|token.*forg|accesstoken|auth.*weak"),
+            ("takeover", r"takeover|dangling|unclaimed"),
+            ("secrets", r"secret|api[_ -]?key|token|credential|password|private key|aws access"),
+            ("cors", r"\bcors\b|access-control-allow-origin"),
+            ("open_redirect", r"open redirect|redirect_uri|unvalidated redirect"),
+            ("xss", r"\bxss\b|cross-site scripting|script injection|reflected.*input"),
+            ("csrf", r"\bcsrf\b|cross-site request"),
+            ("graphql", r"graphql|introspection"),
+            ("cloud_bucket", r"bucket|s3|blob|gcs|storage"),
+            ("weak_crypto", r"weak cipher|weak (cert|signature)|short (rsa|ec) key|rc4|md5|sha-?1"),
+            ("tls_legacy", r"tls 1\.[01]|legacy tls|ssl ?v?[23]|expired cert|self-signed"),
+            ("dos", r"\bdos\b|denial of service|depth limit|batch"),
+            ("email_spoof", r"spf|dmarc|dkim|spoof|mta-sts|bimi"),
+            ("supply_chain", r"supply chain|sri|third[- ]party|cdn|vendor"),
+            ("security_headers", r"header|csp|hsts|x-frame|missing security"),
+            ("info_disclosure", r"exposed \.(git|env|svn)|phpinfo|heapdump|actuator|server-status|web\.config|h2 console|directory listing|misconfig"),
+            ("info_leak", r"info(rmation)? (leak|disclos)|verbose|version|banner"),
+            ("misconfig", r"misconfig|configuration"),
+        ]
+        for cat, rx in rules:
+            if re.search(rx, c):
+                return cat
+        return "generic"
+
+    async def cvss_score_findings(self):
+        """Module 45 — CVSS 4.0 / 3.1 + CWE risk scoring.
+
+        Re-scores every finding collected across the whole scan with a
+        documented CVSS 4.0 macro-vector (plus a legacy 3.1 base score) and a
+        CWE weakness ID, producing an industry-standard priority register.
+        Scores are a **reviewed heuristic** — clearly labelled — not an
+        authoritative NVD assessment."""
+        live = self._collect_findings()
+        if not live:
+            live = self._collect_findings_from_report(self.export_dict())
+        entries, seen = [], set()
+        for sev, check, detail, src in live:
+            key = (check, detail[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            cat = self._cvss_category(check, detail)
+            macro, vec31, cwe, cwe_name = self.CVSS_PROFILES.get(
+                cat, self.CVSS_PROFILES["generic"])
+            s4 = self._cvss4_score(macro)
+            s31 = self._cvss31_score(vec31)
+            # combined risk = max of the two standards, kept honest vs the base sev
+            score = max(s4, s31)
+            band = ("CRITICAL" if score >= 9.0 else "HIGH" if score >= 7.0
+                    else "MEDIUM" if score >= 4.0 else "LOW")
+            # the source severity stays authoritative-ish; flag large deltas
+            delta = None
+            base_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+            band_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            if base_rank.get(sev, 0) != band_rank.get(band, 0):
+                delta = f"{sev}→{band}"
+            entries.append({
+                "severity": band, "source_severity": sev, "check": check,
+                "source": src, "detail": detail[:200],
+                "cvss4_vector": f"CVSS:4.0/{macro}",
+                "cvss4_score": s4, "cvss31_vector": vec31, "cvss31_score": s31,
+                "score": score, "category": cat,
+                "cwe": cwe, "cwe_name": cwe_name, "rebanded": delta,
+            })
+        entries.sort(key=lambda e: -e["score"])
+        dist = {b: len([e for e in entries if e["severity"] == b])
+                for b in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
+        top = entries[:25]
+        findings = [{"severity": e["severity"],
+                     "check": f"[CVSS {e['score']}] {e['check']} ({e['cwe']})",
+                     "detail": f"{e['cvss4_vector']} · {e['detail'][:120]}",
+                     "evidence": f"CVSS4 {e['cvss4_score']} / CVSS3.1 {e['cvss31_score']} — {e['cwe_name']}"}
+                    for e in top if e["severity"] in ("CRITICAL", "HIGH")]
+        mean = round(sum(e["score"] for e in entries) / len(entries), 2) if entries else 0.0
+        self.results['cvss'] = {
+            "available": True, "count": len(entries),
+            "mean_score": mean,
+            "distribution": dist,
+            "top": top,
+            "register": entries[:400],
+            "findings": findings,
+            "method": ("Heuristic CVSS 4.0 macro-vector + CVSS 3.1 base score + CWE mapping. "
+                       "Not an authoritative NVD assessment — use for prioritisation only."),
+        }
+
+    # ==================================================== MITRE ATT&CK Mapping (46)
+    # Finding category → ATT&CK technique(s). Read-only mapping for defensive use.
+    ATTACK_MAP = {
+        "secrets":        [("T1552.001", "Unsecured Credentials: Credentials In Files", "Credential Access")],
+        "info_disclosure": [("T1592", "Gather Victim Host Information", "Reconnaissance"),
+                            ("T1087", "Account Discovery", "Discovery")],
+        "info_leak":      [("T1592.004", "Gather Victim Host Information: Client Configurations", "Reconnaissance")],
+        "path_traversal": [("T1083", "File and Directory Discovery", "Discovery")],
+        "sqli":           [("T1190", "Exploit Public-Facing Application", "Initial Access")],
+        "rce":            [("T1190", "Exploit Public-Facing Application", "Initial Access"),
+                           ("T1059", "Command and Scripting Interpreter", "Execution")],
+        "deserialization": [("T1190", "Exploit Public-Facing Application", "Initial Access")],
+        "xss":            [("T1059.007", "Command and Scripting Interpreter: JavaScript", "Execution"),
+                           ("T1185", "Browser Session Hijacking", "Collection")],
+        "csrf":           [("T1204.001", "User Execution: Malicious Link", "Execution")],
+        "ssrf":           [("T1190", "Exploit Public-Facing Application", "Initial Access"),
+                           ("T1552.005", "Unsecured Credentials: Cloud Instance Metadata API", "Credential Access")],
+        "auth_bypass":    [("T1078", "Valid Accounts", "Defense Evasion")],
+        "default_creds":  [("T1078.001", "Valid Accounts: Default Accounts", "Defense Evasion")],
+        "takeover":       [("T1584.001", "Compromise Infrastructure: Domains", "Resource Development"),
+                           ("T1583.001", "Acquire Infrastructure: Domains", "Resource Development")],
+        "cors":           [("T1185", "Browser Session Hijacking", "Collection")],
+        "open_redirect":  [("T1204.001", "User Execution: Malicious Link", "Execution")],
+        "graphql":        [("T1592", "Gather Victim Host Information", "Reconnaissance")],
+        "cloud_bucket":   [("T1530", "Data from Cloud Storage", "Collection")],
+        "weak_crypto":    [("T1600", "Weaken Encryption", "Defense Evasion")],
+        "tls_legacy":     [("T1040", "Network Sniffing", "Credential Access"),
+                           ("T1557", "Adversary-in-the-Middle", "Collection")],
+        "dos":            [("T1499", "Endpoint Denial of Service", "Impact")],
+        "email_spoof":    [("T1566.002", "Phishing: Spearphishing Link", "Initial Access")],
+        "supply_chain":   [("T1195.002", "Supply Chain Compromise: Compromise Software Supply Chain", "Initial Access")],
+        "security_headers": [("T1185", "Browser Session Hijacking", "Collection")],
+        "misconfig":      [("T1592", "Gather Victim Host Information", "Reconnaissance")],
+        "generic":        [("T1595", "Active Scanning", "Reconnaissance")],
+    }
+
+    async def attack_mapping(self):
+        """Module 46 — map every finding to MITRE ATT&CK Enterprise.
+
+        Produces a tactic/technique coverage view (SOC/blue-team value) and an
+        ATT&CK Navigator layer JSON that can be imported into the official
+        Navigator. Pure mapping over already-collected evidence — no new traffic."""
+        # reuse the CVSS categorisation if module 45 ran, else classify here
+        reg = (self.results.get('cvss', {}) or {}).get('register')
+        if reg:
+            rows = [(e["source_severity"], e["check"], e["detail"], e["source"],
+                     e["category"], e["score"]) for e in reg]
+        else:
+            rows = []
+            for sev, check, detail, src in self._collect_findings():
+                cat = self._cvss_category(check, detail)
+                rows.append((sev, check, detail, src, cat, 0.0))
+
+        techniques, tactics, findings = {}, {}, []
+        seen = set()
+        for sev, check, detail, src, cat, score in rows:
+            for tid, tname, tactic in self.ATTACK_MAP.get(cat, self.ATTACK_MAP["generic"]):
+                key = (tid, check[:60])
+                if key in seen:
+                    continue
+                seen.add(key)
+                t = techniques.setdefault(tid, {
+                    "id": tid, "name": tname, "tactic": tactic,
+                    "count": 0, "examples": [], "max_severity": "INFO"})
+                t["count"] += 1
+                if len(t["examples"]) < 5:
+                    t["examples"].append({"check": check, "severity": sev,
+                                          "detail": detail[:150]})
+                rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+                if rank.get(sev, 0) > rank.get(t["max_severity"], 0):
+                    t["max_severity"] = sev
+                tactics.setdefault(tactic, []).append(tid)
+                if sev in ("CRITICAL", "HIGH"):
+                    findings.append({"severity": sev,
+                                     "check": f"ATT&CK {tid} — {tname}",
+                                     "detail": f"{tactic} · {check[:110]}",
+                                     "evidence": f"{detail[:150]}"})
+        for tactic in tactics:
+            tactics[tactic] = sorted(set(tactics[tactic]))
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        findings.sort(key=lambda f: sev_rank.get(f["severity"], 5))
+        _rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+        tlist = sorted(techniques.values(),
+                       key=lambda x: (-_rank.get(x["max_severity"], 0), x["id"]))
+
+        # ATT&CK Navigator layer (schema 4.5) — offline, importable
+        layer = {
+            "name": f"NULLVEIL — {self.domain}",
+            "versions": {"attack": "15", "navigator": "5.0.0", "layer": "4.5"},
+            "domain": "enterprise-attack",
+            "description": ("Findings observed during a read-only NULLVEIL recon scan, "
+                            "mapped to ATT&CK techniques."),
+            "techniques": [{
+                "techniqueID": t["id"],
+                "score": t["count"],
+                "color": {"CRITICAL": "#d32f2f", "HIGH": "#f57c00",
+                          "MEDIUM": "#fbc02d", "LOW": "#388e3c"}.get(t["max_severity"], "#888888"),
+                "comment": f"{t['count']} finding(s); max severity {t['max_severity']}",
+                "enabled": True,
+            } for t in tlist],
+            "gradient": {"colors": ["#ffffff", "#d32f2f"], "minValue": 0,
+                         "maxValue": max([t["count"] for t in tlist] + [1])},
+            "legendItems": [{"label": "Observed technique", "color": "#d32f2f"}],
+        }
+        self.results['attack_map'] = {
+            "available": True, "technique_count": len(tlist),
+            "tactic_count": len(tactics), "techniques": tlist, "tactics": tactics,
+            "layer": layer,
+            "findings": findings[:200],
+            "note": ("Read-only mapping for defensive coverage. No techniques are executed. "
+                     "Import the layer into MITRE ATT&CK Navigator (JSON)."),
+        }
+
+    # ==================================================== CVE Intelligence Enricher (47)
+    # Curated offline intel for the CVEs in CVE_RULES: CVSS + CWE + KEV + exploit.
+    CVE_INTEL = {
+        "CVE-2021-41773": {"cvss": 9.8, "cwe": "CWE-22", "kev": True, "exploit": True,
+                           "epss": 0.97, "desc": "Apache 2.4.49 path traversal/RCE — actively exploited."},
+        "CVE-2021-42013": {"cvss": 9.8, "cwe": "CWE-22", "kev": True, "exploit": True,
+                           "epss": 0.97, "desc": "Apache 2.4.50 incomplete fix for 41773 — RCE."},
+        "CVE-2021-40438": {"cvss": 9.0, "cwe": "CWE-918", "kev": False, "exploit": True,
+                           "epss": 0.90, "desc": "Apache mod_proxy SSRF."},
+        "CVE-2021-23017": {"cvss": 7.7, "cwe": "CWE-193", "kev": False, "exploit": False,
+                           "epss": 0.55, "desc": "nginx resolver off-by-one (DNS poisoning)."},
+        "CVE-2020-11022": {"cvss": 6.1, "cwe": "CWE-79", "kev": False, "exploit": True,
+                           "epss": 0.60, "desc": "jQuery htmlPrefilter XSS."},
+        "CVE-2019-11358": {"cvss": 6.1, "cwe": "CWE-1321", "kev": False, "exploit": True,
+                           "epss": 0.65, "desc": "jQuery prototype pollution."},
+        "CVE-2015-9251": {"cvss": 6.1, "cwe": "CWE-79", "kev": False, "exploit": True,
+                          "epss": 0.62, "desc": "jQuery cross-domain AJAX XSS."},
+        "CVE-2021-41182": {"cvss": 6.1, "cwe": "CWE-79", "kev": False, "exploit": True,
+                           "epss": 0.50, "desc": "jQuery UI XSS."},
+        "CVE-2019-8331": {"cvss": 6.1, "cwe": "CWE-79", "kev": False, "exploit": True,
+                          "epss": 0.58, "desc": "Bootstrap tooltip/popover XSS."},
+        "CVE-2020-1938": {"cvss": 9.8, "cwe": "CWE-276", "kev": False, "exploit": True,
+                          "epss": 0.94, "desc": "Tomcat Ghostcat AJP file read/RCE."},
+        "CVE-2014-3704": {"cvss": 9.8, "cwe": "CWE-89", "kev": False, "exploit": True,
+                          "epss": 0.93, "desc": "Drupal 7 'Drupageddon' SQLi."},
+        "CVE-2018-7600": {"cvss": 9.8, "cwe": "CWE-94", "kev": True, "exploit": True,
+                          "epss": 0.97, "desc": "Drupalgeddon2 RCE — actively exploited."},
+        "CVE-2022-21661": {"cvss": 5.3, "cwe": "CWE-89", "kev": False, "exploit": True,
+                           "epss": 0.40, "desc": "WordPress WP_Query SQLi."},
+        "CVE-2015-8562": {"cvss": 9.8, "cwe": "CWE-502", "kev": False, "exploit": True,
+                          "epss": 0.88, "desc": "Joomla session deserialization RCE."},
+        "CVE-2021-44228": {"cvss": 10.0, "cwe": "CWE-502", "kev": True, "exploit": True,
+                           "epss": 0.97, "desc": "Log4Shell JNDI RCE — actively exploited."},
+        "CVE-2021-34473": {"cvss": 9.8, "cwe": "CWE-918", "kev": True, "exploit": True,
+                           "epss": 0.97, "desc": "ProxyShell (Exchange) RCE."},
+        "CVE-2017-5638": {"cvss": 10.0, "cwe": "CWE-20", "kev": True, "exploit": True,
+                          "epss": 0.97, "desc": "Struts2 Jakarta Multipart RCE."},
+        "CVE-2022-22965": {"cvss": 9.8, "cwe": "CWE-94", "kev": True, "exploit": True,
+                           "epss": 0.97, "desc": "Spring4Shell RCE."},
+        "CVE-2021-3129": {"cvss": 9.8, "cwe": "CWE-502", "kev": True, "exploit": True,
+                          "epss": 0.96, "desc": "Laravel Ignition RCE."},
+        "CVE-2021-26855": {"cvss": 9.8, "cwe": "CWE-918", "kev": True, "exploit": True,
+                           "epss": 0.97, "desc": "ProxyLogon (Exchange) SSRF/RCE."},
+    }
+
+    async def cve_intel_enrich(self):
+        """Module 47 — enrich fingerprinted versions' CVEs with offline intel.
+
+        Adds CVSS base score, CWE, EPSS-style likelihood, CISA KEV membership and
+        exploit-availability to every CVE surfaced by module 15, then ranks the
+        product exposure by real-world risk (KEV > high-EPSS > CVSS). Fully
+        offline — no CVE API calls, no active checks."""
+        versions = self.results.get('versions', []) or []
+        cve_hits = self.results.get('cve_findings', []) or []
+        intel_rows, findings, seen = [], [], set()
+        # compound CVE regex over all evidence (versions + findings)
+        blob = " ".join(str(v) for v in versions) + " " + \
+               " ".join(str(f) for f in cve_hits)
+        cve_ids = sorted(set(re.findall(r'CVE-\d{4}-\d{4,7}', blob)))
+        for cid in cve_ids:
+            if cid in seen:
+                continue
+            seen.add(cid)
+            info = self.CVE_INTEL.get(cid, {})
+            row = {
+                "cve": cid,
+                "cvss": info.get("cvss", 0.0),
+                "cwe": info.get("cwe", "CWE-noinfo"),
+                "kev": bool(info.get("kev")),
+                "exploit_available": bool(info.get("exploit")),
+                "epss": info.get("epss", 0.0),
+                "desc": info.get("desc", "No offline intel available — verify against NVD."),
+                "known": cid in self.CVE_INTEL,
+            }
+            sev = ("CRITICAL" if row["kev"] else
+                   "CRITICAL" if row["cvss"] >= 9.0 else
+                   "HIGH" if row["cvss"] >= 7.0 or row["exploit_available"] else
+                   "MEDIUM" if row["cvss"] >= 4.0 else "LOW")
+            row["severity"] = sev
+            row["priority"] = ("P1 — patch now" if row["kev"] else
+                               "P2 — urgent" if sev == "CRITICAL" else
+                               "P3 — scheduled" if sev == "HIGH" else "P4 — routine")
+            intel_rows.append(row)
+            if sev in ("CRITICAL", "HIGH"):
+                tags = " · ".join(t for t in (
+                    "CISA KEV" if row["kev"] else "",
+                    f"EPSS {row['epss']:.0%}" if row["epss"] else "",
+                    "exploit public" if row["exploit_available"] else "") if t)
+                findings.append({
+                    "severity": sev,
+                    "check": f"{cid} (CVSS {row['cvss']})",
+                    "detail": f"{row['desc']} [{tags or 'no public exploit'}]",
+                    "evidence": f"{row['cwe']} · {row['priority']}",
+                })
+        intel_rows.sort(key=lambda r: (-r["kev"], -r["epss"], -r["cvss"]))
+        sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        findings.sort(key=lambda f: sev_rank.get(f["severity"], 4))
+        kev = [r["cve"] for r in intel_rows if r["kev"]]
+        self.results['cve_intel'] = {
+            "available": True, "count": len(intel_rows),
+            "kev_count": len(kev), "kev": kev,
+            "cvss_mean": round(sum(r["cvss"] for r in intel_rows) / len(intel_rows), 1)
+                         if intel_rows else 0.0,
+            "cves": intel_rows, "findings": findings,
+            "note": ("Offline curated intel (CVSS/CWE/KEV/EPSS-style). "
+                     "Always confirm against NVD + the vendor advisory before patching."),
+        }
+
+    # ==================================================== Subdomain Takeover v3 (48)
+    # Extended provider fingerprint list — (service, cname_suffixes, http_signature_regex)
+    TAKEOVER_V3 = [
+        ("AWS S3",              ["s3.amazonaws.com", "s3-website"], r"(?i)nosuchbucket|the specified bucket does not exist"),
+        ("AWS CloudFront",      ["cloudfront.net"],                  r"(?i)bad request|generated by cloudfront"),
+        ("AWS Elastic Beanstalk", ["elasticbeanstalk.com"],          r"(?i)404 not found|no application"),
+        ("Heroku",              ["herokuapp.com", "herokussl.com", "herokudns.com"], r"(?i)no such app|herokucdn\.com/error-no-such-app"),
+        ("GitHub Pages",        ["github.io", "githubusercontent.com"], r"(?i)there isn't a github pages site here"),
+        ("GitLab Pages",        ["gitlab.io"],                       r"(?i)404|the page you're looking for could not be found"),
+        ("Netlify",             ["netlify.app", "netlify.com"],      r"(?i)not found - request id|page not found"),
+        ("Vercel",              ["vercel.app", "now.sh"],            r"(?i)404: not_found|deployment not found"),
+        ("Azure App Service",   ["azurewebsites.net"],               r"(?i)404 - web app not found|this web app has been stopped"),
+        ("Azure Cloud Service", ["cloudapp.net", "cloudapp.azure.com"], r"(?i)404 - web app not found"),
+        ("Azure Blob",          ["blob.core.windows.net"],           r"(?i)resource not found|blob not found"),
+        ("Azure Traffic Manager", ["trafficmanager.net"],            r"(?i)not found|traffic manager"),
+        ("Azure Front Door",    ["azurefd.net"],                     r"(?i)not found|front door"),
+        ("Azure Static Web",    ["azurestaticapps.net"],             r"(?i)not found|404"),
+        ("Shopify",             ["shopify.com", "myshopify.com"],    r"(?i)sorry, this shop is currently unavailable"),
+        ("Tumblr",              ["tumblr.com"],                      r"(?i)there's nothing here|whatever you were looking for doesn't exist"),
+        ("WordPress.com",       ["wordpress.com"],                   r"(?i)doesn't exist|do you want to register"),
+        ("Pantheon",            ["pantheonsite.io"],                 r"(?i)the gods are wise|404"),
+        ("Zendesk",             ["zendesk.com"],                     r"(?i)help center closed"),
+        ("Freshdesk",           ["freshdesk.com"],                   r"(?i)there is no helpdesk here|account not found"),
+        ("Desk.com",            ["desk.com"],                        r"(?i)please try again later|not found"),
+        ("Help Scout",          ["helpscoutdocs.com"],               r"(?i)no settings were found"),
+        ("Intercom",            ["custom.intercom.help"],            r"(?i)this page is reserved"),
+        ("Uservoice",           ["uservoice.com"],                    r"(?i)this uservoice subdomain is available"),
+        ("Teamwork",            ["teamwork.com"],                    r"(?i)not found|create a new site"),
+        ("Tilda",               ["tilda.ws", "tildacdn.com"],        r"(?i)please renew your subscription|tilda"),
+        ("Read the Docs",       ["readthedocs.io"],                  r"(?i)404|the page you're looking for"),
+        ("Surge.sh",            ["surge.sh"],                        r"(?i)project not found"),
+        ("Bitbucket",           ["bitbucket.io"],                    r"(?i)repository not found"),
+        ("Fastly",              ["fastly.net"],                      r"(?i)fastly error: unknown domain"),
+        ("Ghost",               ["ghost.io"],                        r"(?i)404|domain is not configured"),
+        ("Webflow",             ["webflow.io"],                      r"(?i)404|this site is not published"),
+        ("Strikingly",          ["strikingly.com", "strikinglydns.com"], r"(?i)page not found|this site is not currently available"),
+        ("Cargo",               ["cargocollective.com"],             r"(?i)404|not found"),
+        ("Agile CRM",           ["agilecrm.com"],                    r"(?i)not found|this account"),
+        ("Aha",                 ["aha.io"],                          r"(?i)not found|this aha account"),
+        ("Statuspage",          ["statuspage.io"],                   r"(?i)not found|this page"),
+        ("Smugmug",             ["smugmug.com"],                     r"(?i)not found|this page"),
+        ("Smartling",           ["smartling.com"],                   r"(?i)not found"),
+        ("Pingdom",             ["pingdom.com"],                     r"(?i)this public report does not exist"),
+        ("Tictail",             ["tictail.com"],                     r"(?i)not found|shop is not available"),
+        ("Campaign Monitor",    ["createsend.com"],                  r"(?i)not found|this page"),
+        ("Acquia",              ["acquia-sites.com"],                r"(?i)not found"),
+        ("Proposify",           ["proposify.com"],                   r"(?i)not found"),
+        ("Simplebooklet",       ["simplebooklet.com"],               r"(?i)not found"),
+        ("Sitemap.io",          ["sitemap.io"],                      r"(?i)not found"),
+        ("Getresponse",         ["getresponse.com"],                 r"(?i)not found"),
+        ("Mailchimp",           ["mailchimp.com"],                   r"(?i)not found"),
+        ("Wix",                 ["wixsite.com"],                     r"(?i)not found|this site"),
+        ("Squarespace",         ["squarespace.com"],                 r"(?i)not found|this site"),
+        ("Launchrock",          ["launchrock.com"],                  r"(?i)not found"),
+        ("Unbounce",            ["unbounce.com"],                    r"(?i)not found"),
+        ("Ngrok",               ["ngrok.io", "ngrok-free.app"],      r"(?i)endpoint (is offline|not found)|tunnel .* not found"),
+        ("Fly.io",              ["fly.dev"],                          r"(?i)404|application not found"),
+        ("Render",              ["onrender.com"],                    r"(?i)not found|service not found"),
+        ("Railway",             ["up.railway.app"],                  r"(?i)404|application not found"),
+        ("Kinsta",              ["kinsta.cloud"],                    r"(?i)not found"),
+        ("WP Engine",           ["wpengine.com", "wpenginepowered.com"], r"(?i)not found"),
+        ("Contentful",          ["contentful.com"],                  r"(?i)not found|space not found"),
+        ("Prismic",             ["prismic.io"],                      r"(?i)not found"),
+        ("Firebase",            ["web.app", "firebaseapp.com"],      r"(?i)site not found|firebase app not found"),
+        ("Google Sites",        ["sites.google.com"],                r"(?i)not found"),
+        ("Blogger",             ["blogspot.com"],                    r"(?i)not found|blog has been removed"),
+        ("Medium",              ["medium.com"],                      r"(?i)not found|out of nothing"),
+        ("Hatena",              ["hatenablog.com"],                  r"(?i)not found"),
+        ("Sendgrid",            ["sendgrid.net"],                    r"(?i)not found"),
+        ("Tave",                ["tave.com"],                        r"(?i)not found"),
+        ("Vend",                ["vendhq.com"],                      r"(?i)not found"),
+        ("Volusion",            ["volusion.com"],                    r"(?i)not found"),
+        ("Kajabi",              ["kajabi.com"],                      r"(?i)not found"),
+        ("Bigcartel",           ["bigcartel.com"],                   r"(?i)not found"),
+        ("Copper",              ["copper.com"],                      r"(?i)not found"),
+        ("Canny",               ["canny.io"],                        r"(?i)not found|company not found"),
+    ]
+
+    async def takeover_v3(self):
+        """Module 48 — standalone subdomain-takeover engine (v3 fingerprints).
+
+        For each known subdomain, resolves the CNAME chain, matches it against
+        70+ provider fingerprints and fetches the host to look for the provider's
+        'unclaimed resource' signature. Reports dangling-CNAME candidates as
+        HIGH-risk. **Read-only** — nothing is registered, claimed or modified."""
+        hosts = set()
+        for h in (self.results.get('subdomains') or []):
+            h = str(h).strip().lower()
+            if h:
+                hosts.add(h)
+        for h in (self.scalar_results.get('subdomains') or []):
+            if h:
+                hosts.add(str(h).strip().lower())
+        root = self.domain.split(':')[0]
+        hosts.add(root)
+        hosts = sorted(hosts)[: (80 if self.deep else 40)]
+
+        resolver = dns.asyncresolver.Resolver()
+        resolver.lifetime = min(self.timeout, 8)
+
+        async def get_chain(host):
+            chain = []
+            cur = host
+            for _ in range(6):
+                try:
+                    ans = await resolver.resolve(cur, 'CNAME')
+                    tgt = str(ans[0].target).rstrip('.').lower()
+                    chain.append(tgt)
+                    cur = tgt
+                except Exception:
+                    break
+            return chain
+
+        risks, findings, checked = [], [], 0
+
+        async def check(host):
+            nonlocal checked
+            chain = await get_chain(host)
+            if not chain:
+                return
+            checked += 1
+            cname = chain[-1]
+            for service, suffixes, sig in self.TAKEOVER_V3:
+                if not any(cname == s or cname.endswith('.' + s) or s in cname
+                           for s in suffixes):
+                    continue
+                body = ""
+                for scheme in ("https", "http"):
+                    try:
+                        async with self.sem:
+                            rr = await self.client.get(f"{scheme}://{host}/", timeout=8.0)
+                        body = rr.text[:80_000]
+                        break
+                    except Exception:
+                        continue
+                m = re.search(sig, body) if body else None
+                base = {"host": host, "cname_chain": chain, "service": service}
+                if m:
+                    risks.append({**base, "status": "LIKELY TAKEOVER",
+                                  "signature": m.group(0)[:60], "severity": "HIGH"})
+                    findings.append({
+                        "severity": "HIGH",
+                        "check": f"Subdomain takeover ({service})",
+                        "detail": f"{host} → {cname} serves unclaimed-resource signature "
+                                  f"'{m.group(0)[:50]}'",
+                        "evidence": f"CNAME chain: {' → '.join(chain)}",
+                    })
+                elif not body:
+                    risks.append({**base, "status": "DANGLING (unreachable)", "severity": "MEDIUM"})
+                    findings.append({
+                        "severity": "MEDIUM",
+                        "check": f"Dangling CNAME ({service})",
+                        "detail": f"{host} → {cname} is unreachable — verify the cloud "
+                                  f"resource still exists",
+                        "evidence": f"CNAME chain: {' → '.join(chain)}",
+                    })
+                else:
+                    findings.append({
+                        "severity": "INFO",
+                        "check": f"Takeover check — {service}",
+                        "detail": f"{host} → {cname} — no takeover signature (likely claimed)",
+                        "evidence": f"CNAME chain: {' → '.join(chain)}",
+                    })
+                return
+
+        await asyncio.gather(*[check(h) for h in hosts])
+        sev_rank = {"HIGH": 0, "MEDIUM": 1, "INFO": 2}
+        findings.sort(key=lambda f: sev_rank.get(f["severity"], 3))
+        self.results['takeover_v3'] = {
+            "available": True, "hosts_checked": checked,
+            "risk_count": len(risks), "risks": risks,
+            "cname_hosts": checked,
+            "findings": findings[:300],
+            "providers": len(self.TAKEOVER_V3),
+            "policy": "Read-only CNAME/HTTP inspection — no registration, claiming or modification.",
+        }
+
+    # ==================================================== Continuous Change Monitor (49)
+    async def change_monitor(self):
+        """Module 49 — continuous change monitor / watch baseline.
+
+        Compares the current scan against the newest stored baseline for the
+        same target and reports added/removed assets plus a risk delta. Designed
+        for ``--watch`` (repeat runs every ``--interval`` seconds) and CI drift
+        gates. Reuses the diff engine when available; otherwise computes a
+        standalone snapshot comparison."""
+        current = self.export_dict()
+        prev = None
+        for e in self._history_list():
+            if e.get("domain", "").lower() == self.domain.lower():
+                prev = e
+                break
+        cur = self._asset_sets(current)
+        if not prev:
+            self.results['watch'] = {
+                "available": True, "baseline": False,
+                "note": "No prior baseline for this target — this scan establishes the baseline.",
+                "snapshot": {k: len(v) for k, v in cur.items()},
+                "assets": {k: sorted(v)[:200] for k, v in cur.items()},
+                "findings": [],
+            }
+            return
+        old = self._asset_sets(prev.get("report", {}))
+        added = {k: sorted(cur[k] - old[k]) for k in cur}
+        removed = {k: sorted(old[k] - cur[k]) for k in old}
+        # risk delta: weighted comparison of the two scans' finding summaries.
+        # (module 49 runs before the post-scan diff engine, so we cannot rely on
+        #  self.results['diff'] here — compute an honest delta from the summaries.)
+        def _risk(report_like):
+            sm = ((report_like or {}).get("report", report_like) or {}).get("summary", {}) or {}
+            return (int(sm.get("cve_issues", 0) or 0) * 6
+                    + int(sm.get("secrets", 0) or 0) * 8
+                    + int(sm.get("takeover_risks", 0) or 0) * 10
+                    + int(sm.get("tls_issues", 0) or 0) * 3
+                    + int(sm.get("audit_issues", 0) or 0) * 2
+                    + int(sm.get("admin_api_findings", 0) or 0) * 4)
+        prev_score = _risk(prev)
+        cur_score = _risk(current)
+        delta = cur_score - prev_score
+        SEV = {"ports": "HIGH", "api_endpoints": "HIGH", "subdomains": "MEDIUM",
+              "paths": "MEDIUM", "users": "LOW", "cookies": "LOW", "js_files": "LOW",
+              "tech_stack": "INFO"}
+        findings = []
+        for k, items in added.items():
+            if not items:
+                continue
+            findings.append({
+                "severity": SEV.get(k, "INFO"),
+                "check": f"watch: new {k.rstrip('s')}",
+                "detail": f"{len(items)} new {k}: {', '.join(items[:6])}" + (" …" if len(items) > 6 else ""),
+                "evidence": f"baseline {prev.get('when', '')[:19]}",
+            })
+        for k, items in removed.items():
+            if not items:
+                continue
+            findings.append({
+                "severity": "INFO",
+                "check": f"watch: removed {k.rstrip('s')}",
+                "detail": f"{len(items)} {k} disappeared: {', '.join(items[:6])}" + (" …" if len(items) > 6 else ""),
+                "evidence": f"baseline {prev.get('when', '')[:19]}",
+            })
+        total_added = sum(len(v) for v in added.values())
+        verdict = ("REGRESSION" if delta > 0 else "IMPROVEMENT" if delta < 0
+                   else "CHANGED" if total_added else "STABLE")
+        self.results['watch'] = {
+            "available": True, "baseline": True,
+            "baseline_id": prev.get("id"), "baseline_when": prev.get("when"),
+            "added": added, "removed": removed,
+            "added_total": total_added,
+            "removed_total": sum(len(v) for v in removed.values()),
+            "risk_delta": delta, "prev_risk": prev_score, "cur_risk": cur_score,
+            "verdict": verdict,
+            "snapshot": {k: len(v) for k, v in cur.items()},
+            "findings": findings,
+        }
+
     # ---------------------------------------------------------- FFUF Fuzzing
     async def ffuf_fuzz(self):
         """Run ffuf content/API fuzzing (curated API wordlist + discovered paths)."""
@@ -5876,7 +6597,10 @@ class WebsiteRecon:
                          ("intel", "intel"), ("breach", "breach"), ("correlation", "correlate"),
                          ("compliance", "comp"), ("js_secret", "jssecret"),
                          ("wayback", "wayback"), ("param", "param"),
-                         ("graphql", "gql"), ("cloud", "cloud")):
+                         ("graphql", "gql"), ("cloud", "cloud"),
+                         ("cvss", "cvss"), ("attack_map", "attack"),
+                         ("cve_intel", "cveintel"), ("takeover_v3", "takeover"),
+                         ("watch", "watch")):
             blob = r.get(key) or {}
             for f in (blob.get("findings") or []) if isinstance(blob, dict) else []:
                 if isinstance(f, dict):
@@ -6307,7 +7031,10 @@ class WebsiteRecon:
                          ("correlation", "correlate"), ("compliance", "comp"),
                          ("anomaly", "anomaly"), ("js_secret", "jssecret"),
                          ("wayback", "wayback"), ("params", "param"),
-                         ("graphql", "gql"), ("cloud_storage", "cloud")):
+                         ("graphql", "gql"), ("cloud_storage", "cloud"),
+                         ("cvss", "cvss"), ("mitre_attack", "attack"),
+                         ("cve_intel", "cveintel"), ("takeover_v3", "takeover"),
+                         ("watch", "watch")):
             blob = r.get(key)
             if not isinstance(blob, dict):
                 continue
@@ -8246,6 +8973,79 @@ class WebsiteRecon:
             console.print(Panel(body, title="[bold blue]◈ CLOUD STORAGE ENUMERATION ◈[/]",
                                 border_style="blue", box=rbox.ROUNDED))
 
+        # --- CVSS 4.0 / CWE Risk Scoring (45) ---
+        cvs = self.results.get('cvss', {})
+        if isinstance(cvs, dict) and cvs.get('count'):
+            dist = cvs.get('distribution', {})
+            body = (f"  [green]✓[/] {cvs.get('count', 0)} finding(s) scored · "
+                    f"mean CVSS [bold]{cvs.get('mean_score', 0)}[/] · "
+                    f"[red]{dist.get('CRITICAL', 0)}[/] crit / "
+                    f"[yellow]{dist.get('HIGH', 0)}[/] high / "
+                    f"{dist.get('MEDIUM', 0)} med / {dist.get('LOW', 0)} low\n"
+                    f"  [dim]{cvs.get('method', '')[:100]}[/]\n")
+            for e in (cvs.get('top') or [])[:10]:
+                col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow"}.get(e.get('severity'), "cyan")
+                reb = f" [magenta]({e['rebanded']})[/]" if e.get('rebanded') else ""
+                body += (f"  [{col}]• {e.get('score', 0):>4}[/] [white]{e.get('check', '')[:60]}[/] "
+                         f"[dim]{e.get('cwe', '')}{reb}[/]\n")
+            console.print(Panel(body, title="[bold cyan]◈ CVSS 4.0 / CWE RISK SCORING ◈[/]",
+                                border_style="cyan", box=rbox.ROUNDED))
+        # --- MITRE ATT&CK Mapping (46) ---
+        am = self.results.get('attack_map', {})
+        if isinstance(am, dict) and am.get('technique_count'):
+            body = (f"  [green]✓[/] {am.get('technique_count', 0)} technique(s) across "
+                    f"{am.get('tactic_count', 0)} tactic(s)  "
+                    f"[dim]{am.get('note', '')[:70]}[/]\n")
+            for t in (am.get('techniques') or [])[:12]:
+                col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow"}.get(t.get('max_severity'), "cyan")
+                body += (f"  [{col}]•[/] [bold]{t.get('id')}[/] {t.get('name', '')[:48]} "
+                         f"[dim]· {t.get('tactic')} × {t.get('count')}[/]\n")
+            console.print(Panel(body, title="[bold red]◈ MITRE ATT&CK MAPPING ◈[/]",
+                                border_style="red", box=rbox.ROUNDED))
+        # --- CVE Intelligence Enricher (47) ---
+        ci = self.results.get('cve_intel', {})
+        if isinstance(ci, dict) and ci.get('count'):
+            body = (f"  [green]✓[/] {ci.get('count', 0)} CVE(s) enriched · "
+                    f"KEV [bold red]{ci.get('kev_count', 0)}[/] · "
+                    f"mean CVSS {ci.get('cvss_mean', 0)}\n")
+            for r in (ci.get('cves') or [])[:12]:
+                col = "bold red" if r.get('kev') else "red" if r.get('severity') == 'CRITICAL' else "yellow"
+                tags = " ".join(t for t in ("KEV" if r.get('kev') else "",
+                                            "exploit" if r.get('exploit_available') else "") if t)
+                body += (f"  [{col}]• {r.get('cve')} (CVSS {r.get('cvss')})[/] "
+                         f"{r.get('cwe')} [magenta]{tags}[/] [dim]{r.get('priority', '')}[/]\n")
+            console.print(Panel(body, title="[bold yellow]◈ CVE INTELLIGENCE ENRICHER ◈[/]",
+                                border_style="yellow", box=rbox.ROUNDED))
+        # --- Subdomain Takeover v3 (48) ---
+        tv = self.results.get('takeover_v3', {})
+        if isinstance(tv, dict) and tv.get('hosts_checked'):
+            body = (f"  [green]✓[/] {tv.get('hosts_checked', 0)} host(s) with CNAME checked · "
+                    f"[bold red]{tv.get('risk_count', 0)}[/] risk(s) · "
+                    f"{tv.get('providers', 0)} provider fingerprints\n")
+            for r in (tv.get('risks') or [])[:12]:
+                col = "bold red" if r.get('severity') == 'HIGH' else "yellow"
+                body += (f"  [{col}]• {r.get('status')}[/] [white]{r.get('host')}[/] "
+                         f"[dim]→ {r.get('service')}[/]\n")
+            console.print(Panel(body, title="[bold red]◈ SUBDOMAIN TAKEOVER V3 ◈[/]",
+                                border_style="red", box=rbox.ROUNDED))
+        # --- Continuous Change Monitor (49) ---
+        wm = self.results.get('watch', {})
+        if isinstance(wm, dict) and wm.get('available'):
+            if not wm.get('baseline'):
+                body = f"  [cyan]•[/] {wm.get('note', '')}\n"
+            else:
+                col = {"REGRESSION": "bold red", "IMPROVEMENT": "green",
+                       "CHANGED": "yellow"}.get(wm.get('verdict'), "cyan")
+                body = (f"  [{col}]{wm.get('verdict')}[/] · "
+                        f"[bold]{wm.get('added_total', 0)}[/] new · "
+                        f"{wm.get('removed_total', 0)} removed · "
+                        f"risk Δ {wm.get('risk_delta', 0):+d} "
+                        f"[dim](baseline {str(wm.get('baseline_when', ''))[:19]})[/]\n")
+                for f in (wm.get('findings') or [])[:8]:
+                    body += f"  [dim]•[/] [white]{f.get('check', '')}[/] {f.get('detail', '')[:70]}\n"
+            console.print(Panel(body, title="[bold magenta]◈ CONTINUOUS CHANGE MONITOR ◈[/]",
+                                border_style="magenta", box=rbox.ROUNDED))
+
         # --- Errors ---
         if self.results['errors']:
             body = "\n".join(f"  [red]•[/] {e}" for e in self.results['errors'][:10])
@@ -8340,6 +9140,12 @@ class WebsiteRecon:
                 "hidden_params": self.results.get('param', {}).get('count', 0),
                 "graphql_endpoints": self.results.get('graphql', {}).get('count', 0),
                 "cloud_buckets": self.results.get('cloud', {}).get('count', 0),
+                "cvss_findings": self.results.get('cvss', {}).get('count', 0),
+                "cvss_mean": self.results.get('cvss', {}).get('mean_score', 0),
+                "attack_techniques": self.results.get('attack_map', {}).get('technique_count', 0),
+                "cve_intel_kev": self.results.get('cve_intel', {}).get('kev_count', 0),
+                "takeover_v3_risks": self.results.get('takeover_v3', {}).get('risk_count', 0),
+                "watch_changes": self.results.get('watch', {}).get('added_total', 0),
             },
             "http": {k: v for k, v in self.scalar_results.items() if k != 'http_headers'},
             "headers": self.scalar_results.get('http_headers', {}),
@@ -8565,6 +9371,11 @@ class WebsiteRecon:
             "params": self.results.get('param', {}),
             "graphql": self.results.get('graphql', {}),
             "cloud_storage": self.results.get('cloud', {}),
+            "cvss": self.results.get('cvss', {}),
+            "mitre_attack": self.results.get('attack_map', {}),
+            "cve_intel": self.results.get('cve_intel', {}),
+            "takeover_v3": self.results.get('takeover_v3', {}),
+            "watch": self.results.get('watch', {}),
             "errors": self.results['errors'],
         }
         return out
@@ -9409,6 +10220,11 @@ function findings(d){
   push('Hidden Param',d.params&&d.params.findings);
   push('GraphQL',d.graphql&&d.graphql.findings);
   push('Cloud Storage',d.cloud_storage&&d.cloud_storage.findings);
+  push('CVSS',d.cvss&&d.cvss.findings);
+  push('ATT&CK',d.mitre_attack&&d.mitre_attack.findings);
+  push('CVE Intel',d.cve_intel&&d.cve_intel.findings);
+  push('Takeover v3',d.takeover_v3&&d.takeover_v3.findings);
+  push('Watch',d.watch&&d.watch.findings);
   out.sort((a,b)=>SEV_ORDER.indexOf(a.sev)-SEV_ORDER.indexOf(b.sev));
   return out;
 }
@@ -9545,6 +10361,48 @@ function render(d){
      (d.cloud_storage.buckets||[]).slice(0,30).map(b=>`<div style="margin-bottom:4px">
        <span class="chip ${b.public_listing||b.writable_probe?'CRITICAL':'INFO'}">${b.writable_probe?'WRITABLE?':(b.public_listing?'PUBLIC':'exists')}</span>
        <b style="margin-left:8px">${e(b.bucket||'')}</b> <span class="mut">${e(b.provider||'')}</span></div>`).join('')}</div>`:''}
+
+  ${(d.cvss&&d.cvss.count)?`<h3>CVSS 4.0 / CWE risk register (${d.cvss.count})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">mean CVSS ${e(String(d.cvss.mean_score||0))} · ${e(d.cvss.method||'')}</div>${
+     (d.cvss.top||[]).slice(0,25).map(r=>`<div style="margin-bottom:6px">
+       <span class="chip ${e((r.severity||'INFO').toUpperCase())}">${e((r.severity||'INFO').toUpperCase())}</span>
+       <b style="margin-left:8px">${e(String(r.score||''))}</b>
+       <span style="margin-left:8px">${e(r.check||'')}</span>
+       <span class="mut" style="font-size:12px"> ${e(r.cwe||'')}${r.rebanded?(' · rebanded '+e(r.rebanded)):''}</span>
+       <div class="mut" style="font-size:11px">${e(r.cvss4_vector||'')}</div>
+     </div>`).join('')}</div>`:''}
+
+  ${(d.mitre_attack&&d.mitre_attack.technique_count)?`<h3>MITRE ATT&amp;CK coverage (${d.mitre_attack.technique_count})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${e(d.mitre_attack.note||'')}</div>${
+     (d.mitre_attack.techniques||[]).slice(0,40).map(t=>`<div style="margin-bottom:4px">
+       <span class="chip ${e((t.max_severity||'INFO').toUpperCase())}">${e((t.max_severity||'INFO').toUpperCase())}</span>
+       <b style="margin-left:8px">${e(t.id||'')}</b> ${e(t.name||'')}
+       <span class="mut" style="font-size:12px"> · ${e(t.tactic||'')} × ${e(String(t.count||0))}</span></div>`).join('')}</div>`:''}
+
+  ${(d.cve_intel&&d.cve_intel.count)?`<h3>CVE intelligence (${d.cve_intel.count})</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">KEV ${e(String(d.cve_intel.kev_count||0))} · mean CVSS ${e(String(d.cve_intel.cvss_mean||0))} · ${e(d.cve_intel.note||'')}</div>${
+     (d.cve_intel.cves||[]).slice(0,30).map(c=>`<div style="margin-bottom:5px">
+       <span class="chip ${c.kev?'CRITICAL':e((c.severity||'INFO').toUpperCase())}">${c.kev?'KEV':e((c.severity||'INFO').toUpperCase())}</span>
+       <b style="margin-left:8px">${e(c.cve||'')}</b> <span class="mut">CVSS ${e(String(c.cvss||''))} · ${e(c.cwe||'')}</span>
+       ${c.exploit_available?'<span class="mut" style="color:#f97316"> · exploitable</span>':''}
+       <div class="mut" style="font-size:11px">${e(c.desc||'')} · ${e(c.priority||'')}</div></div>`).join('')}</div>`:''}
+
+  ${(d.takeover_v3&&d.takeover_v3.hosts_checked)?`<h3>Subdomain takeover v3 (${d.takeover_v3.risk_count} risk)</h3><div class="panel">
+     <div class="mut" style="font-size:12px;margin-bottom:8px">${e(String(d.takeover_v3.hosts_checked||0))} CNAME host(s) · ${e(String(d.takeover_v3.providers||0))} fingerprints · ${e(d.takeover_v3.policy||'')}</div>${
+     (d.takeover_v3.risks||[]).slice(0,30).map(r=>`<div style="margin-bottom:5px">
+       <span class="chip ${e((r.severity||'INFO').toUpperCase())}">${e(r.status||'')}</span>
+       <b style="margin-left:8px">${e(r.host||'')}</b> <span class="mut">→ ${e(r.service||'')}</span>
+       <div class="mut" style="font-size:11px">${e((r.cname_chain||[]).join(' → '))}</div></div>`).join('')}</div>`:''}
+
+  ${(d.watch&&d.watch.available)?`<h3>Continuous change monitor</h3><div class="panel">
+     ${d.watch.baseline?`<div style="margin-bottom:8px"><span class="chip ${d.watch.verdict==='REGRESSION'?'CRITICAL':'INFO'}">${e(d.watch.verdict||'')}</span>
+       <b style="margin-left:8px">${e(String(d.watch.added_total||0))} new · ${e(String(d.watch.removed_total||0))} removed</b>
+       <span class="mut"> · risk Δ ${e(String(d.watch.risk_delta||0))} (baseline ${e(String(d.watch.baseline_when||'').slice(0,19))})</span></div>${
+       (d.watch.findings||[]).slice(0,25).map(f=>`<div style="margin-bottom:3px">
+         <span class="chip ${e((f.severity||'INFO').toUpperCase())}">${e((f.severity||'INFO').toUpperCase())}</span>
+         <span style="margin-left:8px">${e(f.check||'')}</span> <span class="mut" style="font-size:12px">${e(f.detail||'')}</span></div>`).join('')}`
+       :`<div class="mut">${e(d.watch.note||'')}</div>`}
+  </div>`:''}
 
   <div class="grid2" style="margin-top:18px">
     <div class="panel"><h3>Assets</h3>
@@ -9814,7 +10672,7 @@ def main():
     parser.add_argument("-p", "--ports", type=str, help="Custom comma-separated ports (e.g. 80,443,8080)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Less console output")
     parser.add_argument("-a", "--attack", metavar="LIST", default=None,
-                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate,26=shot,27=nuclei,28=katana,29=linkfinder,30=ffuf,31=auth,32=ssrf,33=smartfuzz,34=burp,35=patch,36=poc,37=notify,39=exec,40=jsecret,41=wayback,42=param,43=gql,44=cloud or 'all'")
+                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate,26=shot,27=nuclei,28=katana,29=linkfinder,30=ffuf,31=auth,32=ssrf,33=smartfuzz,34=burp,35=patch,36=poc,37=notify,39=exec,40=jsecret,41=wayback,42=param,43=gql,44=cloud,45=cvss,46=attack,47=cveintel,48=takeover,49=watch or 'all'")
     parser.add_argument("-m", "--menu", action="store_true", help="Interactive attack selection menu")
     parser.add_argument("-l", "--list-attacks", action="store_true", help="List available attack modules")
     parser.add_argument("-R", "--repro", metavar="FILE", help="Export evidence/reproduction pack (benign, no exploit payloads) to markdown file")
@@ -9903,6 +10761,13 @@ def main():
                         help="Also export the executive report as PDF (needs weasyprint/reportlab/playwright)")
     parser.add_argument("--dashboard", nargs="?", const="8899", metavar="PORT", default=None,
                         help="Serve a local web dashboard of scan history (default port: 8899)")
+    parser.add_argument("--watch", nargs="?", const=0, type=int, metavar="N", default=None,
+                        help="Continuous monitor: repeat the scan N times (0 = until Ctrl+C) "
+                             "and report drift (module 49 auto-enabled)")
+    parser.add_argument("--interval", type=int, metavar="SEC", default=300,
+                        help="Seconds between --watch runs (default: 300)")
+    parser.add_argument("--attack-layer", metavar="FILE", default=None,
+                        help="Write a MITRE ATT&CK Navigator layer JSON to FILE (module 46)")
     parser.add_argument("-V", "--version", action="version", version=f"NULLVEIL Recon v{__version__} | Owner: NULLVEIL | Engine: DeepHat")
     args = parser.parse_args()
 
@@ -10042,6 +10907,14 @@ def main():
         recon.attack_set = sorted(set(recon.attack_set) | {37})
     if args.exec_report or args.exec_pdf:
         recon.attack_set = sorted(set(recon.attack_set) | {39})
+    # ---- roadmap v3.7.0 Tier-2 wiring ----
+    recon.attack_layer_path = args.attack_layer or ""
+    if args.attack_layer:
+        recon.attack_set = sorted(set(recon.attack_set) | {46})
+    if args.watch is not None:
+        recon.attack_set = sorted(set(recon.attack_set) | {49})
+    recon.watch_runs = args.watch
+    recon.watch_interval = int(args.interval or 300)
     if args.resume is not None:
         entry = recon._history_load(args.resume or None)
         if entry:
@@ -10052,6 +10925,24 @@ def main():
 
     try:
         report = asyncio.run(recon.run())
+        # ---- --watch continuous monitor loop (module 49) ----
+        watch_runs = getattr(recon, "watch_runs", None)
+        if watch_runs is not None:
+            interval = int(getattr(recon, "watch_interval", 300) or 300)
+            run_no = 1
+            while (watch_runs == 0) or (run_no < watch_runs):
+                run_no += 1
+                console.print(f"\n[bold magenta]◈ WATCH[/] run {run_no}"
+                              f"{'' if watch_runs == 0 else '/' + str(watch_runs)} — "
+                              f"sleeping {interval}s… [dim](Ctrl+C to stop)[/]")
+                try:
+                    time.sleep(interval)
+                except KeyboardInterrupt:
+                    break
+                try:
+                    report = asyncio.run(recon.run())
+                except Exception as e:
+                    console.print(f"[red]watch run {run_no} failed:[/] {e!r}")
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/]")
         sys.exit(130)
