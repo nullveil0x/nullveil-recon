@@ -1,6 +1,6 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.1.0 · **License:** MIT
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.2.0 · **License:** MIT
 
 A fast, colorful, modular **website & domain reconnaissance** tool built in Python. Run 27 attack modules — from DNS records to full API discovery — with a live progress bar and a premium terminal report.
 
@@ -14,7 +14,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.1.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.2.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -70,6 +70,9 @@ By using NULLVEIL Recon you agree to these terms.
 - 📊 Exposure Risk Meter (0–100 score)
 - 🎯 Selectable modules — run only what you need
 - 💾 JSON export + **standalone HTML report** (dark theme, shareable)
+- 📄 **Client-ready PDF report** (`--pdf`, headless Chromium, paginated A4)
+- 🖥 **Local web dashboard** (`--dashboard`) — live charts, findings search, screenshot gallery — offline, stdlib-only, localhost-only
+- 💾 **Scan history + resume** — every scan auto-saves; `Ctrl+C` keeps partial results; `--resume` runs only what's missing
 - 📝 **Custom subdomain wordlist** (`-w wordlist.txt`)
 - 🌐 Async & concurrent (fast on slow networks)
 - 🛡 DNS-over-HTTPS fallback — works even when TCP/53 is blocked
@@ -109,7 +112,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Optional power-ups (v3.1.0)
+### Optional power-ups
 
 Screenshot capture (`-a shot`) and Nuclei scanning (`-a nuclei`) use **optional** tools —
 NULLVEIL degrades gracefully with a friendly hint if they are missing:
@@ -192,6 +195,16 @@ python3 nullveil_recon.py example.com -a shot,nuclei
 # Custom nuclei templates
 python3 nullveil_recon.py example.com -a nuclei --nuclei-templates ~/my-templates/
 
+# v3.2.0: client-ready PDF report
+python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
+
+# Convert an old JSON report to PDF
+python3 nullveil_recon.py --pdf-from old_report.json --pdf client.pdf
+
+# v3.2.0: interactive web dashboard (localhost, offline, zero extra deps)
+python3 nullveil_recon.py --dashboard          # http://127.0.0.1:8899
+python3 nullveil_recon.py --dashboard 9000     # custom port
+
 # Scan history: list past scans / resume an interrupted one
 python3 nullveil_recon.py --history
 python3 nullveil_recon.py example.com --resume          # latest scan for target
@@ -226,6 +239,9 @@ python3 nullveil_recon.py -l
 | `--resume [ID]` | Resume previous scan — re-runs only the missing modules |
 | `--no-history` | Don't auto-save this scan to history |
 | `--nuclei-templates DIR` | Custom nuclei template path for `-a nuclei` |
+| `--pdf FILE` | Save a **client-ready PDF report** (headless Chromium — needs playwright) |
+| `--pdf-from JSON` | Convert an existing JSON report to PDF (use with `--pdf`) |
+| `--dashboard [PORT]` | Serve a **local web dashboard** of scan history (default port 8899) |
 | `-q`, `--quiet` | Suppress console output |
 | `-V`, `--version` | Show version |
 
@@ -319,6 +335,12 @@ A few v3 features are **deliberately shaped** so the tool stays defensive & repo
 
 Compliance output is **evidence-based partial mapping**, never a certification claim.
 
+### v3.2.0 notes (dashboard, PDF, robustness)
+
+- **Dashboard** is a **zero-dependency**, **localhost-only**, **offline** standard-library web server — it reads your local scan history and renders charts/findings/screenshots in the browser. Screenshot serving is index-based (no user-controlled paths) and constrained to your own home/workspace directories.
+- **PDF export** renders the branded HTML report through the same headless Chromium used for screenshots (`--pdf`), and can convert any saved JSON report (`--pdf-from`).
+- **Interrupt-safe scanning**: `Ctrl+C` saves partial results to history, and `--resume` finishes exactly the modules that didn't complete — nothing is re-scanned twice.
+
 ---
 
 ## 🗺️ Roadmap
@@ -344,6 +366,9 @@ Compliance output is **evidence-based partial mapping**, never a certification c
 - [x] Screenshot capture — headless Chromium (`-a shot`)
 - [x] Nuclei template integration (`-a nuclei`)
 - [x] Scan history + resume (`--history`, `--resume`)
+- [x] Ctrl+C-safe scans — partial results auto-saved, `--resume` finishes the job
+- [x] Web dashboard (`--dashboard`) — local, offline, zero-dependency
+- [x] Client-ready PDF reports (`--pdf`, `--pdf-from`)
 
 Contributions welcome — open an issue or PR.
 

@@ -63,7 +63,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -287,15 +287,25 @@ def parse_attack_list(s: str):
         return list(range(1, MAX_MODULE + 1))
     items = [x.strip().lower() for x in s.split(',') if x.strip()]
     res = set()
+    unknown = []
     for it in items:
         if it.isdigit():
             m = int(it)
             if 1 <= m <= MAX_MODULE:
                 res.add(m)
+            else:
+                unknown.append(it)
             continue
+        hit = False
         for name, idx, *_ in ATTACK_MODULES:
             if it == name or (name == "sub" and it in ("subdomains", "subdomain")) or (name == "paths" and it in ("admin", "dirs")):
                 res.add(idx)
+                hit = True
+        if not hit:
+            unknown.append(it)
+    if unknown:
+        console.print(f"[yellow]⚠ Unknown module name(s) ignored:[/] [bold]{', '.join(unknown)}[/]  "
+                      f"[dim](see -l for the full list)[/]")
     return sorted(res)
 
 
@@ -429,7 +439,12 @@ class WebsiteRecon:
             timeout=self.timeout,
             verify=False,  # recon: expired/self-signed certs still interesting
             http2=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 NULLVEIL-Recon/1.0"}
+            # tuned pooling: fewer TCP/TLS handshakes under high concurrency
+            limits=httpx.Limits(max_connections=max(concurrency, 100),
+                                max_keepalive_connections=40,
+                                keepalive_expiry=30.0),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                   f"(KHTML, like Gecko) Chrome/124.0 Safari/537.36 NULLVEIL-Recon/{__version__}"}
         )
         self.sem = asyncio.Semaphore(concurrency)
 
@@ -517,21 +532,41 @@ class WebsiteRecon:
             transient=True,
         )
 
-        async def runner(name, coro, tid):
+        self._completed = []
+
+        async def runner(name, coro, tid, idx):
             try:
                 result = await coro
                 progress.update(tid, completed=1, status="[bold green]✓ done[/]")
+                self._completed.append(ATTACK_MODULES[idx - 1][0])   # canonical name
                 return result
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 progress.update(tid, completed=1, status="[bold red]✗ fail[/]")
                 raise
 
-        with progress:
-            tids = [progress.add_task(name, total=1, status="[dim]scanning…[/]") for name, _, _ in modules]
-            results = await asyncio.gather(
-                *[runner(modules[i][0], modules[i][1], tids[i]) for i in range(len(modules))],
-                return_exceptions=True,
-            )
+        try:
+            with progress:
+                tids = [progress.add_task(name, total=1, status="[dim]scanning…[/]") for name, _, _ in modules]
+                results = await asyncio.gather(
+                    *[runner(modules[i][0], modules[i][1], tids[i], modules[i][2])
+                      for i in range(len(modules))],
+                    return_exceptions=True,
+                )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Ctrl+C — keep partial results so `--resume` can finish the job
+            self.scan_duration = (datetime.now() - scan_start).total_seconds()
+            try:
+                await self.client.aclose()
+            except Exception:
+                pass
+            hid = self._history_save()
+            console.print("\n[yellow]⏸  Scan interrupted[/]")
+            if hid:
+                console.print(f"[dim]Partial results saved to history:[/] [cyan]{hid}[/]")
+                console.print(f"[dim]Continue:[/] nullveil {self.domain} --resume")
+            raise
 
         for i, r in enumerate(results):
             if isinstance(r, Exception):
@@ -549,6 +584,7 @@ class WebsiteRecon:
                     try:
                         await coro
                         prog2.update(tid, completed=1, status="[bold green]✓ done[/]")
+                        self._completed.append(ATTACK_MODULES[idx - 1][0])
                     except Exception as e:
                         prog2.update(tid, completed=1, status="[bold red]✗ fail[/]")
                         self.results['errors'].append(f"{name} crashed: {e!r}")
@@ -2932,13 +2968,19 @@ class WebsiteRecon:
                     pass
 
         # ---------- 1) AlienVault OTX ----------
+        otx_ok = False
+        otx_attempts = 0
         for indicator, itype in ([(self.domain, "domain")] + [(ip, "IPv4") for ip in ips[:3]]):
+            if not otx_ok and otx_attempts >= 2:
+                break           # OTX unreachable — don't hammer more slow timeouts
+            otx_attempts += 1
             try:
                 async with self.sem:
                     r = await self.client.get(
                         f"https://otx.alienvault.com/api/v1/indicators/{itype}/{indicator}/general",
                         timeout=15.0, headers={"Accept": "application/json"})
                 if r.status_code == 200:
+                    otx_ok = True
                     data = r.json()
                     pc = data.get("pulse_info", {}).get("count", 0) or 0
                     pulse_names = [p.get("name", "") for p in
@@ -2951,7 +2993,6 @@ class WebsiteRecon:
                         findings.append((sev, "OTX pulse match",
                                          f"{indicator} appears in {pc} AlienVault threat pulse(s)"
                                          + (f" — {', '.join(pulse_names)}" if pulse_names else "")))
-                    break       # OTX working → skip remaining retries
             except Exception:
                 continue
         if not sources:
@@ -3603,8 +3644,15 @@ class WebsiteRecon:
         shared NS / MX / IP / CDN / cert-SAN → relationship matrix.
         Extra domains come from --correlate or are auto-derived from certificate SANs."""
 
+        MULTI_TLD = {"co.uk", "org.uk", "ac.uk", "gov.uk", "net.uk", "com.au", "net.au",
+                     "org.au", "co.jp", "ne.jp", "or.jp", "com.br", "com.mx", "com.ar",
+                     "co.in", "co.nz", "co.za", "com.sg", "com.hk", "com.tw", "co.kr",
+                     "com.cn", "com.tr", "com.pl", "com.ua", "com.vn", "co.id"}
+
         def apex(host):
             parts = str(host).lower().rstrip('.').split('.')
+            if len(parts) >= 3 and ".".join(parts[-2:]) in MULTI_TLD:
+                return ".".join(parts[-3:])
             if len(parts) >= 2:
                 return ".".join(parts[-2:])
             return str(host).lower()
@@ -3906,6 +3954,16 @@ class WebsiteRecon:
     # ---------------------------------------------------------- Scan History
     HISTORY_DIR = os.path.join(os.path.expanduser("~"), ".nullveil", "history")
 
+    def _modules_run_names(self):
+        """Module names that actually ran (accurate for interrupted / resumed scans)."""
+        idxs = set(self.attack_set) | set(getattr(self, "_resume_done", []))
+        done = getattr(self, "_completed", None)
+        if done is not None:
+            done_set = set(done)
+            idxs = ({i for i in idxs if ATTACK_MODULES[i - 1][0] in done_set}
+                    | set(getattr(self, "_resume_done", [])))
+        return [ATTACK_MODULES[i - 1][0] for i in sorted(idxs) if 0 < i <= MAX_MODULE]
+
     def _history_save(self, report=None):
         """Auto-save every completed scan for --history / --resume."""
         if getattr(self, "no_history", False):
@@ -3919,8 +3977,7 @@ class WebsiteRecon:
                 "id": hid, "target": self.base_url, "domain": self.domain,
                 "when": datetime.now().isoformat(), "duration_s": round(self.scan_duration, 1),
                 "version": __version__,
-                "modules_run": [ATTACK_MODULES[i - 1][0] for i in
-                                sorted(self.attack_set) if 0 < i <= MAX_MODULE],
+                "modules_run": self._modules_run_names(),
                 "summary": report.get("summary", {}),
                 "report": report,
                 "_raw": {"results": {k: v for k, v in self.results.items()},
@@ -3939,15 +3996,16 @@ class WebsiteRecon:
         except Exception:
             return None
 
-    def _history_list(self):
+    @classmethod
+    def _history_list(cls):
         """Return scan entries sorted newest-first."""
         out = []
         try:
-            for fn in sorted(os.listdir(self.HISTORY_DIR), reverse=True):
+            for fn in sorted(os.listdir(cls.HISTORY_DIR), reverse=True):
                 if not fn.endswith(".json"):
                     continue
                 try:
-                    with open(os.path.join(self.HISTORY_DIR, fn), encoding="utf-8") as fh:
+                    with open(os.path.join(cls.HISTORY_DIR, fn), encoding="utf-8") as fh:
                         e = json.load(fh)
                     out.append(e)
                 except Exception:
@@ -4607,7 +4665,7 @@ class WebsiteRecon:
                 sev_col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "cyan", "INFO": "dim"}
                 nt = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_red",
                            title=f"[bold red]◈ NUCLEI FINDINGS ◈[/] [dim]v{nuc.get('version', '') or 'n/a'} · "
-                                 f"{nuc.get('templates_run', 0)} template(s)[/]")
+                                 f"{len(nuc.get('findings', []))} finding(s)[/]")
                 nt.add_column("Sev", justify="center")
                 nt.add_column("ID", style="bold")
                 nt.add_column("Detail")
@@ -4668,10 +4726,9 @@ class WebsiteRecon:
             "version": __version__,
             "target": self.domain,
             "started": datetime.now().isoformat(),
+            "duration_s": round(getattr(self, "scan_duration", 0.0), 1),
             "mode": "deep" if self.deep else "normal",
-            "modules_run": [ATTACK_MODULES[i - 1][0] for i in
-                            sorted(set(self.attack_set) | set(getattr(self, "_resume_done", [])))
-                            if 0 < i <= MAX_MODULE],
+            "modules_run": self._modules_run_names(),
             "summary": {
                 "dns_records": len(self.results['dns']),
                 "subdomains": len(set(self.results['subdomains'])),
@@ -4871,13 +4928,20 @@ class WebsiteRecon:
     # ---------------------------------------------------------- HTML Export
     def export_html(self, path):
         """Generate a standalone dark-themed HTML report (no external assets)."""
+        html_doc = self._render_html(self.export_dict())
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(html_doc)
+        return path
+
+    @staticmethod
+    def _render_html(d):
+        """Render a report dict to a standalone dark-themed HTML document (no external assets)."""
         from html import escape as _e
 
-        d = self.export_dict()
         s = d['summary']
-        risk = _risk_meter(self.results['secrets'],
-                           len(self.results['missing_security_headers']),
-                           [p for p in self.results['paths'] if str(p.get('status')) in ('200', '403')])
+        risk = _risk_meter(d.get('secrets', []),
+                           len(d.get('missing_security_headers', [])),
+                           [p for p in d.get('paths', []) if str(p.get('status')) in ('200', '403')])
         score, level, color, verdict, _ = risk
         css_color = {"green": "#22c55e", "yellow": "#eab308", "red": "#ef4444"}[color]
 
@@ -5250,7 +5314,7 @@ class WebsiteRecon:
         if nuc:
             nf = nuc.get('findings', [])
             if nf:
-                parts.append(sec(f"Nuclei Scan (v{nuc.get('version','?')} · {nuc.get('templates_run',0)} templates)",
+                parts.append(sec(f"Nuclei Scan (v{nuc.get('version','?')}) — {len(nf)} finding(s)",
                                  tbl(["Severity", "ID", "Detail"],
                                      [[f"<span class='chip {'red' if f['severity'] in ('CRITICAL','HIGH') else ('yellow' if f['severity']=='MEDIUM' else 'green')}'>{_e(f['severity'])}</span>",
                                        _e(f['id']), _e(str(f['detail'])[:140])] for f in nf[:80]]), "#ef4444"))
@@ -5331,7 +5395,7 @@ class WebsiteRecon:
   <h1>NULLVEIL</h1>
   <div class="sub">R E C O N &nbsp;R E P O R T<br>
     <strong>{_e(str(d.get('target', '')))}</strong> · Scanned: {_e(str(d.get('started', '')[:19]))} ·
-    Duration: {_e(str(round(self.scan_duration, 1)))}s · Modules: {_e(', '.join(d.get('modules_run', [])) or '-')} ·
+    Duration: {_e(str(round(d.get('duration_s') or 0, 1)))}s · Modules: {_e(', '.join(d.get('modules_run', [])) or '-')} ·
     Version {_e(str(d.get('version', '')))}
   </div>
 </header>
@@ -5341,8 +5405,8 @@ class WebsiteRecon:
     <div class="bar"><div style="width:{score}%"></div></div>
     <div class="score">{score}/100 — {verdict}</div>
     <div class="muted">Risk: {level} · Secrets: {s.get('secrets',0)} ·
-      Missing headers: {len(self.results['missing_security_headers'])} ·
-      Flagged paths: {len([p for p in self.results['paths'] if str(p.get('status')) in ('200','403')])}</div>
+      Missing headers: {len(d.get('missing_security_headers', []))} ·
+      Flagged paths: {len([p for p in d.get('paths', []) if str(p.get('status')) in ('200','403')])}</div>
   </div>
   {"".join(parts)}
 </main>
@@ -5352,9 +5416,425 @@ class WebsiteRecon:
 </footer>
 </body>
 </html>"""
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(html_doc)
+        return html_doc
 
+    def export_html(self, path):
+        """Generate a standalone dark-themed HTML report (no external assets)."""
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(self._render_html(self.export_dict()))
+        return path
+
+    @staticmethod
+    def render_html_from_dict(d, path):
+        """Render an arbitrary saved report dict (e.g. old JSON) to HTML."""
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(WebsiteRecon._render_html(d))
+        return path
+
+    # ---------------------------------------------------------- PDF Export
+    @staticmethod
+    def _html_to_pdf(html_doc, pdf_path):
+        """Render an HTML document to a client-ready PDF via headless Chromium.
+        Uses the same optional dependency as screenshots (playwright).
+        Returns (ok: bool, message: str)."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return False, ("playwright not installed — run: pip install playwright && "
+                           "playwright install chromium")
+        try:
+            import glob as _glob
+            _cache = os.path.expanduser("~/.cache/ms-playwright")
+            if not _glob.glob(os.path.join(_cache, "chromium*")):
+                return False, "browser binary not downloaded — run: playwright install chromium"
+        except Exception:
+            pass
+
+        async def _go():
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True,
+                                                   args=["--no-sandbox", "--disable-gpu"])
+                try:
+                    page = await browser.new_page()
+                    await page.set_content(html_doc, wait_until="load")
+                    await page.pdf(path=pdf_path, format="A4", print_background=True,
+                                   margin={"top": "12mm", "bottom": "12mm",
+                                           "left": "10mm", "right": "10mm"})
+                finally:
+                    await browser.close()
+
+        try:
+            asyncio.run(_go())
+            return True, pdf_path
+        except Exception as e:
+            return False, f"PDF render failed ({type(e).__name__}) — {e}"
+
+    def export_pdf(self, path):
+        """Save this scan as a client-ready PDF (renders the branded HTML report)."""
+        return self._html_to_pdf(self._render_html(self.export_dict()), path)
+
+    @classmethod
+    def pdf_from_dict_file(cls, json_path, pdf_path):
+        """Convert an existing NULLVEIL JSON report into a PDF."""
+        with open(json_path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return cls._html_to_pdf(cls._render_html(d), pdf_path)
+
+
+
+# ---------------------------------------------------------- Web Dashboard
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NULLVEIL · Recon Dashboard</title>
+<style>
+  :root{--bg:#080c18;--panel:#0f1626;--panel2:#131c30;--line:#1e2942;--txt:#dbe4f3;--mut:#7b8aa6;
+        --cri:#ef4444;--hig:#f97316;--med:#eab308;--low:#38bdf8;--inf:#64748b;--ok:#22c55e;--acc:#a855f7;--cy:#22d3ee}
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 700px at 75% -10%,#22104080,transparent),var(--bg);
+       color:var(--txt);font:14px/1.5 ui-sans-serif,system-ui,'Segoe UI',Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:18px;padding:14px 22px;border-bottom:1px solid var(--line);
+         background:#0a1020cc;backdrop-filter:blur(8px);position:sticky;top:0;z-index:9}
+  .brand{font-weight:800;letter-spacing:3px;font-size:19px}
+  .brand span{background:linear-gradient(90deg,var(--acc),var(--cy));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .tag{color:var(--mut);font-size:11px;letter-spacing:2px;text-transform:uppercase}
+  .grow{flex:1}
+  input,button{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:9px;
+               padding:9px 13px;font:inherit;outline:none}
+  input:focus{border-color:var(--acc)}
+  button{cursor:pointer;transition:.15s} button:hover{border-color:var(--acc);color:#fff}
+  .layout{display:grid;grid-template-columns:290px 1fr;min-height:calc(100vh - 58px)}
+  aside{border-right:1px solid var(--line);padding:12px;overflow:auto;max-height:calc(100vh - 58px)}
+  .scan{padding:10px 12px;border:1px solid transparent;border-radius:10px;cursor:pointer;margin-bottom:6px}
+  .scan:hover{background:var(--panel)}
+  .scan.on{background:var(--panel2);border-color:var(--acc)}
+  .scan .t{font-weight:600;display:flex;justify-content:space-between;gap:8px}
+  .scan .m{color:var(--mut);font-size:11px;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+  main{padding:20px 24px 70px;overflow:auto}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:12px;margin:6px 0 18px}
+  .kpi{background:linear-gradient(180deg,var(--panel),#0d1424);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+  .kpi .v{font-size:26px;font-weight:800} .kpi .l{color:var(--mut);font-size:11px;letter-spacing:1.4px;text-transform:uppercase}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin-bottom:16px}
+  .card h2{margin:0 0 12px;font-size:12px;letter-spacing:1.6px;text-transform:uppercase;color:#c9d6ee}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
+  tr:hover td{background:#0e1729}
+  .chip{display:inline-block;padding:1px 9px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.4px}
+  .CRITICAL{background:#ef444422;color:var(--cri)} .HIGH{background:#f9731622;color:var(--hig)}
+  .MEDIUM{background:#eab30822;color:var(--med)} .LOW{background:#38bdf822;color:var(--low)}
+  .INFO{background:#64748b22;color:var(--inf)}
+  .chip.mod{background:#a855f722;color:#c4a6ff;margin:2px}
+  .bars{display:flex;flex-direction:column;gap:7px;margin-top:4px}
+  .barrow{display:grid;grid-template-columns:74px 1fr 46px;align-items:center;gap:10px;font-size:12px}
+  .track{height:11px;background:#16203a;border-radius:6px;overflow:hidden}
+  .track>i{display:block;height:100%;border-radius:6px}
+  .meter{margin:2px 0 16px}
+  .meter .top{display:flex;justify-content:space-between;align-items:baseline}
+  .meter .score{font-size:30px;font-weight:800}
+  .meter .track{height:16px;margin-top:8px}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+  .shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px}
+  .shot{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#0a0f1c}
+  .shot img{width:100%;display:block}
+  .shot .cap{padding:7px 10px;font-size:11px;color:var(--mut);word-break:break-all}
+  ul{margin:4px 0;padding-left:18px} li{margin:2px 0;word-break:break-all}
+  code{background:#0a1120;padding:1px 6px;border-radius:5px;color:var(--cy);font-size:.9em}
+  .mut{color:var(--mut)} .empty{color:var(--mut);text-align:center;margin-top:120px;font-size:15px}
+  h3{font-size:12px;text-transform:uppercase;letter-spacing:1.4px;color:var(--mut);margin:18px 0 8px}
+  .err{color:#fca5a5}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="brand"><span>NULLVEIL</span></div>
+    <div class="tag">Recon Dashboard · Engine DeepHat</div>
+  </div>
+  <div class="grow"></div>
+  <input id="q" placeholder="filter findings…" style="width:230px">
+  <button id="refresh">↻ Refresh</button>
+</header>
+<div class="layout">
+  <aside id="list"></aside>
+  <main id="main"><div class="empty">Select a scan from the left panel →</div></main>
+</div>
+<script>
+const SEV_ORDER=['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
+const SEV_COLOR={CRITICAL:'#ef4444',HIGH:'#f97316',MEDIUM:'#eab308',LOW:'#38bdf8',INFO:'#64748b'};
+const e=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let SCANS=[],DATA=null;
+
+async function loadScans(){
+  const r=await fetch('/api/scans');const j=await r.json();SCANS=j.scans||[];
+  document.getElementById('list').innerHTML = SCANS.length? SCANS.map(s=>{
+    const n=(s.summary&&(s.summary.cve_issues+s.summary.audit_issues+s.summary.supply_issues+s.summary.nuclei_issues>0||0))||0;
+    const tot=findCount(s.summary);
+    return `<div class="scan" data-id="${e(s.id)}">
+      <div class="t"><span>${e(s.target)}</span><span class="chip ${tot.cri?'CRITICAL':(tot.hig?'HIGH':'INFO')}">${tot.all}</span></div>
+      <div class="m"><span>${e((s.when||'').slice(0,16).replace('T',' '))}</span>
+      <span>${(s.modules||[]).length} modules</span><span>${s.duration_s||0}s</span></div></div>`;
+  }).join('') : '<div class="mut" style="padding:10px">No scans yet. Run a scan first — every scan auto-saves.</div>';
+  document.querySelectorAll('.scan').forEach(el=>el.onclick=()=>openScan(el.dataset.id));
+  if(SCANS.length && !DATA) openScan(SCANS[0].id);
+}
+function findCount(s){ s=s||{}; const keys=['cve_issues','audit_issues','supply_issues','nuclei_issues','anomaly_issues','intel_issues','breach_issues','tls_issues','email_issues'];
+  let cri=0,hig=0,all=0; keys.forEach(k=>{all+=(s[k]||0)}); return {all,cri:s.cve_issues||0,hig:s.supply_issues||0}; }
+
+function findings(d){
+  const out=[];
+  const push=(section,arr,idKey)=>{(arr||[]).forEach(f=>{
+    const sev=(f.severity||'INFO').toUpperCase();
+    out.push({section,sev,id:f.id||f.check||'',detail:f.detail||f.title||f.message||'',evidence:f.evidence||''});
+  })};
+  push('API Audit',d.api_audit&&d.api_audit.findings);
+  push('External Intel',d.external_intel&&d.external_intel.findings);
+  push('CVE',d.cve&&d.cve.findings);
+  push('TLS',d.tls&&d.tls.findings);
+  push('Supply Chain',d.supply_chain&&d.supply_chain.findings);
+  push('Anomaly',d.anomaly&&d.anomaly.findings);
+  push('Threat Intel',d.threat_intel&&d.threat_intel.findings);
+  push('Breach',d.breach&&d.breach.findings);
+  push('Correlation',d.correlation&&d.correlation.findings);
+  push('Nuclei',d.nuclei&&d.nuclei.findings);
+  push('Email',d.email_security&&d.email_security.findings);
+  out.sort((a,b)=>SEV_ORDER.indexOf(a.sev)-SEV_ORDER.indexOf(b.sev));
+  return out;
+}
+
+async function openScan(id){
+  document.querySelectorAll('.scan').forEach(el=>el.classList.toggle('on',el.dataset.id===id));
+  const r=await fetch('/api/scan?id='+encodeURIComponent(id)); if(!r.ok)return;
+  DATA=await r.json(); DATA.__id=id; render(DATA);
+}
+function render(d){
+  const s=d.summary||{}, F=findings(d);
+  const crit=F.filter(f=>f.sev==='CRITICAL').length, high=F.filter(f=>f.sev==='HIGH').length,
+        med=F.filter(f=>f.sev==='MEDIUM').length;
+  let score=Math.min(100, crit*22+high*10+med*4+(s.secrets||0)*12+(s.takeover_risks||0)*25);
+  const verdict = score>=70?'CRITICAL EXPOSURE':score>=40?'HIGH EXPOSURE':score>=15?'MODERATE':'LOW RISK';
+  const color = score>=70?'var(--cri)':score>=40?'var(--hig)':score>=15?'var(--med)':'var(--ok)';
+  const cnt=sev=>F.filter(f=>f.sev===sev).length;
+  const maxc=Math.max(1,...SEV_ORDER.map(cnt));
+  const shots=(d.screenshots&&d.screenshots.shots)||[];
+  const chains=(d.attack_graph&&d.attack_graph.chains)||[];
+  const comp=d.compliance||{};
+
+  let html=`
+  <div class="meter">
+    <div class="top"><div><div class="tag">Exposure level</div>
+      <div class="score" style="color:${color}">${score}<span class="mut" style="font-size:16px">/100</span></div></div>
+      <div style="text-align:right"><div class="tag">Target</div>
+        <div style="font-weight:700;font-size:16px">${e(d.target)}</div>
+        <div class="mut" style="font-size:12px">${e((d.started||'').slice(0,19).replace('T',' '))} · v${e(d.version)} · ${e(d.mode)}</div></div></div>
+    <div class="track"><i style="width:${score}%;background:${color}"></i></div>
+    <div style="margin-top:6px;font-weight:700;color:${color}">${verdict}</div>
+  </div>
+  <div class="kpis">
+    ${kpi(crit,'Critical','var(--cri)')}${kpi(high,'High','var(--hig)')}${kpi(med,'Medium','var(--med)')}
+    ${kpi(s.secrets||0,'Secrets leaked','var(--cri)')}${kpi(s.subdomains||0,'Subdomains')}
+    ${kpi(s.open_ports||0,'Open ports')}${kpi(s.takeover_risks||0,'Takeover risks')}
+    ${kpi(chains.length,'Attack chains')}${kpi(shots.length,'Screenshots')}
+    ${kpi((comp.coverage_pct||0)+'%','Compliance')}
+  </div>
+  <div class="grid2">
+    <div class="panel">
+      <h3>Severity distribution</h3>
+      <div class="bars">${SEV_ORDER.map(v=>`<div class="barrow"><span>${v}</span>
+        <div class="track"><i style="width:${(cnt(v)/maxc*100).toFixed(1)}%;background:${SEV_COLOR[v]}"></i></div>
+        <span class="mut" style="text-align:right">${cnt(v)}</span></div>`).join('')}</div>
+      <h3>Modules run (${(d.modules_run||[]).length})</h3>
+      <div>${(d.modules_run||[]).map(m=>`<span class="chip mod">${e(m)}</span>`).join('')}</div>
+    </div>
+    <div class="panel">
+      <h3>Attack surface</h3>
+      <div class="kv">
+        <div><span class="mut">IPs</span><b>${(d.ips||[]).length}</span></div>
+        <div><span class="mut">Emails</span><b>${(d.emails||[]).length}</b></div>
+        <div class="mut" style="font-size:11px">${(d.tech_stack||[]).slice(0,14).map(e).join(' · ')}</div>
+      </div>
+      <h3>Compliance coverage</h3>
+      ${comp.frameworks? Object.entries(comp.frameworks).map(([k,v])=>`<div class="barrow"><span>${e(k)}</span>
+        <div class="track"><i style="width:${(v.coverage_pct||0)}%;background:var(--acc)"></i></div>
+        <span class="mut" style="text-align:right">${v.coverage_pct||0}%</span></div>`).join('') : '<div class="mut">not run</div>'}
+      <h3>Email security</h3>
+      <ul><li>SPF: <code>${e((d.email_security&&d.email_security.spf)||'none')}</code></li>
+      <li>DMARC: <code>${e((d.email_security&&d.email_security.dmarc)||'none')}</code></li></ul>
+    </div>
+  </div>
+
+  <h3>Findings (${F.length})</h3>
+  <div id="ftable"></div>
+
+  ${chains.length?`<h3>Attack chain hypotheses (${chains.length})</h3><div class="panel">${
+     chains.map(c=>`<div style="margin-bottom:10px"><span class="chip ${c.severity||'HIGH'}">${e(c.severity||'')}</span>
+       <b style="margin-left:8px">${e(c.name||c.title||'chain')}</b>
+       <div class="mut" style="font-size:12px;margin-top:3px">${e(c.narrative||c.detail||'')}</div></div>`).join('')}</div>`:''}
+
+  ${shots.length?`<h3>Screenshots (${shots.length})</h3><div class="shots">${
+     shots.map((x,i)=>x.file?`<div class="shot"><img loading="lazy" src="/api/shot?id=${encodeURIComponent(d.__id)}&i=${i}">
+       <div class="cap">${e(x.status||'')} · ${e(x.url||'')}</div></div>`:'').join('')}</div>`:''}
+
+  <div class="grid2" style="margin-top:18px">
+    <div class="panel"><h3>Assets</h3>
+      <h4 class="tag">Subdomains</h4><ul>${list(d.subdomains,40)}</ul>
+      <h4 class="tag">Open ports</h4><ul>${list((d.open_ports||[]).map(p=>p.port+' ('+(p.service||'?')+')'),30)}</ul>
+    </div>
+    <div class="panel"><h3>Secrets & intel</h3>
+      <h4 class="tag">Secrets (masked)</h4><ul>${list(d.secrets,30)}</ul>
+      <h4 class="tag">Tech stack</h4><ul>${list(d.tech_stack,40)}</ul>
+    </div>
+  </div>
+  ${(d.errors&&d.errors.length)?`<h3>Notes / errors</h3><div class="panel err">${list(d.errors,40)}</div>`:''}
+  `;
+  document.getElementById('main').innerHTML=html;
+  renderFindings(F);
+  document.getElementById('q').oninput=()=>renderFindings(F);
+}
+function kpi(v,l,col){return `<div class="kpi"><div class="tag">${e(l)}</div>
+  <div class="kpi-v" style="${col?'color:'+col:''}">${e(v)}</div></div>`}
+function list(a,n){a=a||[];return a.length?a.slice(0,n||99).map(x=>`<li>${e(x)}</li>`).join(''):'<li class="mut">none</li>'}
+function renderFindings(F){
+  const q=(document.getElementById('q').value||'').toLowerCase();
+  const rows=F.filter(f=>!q||(f.section+f.id+f.detail).toLowerCase().includes(q));
+  document.getElementById('ftable').innerHTML=`<div class="panel"><table><thead><tr>
+    <th>Sev</th><th>Section</th><th>Finding</th><th>Detail</th></tr></thead><tbody>${
+    rows.slice(0,500).map(f=>`<tr><td><span class="chip ${f.sev}">${e(f.sev)}</span></td>
+      <td class="mut">${e(f.section)}</td><td>${e(f.id)}</td>
+      <td>${e(f.detail)}${f.evidence?`<div class="mut" style="font-size:11px">${e(f.evidence)}</div>`:''}</td></tr>`).join('')
+    ||'<tr><td colspan="4" class="mut">no findings</td></tr>'}</tbody></table></div>`;
+}
+document.getElementById('refresh').onclick=loadScans;
+loadScans();
+setInterval(loadScans,30000);
+</script>
+</body>
+</html>
+"""
+
+
+def serve_dashboard(port=8899, open_browser=True, host="127.0.0.1"):
+    """Zero-dependency local web dashboard over NULLVEIL scan history.
+    Stdlib-only HTTP server bound to localhost; embedded offline SPA (no CDN)."""
+    import re as _re
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse, parse_qs
+
+    hist_dir = WebsiteRecon.HISTORY_DIR
+
+    def _entry_path(scan_id):
+        if not _re.fullmatch(r"[A-Za-z0-9-]{1,64}", scan_id or ""):
+            return None
+        p = os.path.join(hist_dir, scan_id + ".json")
+        return p if os.path.isfile(p) else None
+
+    def _load_entry(scan_id):
+        p = _entry_path(scan_id)
+        if not p:
+            return None
+        try:
+            with open(p, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "NULLVEIL-Dashboard"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+        def _json(self, obj, code=200):
+            self._send(code, json.dumps(obj, ensure_ascii=False, default=str),
+                       "application/json; charset=utf-8")
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            qs = parse_qs(u.query)
+            if u.path in ("/", "/index.html"):
+                return self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+            if u.path == "/api/scans":
+                scans = []
+                for x in WebsiteRecon._history_list():
+                    scans.append({"id": x.get("id"), "target": x.get("domain"),
+                                  "url": x.get("target"), "when": x.get("when"),
+                                  "duration_s": x.get("duration_s"), "version": x.get("version"),
+                                  "modules": x.get("modules_run", []),
+                                  "summary": x.get("summary", {})})
+                return self._json({"scans": scans, "history_dir": WebsiteRecon.HISTORY_DIR})
+            if u.path == "/api/scan":
+                x = _load_entry((qs.get("id") or [""])[0])
+                if not x:
+                    return self._json({"error": "scan not found"}, 404)
+                return self._json(x.get("report", {}))
+            if u.path == "/api/shot":
+                x = _load_entry((qs.get("id") or [""])[0])
+                try:
+                    idx = int((qs.get("i") or ["-1"])[0])
+                except Exception:
+                    idx = -1
+                if not x or idx < 0:
+                    return self._send(404, "not found", "text/plain")
+                shots = ((x.get("report", {}) or {}).get("screenshots", {}) or {}).get("shots", []) or []
+                if idx >= len(shots):
+                    return self._send(404, "not found", "text/plain")
+                fp = shots[idx].get("file", "")
+                if not (fp and str(fp).lower().endswith(".png") and os.path.isfile(fp)):
+                    return self._send(404, "not found", "text/plain")
+                # constrain to user-owned locations (home / workspace)
+                rp = os.path.realpath(fp)
+                roots = [os.path.realpath(os.path.expanduser("~")),
+                         os.path.realpath(os.getcwd())]
+                if not any(rp == r or rp.startswith(r + os.sep) for r in roots):
+                    return self._send(403, "forbidden", "text/plain")
+                try:
+                    with open(rp, "rb") as fh:
+                        return self._send(200, fh.read(), "image/png")
+                except Exception:
+                    return self._send(500, "read error", "text/plain")
+            return self._send(404, "NULLVEIL dashboard: not found", "text/plain")
+
+    try:
+        httpd = ThreadingHTTPServer((host, port), Handler)
+    except OSError as ex:
+        console.print(f"[red]Cannot start dashboard on {host}:{port}[/] — {ex}")
+        console.print("[dim]Try another port:[/] nullveil --dashboard 9000")
+        return
+    url = f"http://{host}:{port}"
+    console.print(Panel(f"[bold green]Dashboard live →[/] [bold cyan]{url}[/]\n"
+                        f"[dim]History: {WebsiteRecon.HISTORY_DIR}[/]\n"
+                        f"[dim]Localhost-only · offline · Ctrl+C to stop[/]",
+                        title="[bold magenta]◈ NULLVEIL DASHBOARD ◈[/]", border_style="magenta"))
+    if open_browser:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Dashboard stopped.[/]")
+    finally:
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------- CLI
@@ -5375,6 +5855,9 @@ def main():
                "  nullveil example.com --dot graph.dot -> export attack path graph as DOT\n"
                "  nullveil example.com --correlate a.com,b.com -> cross-org correlation\n"
                "  HIBP_API_KEY=xxx nullveil example.com -a breach -> breach monitoring\n"
+               "  nullveil example.com --pdf report.pdf -> client-ready PDF report\n"
+               "  nullveil --dashboard                -> local web dashboard (scan history)\n"
+               "  nullveil --pdf-from old.json --pdf out.pdf -> convert saved JSON to PDF\n"
                "  nullveil -l                         -> list attack modules\n\n"
                "Owner: NULLVEIL | Use only on authorized targets."
     )
@@ -5388,7 +5871,7 @@ def main():
     parser.add_argument("-p", "--ports", type=str, help="Custom comma-separated ports (e.g. 80,443,8080)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Less console output")
     parser.add_argument("-a", "--attack", metavar="LIST", default=None,
-                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate or 'all'")
+                        help="Comma-separated modules: 1=dns,2=sub,3=ports,4=http,5=ssl,6=content,7=robots,8=paths,9=users,10=api,11=waf,12=email,13=audit,14=ext,15=cve,16=crawl,17=tls,18=supply,19=crit,20=anom,21=intel,22=breach,23=comp,24=graph,25=correlate,26=shot,27=nuclei or 'all'")
     parser.add_argument("-m", "--menu", action="store_true", help="Interactive attack selection menu")
     parser.add_argument("-l", "--list-attacks", action="store_true", help="List available attack modules")
     parser.add_argument("-R", "--repro", metavar="FILE", help="Export evidence/reproduction pack (benign, no exploit payloads) to markdown file")
@@ -5401,12 +5884,17 @@ def main():
     parser.add_argument("--no-history", action="store_true", help="Do not auto-save this scan to history")
     parser.add_argument("--nuclei-templates", metavar="DIR", default=None,
                         help="Custom nuclei template path/dir (used by -a nuclei)")
+    parser.add_argument("--pdf", metavar="FILE", default=None,
+                        help="Export a client-ready PDF report (headless Chromium; needs playwright)")
+    parser.add_argument("--pdf-from", metavar="JSON", default=None,
+                        help="Convert an existing NULLVEIL JSON report to PDF (use with --pdf)")
+    parser.add_argument("--dashboard", nargs="?", const="8899", metavar="PORT", default=None,
+                        help="Serve a local web dashboard of scan history (default port: 8899)")
     parser.add_argument("-V", "--version", action="version", version=f"NULLVEIL Recon v{__version__} | Owner: NULLVEIL | Engine: DeepHat")
     args = parser.parse_args()
 
     if args.history:
-        any_recon = WebsiteRecon("example.com")   # only to reach history helpers
-        entries = any_recon._history_list()
+        entries = WebsiteRecon._history_list()
         console.print("[bold cyan]NULLVEIL Scan History[/]  [dim](~/.nullveil/history)[/]\n")
         if not entries:
             console.print("  [yellow]No saved scans yet.[/] Run a scan first — every scan auto-saves here.")
@@ -5426,6 +5914,19 @@ def main():
             console.print("\n[dim]Resume: nullveil <target> --resume [ID][/]")
         return
 
+    if args.pdf_from:
+        if not args.pdf:
+            console.print("[yellow]--pdf-from needs --pdf FILE[/] (e.g. --pdf-from old.json --pdf out.pdf)")
+            sys.exit(1)
+        ok, msg = WebsiteRecon.pdf_from_dict_file(args.pdf_from, args.pdf)
+        if ok:
+            console.print(f"[bold green]PDF report saved:[/] {msg}")
+        else:
+            console.print(f"[red]PDF export failed:[/] {msg}")
+            sys.exit(1)
+        if not args.target and args.dashboard is None:
+            return
+
     if args.list_attacks:
         console.print("[bold cyan]NULLVEIL Attack Modules[/]")
         console.print("")
@@ -5439,8 +5940,11 @@ def main():
         return
 
     if not args.target:
+        if args.dashboard is not None:
+            serve_dashboard(port=int(args.dashboard))
+            return
         parser.print_help()
-        console.print("\n[red]Error:[/] target is required (unless using --list-attacks)")
+        console.print("\n[red]Error:[/] target is required (unless using -l / --history / --dashboard / --pdf-from)")
         sys.exit(1)
 
     # Attack selection: -m menu > -a list > default ALL
@@ -5518,6 +6022,20 @@ def main():
             console.print(f"[bold green]Repro pack saved:[/] {outp}")
     except Exception as e:
         console.print(f"[bold red]Failed to export repro:[/] {type(e).__name__} — {e}")
+
+    if args.pdf:
+        try:
+            ok, msg = recon.export_pdf(args.pdf)
+            if ok:
+                size = os.path.getsize(msg) // 1024 if os.path.exists(msg) else 0
+                console.print(f"[bold green]PDF report saved:[/] {msg} [dim]({size} KB)[/]")
+            else:
+                console.print(f"[yellow]PDF skipped:[/] {msg}")
+        except Exception as e:
+            console.print(f"[bold red]Failed to export PDF:[/] {type(e).__name__} — {e}")
+
+    if args.dashboard is not None:
+        serve_dashboard(port=int(args.dashboard))
 
 
 if __name__ == "__main__":
