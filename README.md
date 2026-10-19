@@ -21,6 +21,20 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 
 ---
 
+## ⚡ Quick Start (TL;DR)
+
+```bash
+git clone https://github.com/nullveil0x/nullveil-recon.git
+cd nullveil-recon
+pip install -r requirements.txt
+python3 nullveil_recon.py example.com                  # full scan (27 modules)
+python3 nullveil_recon.py example.com --dashboard      # scan → PDF-ready UI opens
+```
+
+Scan a target you are **authorized** to test, then explore the results in JSON, HTML, PDF, or the web dashboard.
+
+---
+
 ## ⚠️ Disclaimer
 
 This tool is for **education, bug bounty, and authorized security testing ONLY**.
@@ -248,11 +262,38 @@ python3 nullveil_recon.py -l
 
 ---
 
+## 🖥 Web Dashboard (v3.2.0+)
+
+A **zero-dependency**, **localhost-only**, **offline** web UI (Python stdlib `http.server` + an embedded SPA — no CDN, no extra pip package) that reads your local scan history.
+
+```bash
+# After / alongside a scan — dashboard opens automatically when the scan finishes
+python3 nullveil_recon.py example.com --dashboard
+python3 nullveil_recon.py example.com --dashboard 9000     # custom port
+
+# Dashboard only — browse every past scan (no target needed)
+python3 nullveil_recon.py --dashboard
+```
+
+**What you get:** exposure score + severity charts · findings with search/filter · screenshot gallery · per-module breakdown · clickable scan list.
+
+| Thing to know | Detail |
+|---|---|
+| Does it open by itself after a scan? | **Only if you pass `--dashboard`** in the same command, or chain `nullveil site.com && nullveil --dashboard` |
+| Where does the data come from? | `~/.nullveil/history/` — **every** past scan shows up, no re-scan needed |
+| URL | `http://127.0.0.1:8899` (default) |
+| How to stop it | **`Ctrl + C`** in the terminal running it |
+| `Address already in use` | Another dashboard is running — use `--dashboard 9000`, or stop the first one |
+
+> Binds to `127.0.0.1` only. Screenshot serving is index-based and constrained to your own home/workspace dirs.
+
+---
+
 ## 📖 Sample Output
 
 ```
       Target: example.com   Mode: NORMAL   Started: 2026-10-19 01:10:21
-      Attacks: dns, sub  (2/25 modules)
+      Attacks: dns, sub  (2/27 modules)
 
 ╔══════════════════════════════ ◈ RECON REPORT ◈ ══════════════════════════════╗
 ║                                 example.com                                  ║
@@ -346,6 +387,25 @@ Compliance output is **evidence-based partial mapping**, never a certification c
 - **Dashboard** is a **zero-dependency**, **localhost-only**, **offline** standard-library web server — it reads your local scan history and renders charts/findings/screenshots in the browser. Screenshot serving is index-based (no user-controlled paths) and constrained to your own home/workspace directories.
 - **PDF export** renders the branded HTML report through the same headless Chromium used for screenshots (`--pdf`), and can convert any saved JSON report (`--pdf-from`).
 - **Interrupt-safe scanning**: `Ctrl+C` saves partial results to history, and `--resume` finishes exactly the modules that didn't complete — nothing is re-scanned twice.
+
+---
+
+## 🩺 Troubleshooting / FAQ
+
+| Problem | Fix |
+|---|---|
+| `nullveil: command not found` | Use the full path (`python3 nullveil_recon.py …`) or create the symlink (see *install as a `nullveil` command*) |
+| `ModuleNotFoundError: No module named 'httpx'` (or `dns` / `rich`) | `pip install -r requirements.txt` |
+| PDF skipped / no PDF produced | PDF uses headless Chromium → `pip install playwright && playwright install chromium` |
+| Screenshots skipped (`-a shot`) | Same as PDF — install `playwright` + Chromium |
+| `nuclei` skipped (`-a nuclei`) | Optional binary: `go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+| Dashboard: `Address already in use` | Another dashboard is running — use `nullveil --dashboard 9000`, or stop the first one |
+| `crt.sh` 502 / Wayback timeout in the report's `errors` | External services being slow — **not** a tool bug; all other modules still ran |
+| Scan looks thin / target is large | Re-run with `-d` (deep mode: bigger wordlists, more ports & paths) |
+| I stopped a scan with `Ctrl + C` | Partial results were saved — `nullveil <target> --resume` runs only the missing modules |
+| Where are screenshots saved? | `nullveil_shots/<domain>/` (also embedded in the HTML report) |
+| Where is scan history stored? | `~/.nullveil/history/` — the dashboard reads from here |
+| `--pdf-from` a history file | Supported (v3.2.2+) — history entries are auto-unwrapped |
 
 ---
 
