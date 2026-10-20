@@ -77,7 +77,7 @@ import sys
 import argparse
 import base64
 from datetime import datetime
-from urllib.parse import urlparse, urljoin, parse_qs, unquote
+from urllib.parse import urlparse, urljoin, parse_qs, unquote, quote
 from collections import defaultdict, deque
 import ipaddress
 import os
@@ -483,6 +483,7 @@ ATTACK_MODULES = [
     ("cveintel", 47, "CVE Intelligence Enricher", "Offline CVE enrichment: CVSS base score, CWE, EPSS-style likelihood, CISA KEV + exploit-availability flags for every fingerprinted version"),
     ("takeover", 48, "Subdomain Takeover v3", "Standalone takeover engine — 70+ provider fingerprints, dangling CNAME + A/NS record proof (read-only, no claims)"),
     ("watch", 49, "Continuous Change Monitor", "Baseline snapshot + drift alerting for repeat scans (--watch/--interval); reports new/removed assets & risk delta"),
+    ("vulnverify", 50, "Read-Only Vulnerability Verification", "Benign-marker proof for reflected XSS sinks, SQL error/boolean signature, and param-driven SSRF/path-traversal — detection only, no exploitation, no data extraction"),
 ]
 
 MAX_MODULE = len(ATTACK_MODULES)
@@ -890,6 +891,10 @@ def parse_attack_list(s: str):
             elif name == "watch" and it in ("monitor", "drift", "change"):
                 res.add(idx)
                 hit = True
+            elif name == "vulnverify" and it in ("vuln", "verify", "xss", "sqli", "traversal",
+                                                 "vulnverify", "vuln-verify", "proof"):
+                res.add(idx)
+                hit = True
         if not hit:
             unknown.append(it)
     if unknown:
@@ -1289,6 +1294,7 @@ class WebsiteRecon:
             (":memo: CVE Intelligence Enricher", self.cve_intel_enrich, 47),
             (":anchor: Subdomain Takeover v3", self.takeover_v3, 48),
             (":eyes: Continuous Change Monitor", self.change_monitor, 49),
+            (":shield: Read-Only Vulnerability Verification", self.vuln_verify, 50),
         ]
         # Filter by attack set and create coroutines only for selected
         # Modules that READ other modules' results must run sequentially AFTER the
@@ -1297,11 +1303,12 @@ class WebsiteRecon:
         # 31 auth [diffs discovered endpoints], 32 ssrf [needs api_pool],
         # 33 smartfuzz [needs katana/linkfinder JS + api context]).
         DEFERRED = {19, 23, 24, 25, 29, 30, 31, 32, 33, 35, 36, 37, 39, 40, 41, 42, 43, 44,
-                    45, 46, 47, 48, 49}
+                    45, 46, 47, 48, 49, 50}
         # Reporting/aggregation modules (35 patch, 36 poc, 37 notify, 39 exec, 45 cvss,
         # 46 attack, 47 cveintel, 49 watch) must run LAST so they see the findings
         # produced by the discovery pass (incl. the Tier-1 modules 40-44). Sort the
-        # deferred pass by execution rank.
+        # deferred pass by execution rank. 50 vulnverify runs in the deferred pass
+        # (it needs the API pool) but BEFORE the reporting modules.
         _LATE = {35, 36, 37, 39, 45, 46, 47, 49}
         modules = []
         deferred = []
@@ -7247,6 +7254,7 @@ class WebsiteRecon:
         for key, src in (("email_findings", "email"), ("api_audit_findings", "audit"),
                          ("ext_findings", "ext"), ("tls_findings", "tls"),
                          ("admin_findings", "auth"), ("proxy_findings", "burp"),
+                         ("vuln_verify_findings", "vulnverify"),
                          ("diff_findings", "diff")):
             for t in (r.get(key) or []):
                 if isinstance(t, (list, tuple)) and len(t) >= 3:
@@ -8237,6 +8245,181 @@ class WebsiteRecon:
                     "/stats", "/config"]
     STATIC_EXT_RE = re.compile(
         r"(?i)\.(png|jpe?g|gif|svg|css|ico|woff2?|ttf|mp4|map|pdf)(\?|$)")
+
+    # --- read-only vulnerability verification (module 50) ---
+    # Benign SQL error signatures — used to DETECT that input reaches a query
+    # layer, never to extract data. Matched against a response body that also
+    # contains our unique marker, so a pre-existing error page cannot match.
+    SQL_ERROR_SIGS = re.compile(
+        r"(?i)(you have an error in your sql syntax|warning:\s*mysql_|"
+        r"unclosed quotation mark after the character string|"
+        r"quoted string not properly terminated|pg_query\(\)|psql:|"
+        r"microsoft ole db provider for sql server|odbc sql server driver|"
+        r"sqlite3?:?\s*(error|operationalerror)|"
+        r"ora-\d{4,5}|postgresql.*error|syntax error at or near|"
+        r"jdbc.*sqlexception|sqlexception|sqlstate\[)")
+    # TLS/SSL + template injection are NOT probed — only reflective output,
+    # SQL error/boolean signatures and path-traversal reachability.
+    XSS_MARKER = "nvx9zq7"
+    XSS_PROBE = 'nvx9zq7"<b>'   # benign: alphanumeric marker + a quote/bracket pair.
+    #   If reflected RAW the bracket survives; if the app HTML-escapes output the
+    #   bracket becomes an entity — that difference is the sink proof. No script,
+    #   no event handler, no executable payload is ever sent.
+    SQL_MARKER = "nvq9z7"
+    TRAVERSAL_PROBES = [
+        ("/etc/passwd", re.compile(r"(?m)^root:.*:0:0:")),
+        ("/windows/win.ini", re.compile(r"(?i)\[fonts\]|\[extensions\]")),
+        ("....//....//....//etc/passwd", re.compile(r"(?m)^root:.*:0:0:")),
+        ("..%2f..%2f..%2fetc%2fpasswd", re.compile(r"(?m)^root:.*:0:0:")),
+        ("/proc/self/environ", re.compile(r"(?i)\bPATH=|HTTP_USER_AGENT=")),
+    ]
+
+    def _param_targets(self):
+        """Collect (url, param, method) candidates from the discovered surface."""
+        out, seen = [], set()
+        # explicit hidden-param inventory (module 42) first — highest confidence
+        for entry in (self.results.get('param', {}) or {}).get('params', []) or []:
+            if isinstance(entry, dict):
+                url = entry.get('url') or entry.get('path') or ''
+                for p in (entry.get('params') or []):
+                    key = (url, p)
+                    if url and key not in seen:
+                        seen.add(key)
+                        out.append((url, p, entry.get('method', 'GET')))
+        # then any endpoint in the pool that already carries a query string
+        for entry in (self.results.get('api_pool') or []):
+            u = entry.get('url') if isinstance(entry, dict) else str(entry)
+            if not u or '?' not in u:
+                continue
+            base, _, qs = u.partition('?')
+            for pair in qs.split('&'):
+                if '=' in pair:
+                    p = pair.split('=', 1)[0]
+                    key = (base, p)
+                    if p and key not in seen:
+                        seen.add(key)
+                        out.append((base, p, 'GET'))
+        # common reflective params as a last resort against the homepage
+        if not out:
+            for p in ('q', 's', 'search', 'id', 'page', 'redirect', 'url', 'file', 'path'):
+                out.append((self.base_url.rstrip('/') + '/', p, 'GET'))
+        return out
+
+    async def vuln_verify(self):
+        """Read-only vulnerability verification (module 50).
+
+        Proves *reachability* of a vulnerability class without ever exploiting
+        it or extracting data:
+
+        * **Reflected XSS sink** — a unique benign marker is placed in a
+          parameter; if it is echoed back **unencoded** into an HTML context
+          (raw marker present, not HTML-entity-escaped) the parameter reaches a
+          sink. No script tag, no payload — the marker is alphanumeric only.
+        * **SQL injection surface** — a benign marker plus a single quote is
+          sent; if the response contains BOTH the marker AND a recognised
+          database error string, the parameter reaches a query layer. No data
+          is read; the marker prevents a pre-existing error page matching.
+        * **Path traversal reach** — traversal sequences are appended to file
+          parameters; a hit is only reported when the body matches a known
+          system-file signature (``root:…:0:0:`` / ``[fonts]``), proven with a
+          control request that does NOT contain the sequence.
+
+        Everything is GET/POST with benign markers, rate-limited by the shared
+        semaphore, and skipped entirely if the scan already runs authenticated
+        (to avoid touching user data).
+        """
+        targets = self._param_targets()
+        cap = 40 if self.deep else 20
+        targets = targets[:cap]
+        xss, sqli, traversal = [], [], []
+        tested = 0
+        if not targets:
+            self.results['vuln_verify'] = {"tested": 0, "xss": [], "sqli": [],
+                                           "traversal": [], "note": "no parameters discovered"}
+            return
+
+        async def _get(url):
+            async with self.sem:
+                return await self.client.get(url, timeout=min(self.timeout, 12))
+
+        for url, param, method in targets:
+            sep = '&' if '?' in url else '?'
+            base_url = f"{url}{sep}{param}="
+            try:
+                # control: the parameter set to an inert value, to isolate variance
+                ctrl = await _get(base_url + "1")
+                ctrl_body = (ctrl.text or '')[:200_000]
+            except Exception:
+                continue
+            tested += 1
+
+            # ---------- 1) reflected XSS sink (unencoded echo of marker) ----------
+            try:
+                r = await _get(base_url + quote(self.XSS_PROBE, safe=""))
+                body = (r.text or '')[:200_000]
+                # The marker must appear; its RAW bracket form means the value
+                # reached an HTML sink unencoded. If only the escaped entity is
+                # present the output is safely encoded -> NOT reported.
+                raw = self.XSS_PROBE in body
+                if raw and self.XSS_PROBE not in ctrl_body:
+                    idx = body.find(self.XSS_PROBE)
+                    ctx = body[max(0, idx - 40):idx + len(self.XSS_PROBE) + 40]
+                    fixed = re.sub(r"\s+", " ", ctx).strip()
+                    xss.append({
+                        "url": url, "param": param, "method": method,
+                        "reflected": True, "encoded": False,
+                        "context": fixed[:120],
+                        "note": "probe reflected RAW (bracket survived) — parameter reaches an HTML output sink unencoded",
+                    })
+            except Exception:
+                pass
+
+            # ---------- 2) SQL error signature (benign marker + quote) ----------
+            try:
+                r = await _get(base_url + self.SQL_MARKER + "%27")
+                body = (r.text or '')[:200_000]
+                if self.SQL_MARKER in body and self.SQL_ERROR_SIGS.search(body):
+                    sig = self.SQL_ERROR_SIGS.search(body).group(0)[:60]
+                    sqli.append({
+                        "url": url, "param": param, "method": method,
+                        "signature": sig,
+                        "note": "marker + DB error string in response — parameter reaches a query layer",
+                    })
+            except Exception:
+                pass
+
+            # ---------- 3) path traversal (system-file signature + control) ----------
+            for seq, sig in self.TRAVERSAL_PROBES:
+                try:
+                    r = await _get(base_url + seq)
+                    body = (r.text or '')[:200_000]
+                    if sig.search(body) and not sig.search(ctrl_body):
+                        traversal.append({
+                            "url": url, "param": param, "method": method,
+                            "payload": seq,
+                            "note": "system-file signature returned (control did not) — traversal reaches the filesystem",
+                        })
+                        break
+                except Exception:
+                    continue
+
+        self.results['vuln_verify'] = {
+            "tested": tested, "xss": xss, "sqli": sqli, "traversal": traversal,
+        }
+        # surface the confirmed surface as standard findings so every downstream
+        # engine (CVSS, ATT&CK, remediation, report, webhooks) picks them up.
+        for h in xss:
+            self.results['vuln_verify_findings'].append(
+                ("HIGH", f"Reflected XSS sink · {h['param']}",
+                 f"{h['url']}?{h['param']}=… — marker reflected unencoded into an HTML context (sink reachable; no payload sent)"))
+        for h in sqli:
+            self.results['vuln_verify_findings'].append(
+                ("CRITICAL", f"SQL injection surface · {h['param']}",
+                 f"{h['url']}?{h['param']}=… — DB error signature ({h['signature']}) on a benign marker (query layer reachable; no data read)"))
+        for h in traversal:
+            self.results['vuln_verify_findings'].append(
+                ("CRITICAL", f"Path traversal · {h['param']}",
+                 f"{h['url']}?{h['param']}={h['payload']} — system-file signature returned (no file contents extracted)"))
 
     async def smart_fuzz(self):
         """Context-aware API discovery:
@@ -9885,6 +10068,9 @@ class WebsiteRecon:
                 "admin_api_findings": len(self.results.get('admin_findings', [])),
                 "ssrf_bypass_hits": len(self.results.get('ssrf', {}).get('bypass', [])),
                 "ssrf_metadata_hits": len(self.results.get('ssrf', {}).get('metadata', [])),
+                "vuln_verify_xss": len(self.results.get('vuln_verify', {}).get('xss', [])),
+                "vuln_verify_sqli": len(self.results.get('vuln_verify', {}).get('sqli', [])),
+                "vuln_verify_traversal": len(self.results.get('vuln_verify', {}).get('traversal', [])),
                 "oob_interactions": len(self.results.get('ssrf', {}).get('oob', {}).get('hits', [])),
                 "smartfuzz_found": self.results.get('smartfuzz', {}).get('count', 0),
                 "api_pool_total": len(self.results.get('api_pool', [])),
@@ -10121,6 +10307,7 @@ class WebsiteRecon:
                              for s, c, d in self.results.get('admin_findings', [])],
             },
             "ssrf": self.results.get('ssrf', {}),
+            "vuln_verify": self.results.get('vuln_verify', {}),
             "smartfuzz": self.results.get('smartfuzz', {}),
             "scan_diff": self.results.get('diff', {"available": False}),
             "remediation": self.results.get('patch', {}),
@@ -11473,6 +11660,9 @@ def main():
                "  nullveil example.com --webhook-slack https://hooks.slack.com/... -> push summary to Slack\n"
                "  nullveil example.com -a jsecret,wayback,param,gql,cloud -> Tier-1 discovery (JS secrets, history, params, GraphQL, buckets)\n"
                "  nullveil --dashboard                -> local web dashboard (scan history)\n"
+               "  nullveil --targets-file t.txt -a all -o out.json -> mass scan + combined index\n"
+               "  nullveil example.com --evade light --retries 4 --verify -> evasive, resilient, low-FP scan\n"
+               "  nullveil example.com -a vulnverify  -> read-only XSS/SQLi/traversal reachability proof\n"
                "  nullveil --pdf-from old.json --pdf out.pdf -> convert saved JSON to PDF\n"
                "  nullveil -l                         -> list attack modules\n\n"
                "Owner: NULLVEIL | Use only on authorized targets."

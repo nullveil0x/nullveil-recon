@@ -34,7 +34,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 git clone https://github.com/nullveil0x/nullveil-recon.git
 cd nullveil-recon
 pip install -r requirements.txt
-python3 nullveil_recon.py example.com                  # full scan (48 modules)
+python3 nullveil_recon.py example.com                  # full scan (49 modules)
 python3 nullveil_recon.py example.com --dashboard      # scan → PDF-ready UI opens
 ```
 
@@ -107,6 +107,7 @@ By using NULLVEIL Recon you agree to the [EULA](EULA.md). Full policy:
 | 47 | **CVE Intelligence Enricher** | **`cveintel`: enriches each fingerprinted CVE. Curated **offline intel** by default (CVSS, CWE, EPSS-style, CISA KEV, exploit-availability → P1–P4 patch priority); add `--cve-live` to merge **LIVE NVD 2.0 + FIRST EPSS + CISA KEV** data (disk-cached, no API key, graceful offline fallback)** |
 | 48 | **Subdomain Takeover v3** | **`takeover`: dedicated takeover engine with 70+ provider fingerprints (S3/CloudFront/Heroku/GitHub Pages/Netlify/Vercel/Azure/Fastly/Firebase…) — resolves full CNAME chains and matches unclaimed-resource HTTP signatures. Read-only: nothing is registered or claimed** |
 | 49 | **Continuous Change Monitor** | **`watch`: baseline snapshot + drift alerting for repeat scans (`--watch [N] --interval SEC`) — reports new/removed assets and a risk delta/verdict (REGRESSION/IMPROVEMENT/STABLE); also usable as a CI drift gate** |
+| 50 | **Read-Only Vulnerability Verification** | **`vulnverify`: benign-marker proof for reflected-XSS sinks, SQL error/boolean signatures and param-driven path traversal — proves *reachability* only, never sends an executable payload or extracts data** |
 
 **Plus:**
 - 🎨 Premium ASCII banner + live progress bar
@@ -202,7 +203,7 @@ python3 nullveil_recon.py TARGET [options]
 ### Examples
 
 ```bash
-# Full scan (all 48 modules)
+# Full scan (all 49 modules)
 python3 nullveil_recon.py example.com
 
 # Interactive attack menu — pick modules by number
@@ -338,6 +339,8 @@ python3 nullveil_recon.py example.com --evade light                     # rotate
 python3 nullveil_recon.py example.com --evade stealth --evade-rotate-every 3
 # v3.9.0: deep accuracy — re-verify findings, drop false positives
 python3 nullveil_recon.py example.com -a paths --verify                  # second independent probe; non-reproducers removed
+# v3.9.0: read-only vulnerability verification (reachability proof, no payloads)
+python3 nullveil_recon.py example.com -a vulnverify                      # benign-marker XSS / SQL-error / traversal proof
 
 # v3.2.0: client-ready PDF report
 python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
@@ -449,7 +452,7 @@ python3 nullveil_recon.py --dashboard
 
 ```
       Target: example.com   Mode: NORMAL   Started: 2026-10-19 01:10:21
-      Attacks: dns, sub  (2/48 modules)
+      Attacks: dns, sub  (2/49 modules)
 
 ╔══════════════════════════════ ◈ RECON REPORT ◈ ══════════════════════════════╗
 ║                                 example.com                                  ║
@@ -557,6 +560,11 @@ Three advanced-operator features — all still **read-only / defensive**:
 - **Mass Scanning** (`--targets-file FILE` / `--targets-list LIST`) runs the whole pipeline over many targets in one invocation. Targets are de-duplicated, blank lines and `#` comments ignored, and **CIDR blocks are expanded to host IPs** (safety-capped by `--max-hosts`, default 1024). Each target gets its own report (`-o out.json` → `out.<target>.json`, `-H`/`--pdf` likewise) plus a combined **`out.index.json`** with the per-target exposure score + verdict, so a fleet scan is one command and one summary.
 - **WAF Evasion** (`--evade none|light|stealth`) rewrites every request to a **coherent, real-browser profile** — UA, `Accept`, `Accept-Language`, `Sec-Ch-Ua`, `Sec-Fetch-*` — rotating between four profiles (Chrome/Windows, Chrome/macOS, Firefox, Safari) with added **request jitter** (`--evade-rotate-every N`). Profiles are self-consistent (a Chrome UA never ships a Firefox header set), which is what gets naive scripts fingerprinted. It **never** forges auth, tampers with payloads or mutates the target — it only makes the scan's *own* traffic look like an ordinary visitor's. Injected auth headers (`Authorization`/`Cookie`/`X-Api-Key`/`X-Auth-Token`) are preserved. Requests rewritten are exported under `evasion`.
 - **Deep Accuracy** (`--verify`) adds a second, independent verification pass: it re-probes the **false-positive-prone** classes (flagged paths, `.git`/`.env`/config/backup exposures) from a fresh connection and **drops anything that does not reproduce**, recording it (never silently deleting) under `verify_dropped`. A network hiccup is treated as *inconclusive* — findings are kept, so a flaky link can never hide a real issue. Results are exported under `verification` (`tested`/`kept`/`dropped`/`unknown`/`paths_removed`).
+- **Read-Only Vulnerability Verification** (`vulnverify`, module 50) proves *reachability* of a vulnerability class with **benign markers only — it never sends an executable payload and never extracts data**:
+  - **Reflected-XSS sink** — an alphanumeric marker plus a quote/bracket pair is placed in a parameter; if the bracket survives **raw** in the response (rather than becoming an HTML entity) the value reaches an unencoded output sink. No `<script>`, no event handler.
+  - **SQL-injection surface** — a marker plus a single quote is sent; a hit requires **both** the marker **and** a recognised database-error signature in the body (the marker prevents a pre-existing error page matching). No data is read.
+  - **Path traversal** — traversal sequences are tried only against file-ish parameters, and a hit is confirmed against a **control request** that does not contain the sequence, matched to a known system-file signature. No file contents are extracted or stored.
+  - Every hit becomes a standard finding (JSON/HTML/PDF/dashboard/CVSS/ATT&CK/remediation/webhooks). Results under `vuln_verify` (`tested`, `xss`, `sqli`, `traversal`). See [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 
 ### v3.8.0 notes (plugin rule engine + resilient scanning)
 
@@ -694,6 +702,8 @@ All five export to JSON, render as CLI panels and dashboard sections, and feed `
 - [x] **CVE Intelligence Enricher** (`-a cveintel`) — offline CVSS/CWE/EPSS/KEV/exploit prioritisation (P1–P4), plus **live NVD 2.0 + FIRST EPSS + CISA KEV** (`--cve-live`, disk-cached)
 - [x] **Subdomain Takeover v3** (`-a takeover`) — 70+ provider fingerprints + full CNAME-chain proof
 - [x] **Continuous Change Monitor** (`-a watch`, `--watch`, `--interval`) — baseline drift alerting & CI gate
+- [x] **Advanced operator pack** (`--targets-file`/`--targets-list`, `--evade`, `--verify`) — mass scanning, WAF evasion, deep-accuracy false-positive reduction
+- [x] **Read-Only Vulnerability Verification** (`-a vulnverify`) — benign-marker XSS/SQLi/traversal reachability proof (no payloads, no extraction)
 
 Contributions welcome — open an issue or PR.
 
@@ -723,7 +733,7 @@ ensuring every target you scan is authorized. See [SECURITY.md](SECURITY.md) and
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 65 tests: registry, scoring, helpers, rules, Tier-2 intel, report, integration
+python -m pytest tests/ -q          # 85 tests: registry, scoring, helpers, rules, advanced scanning, vuln-verify, Tier-2 intel, report, integration
 ```
 
 **Lint** (bug classes only — undefined names, unused imports/vars, redefinitions):
@@ -763,6 +773,7 @@ bug-class lint, a coverage report, and builds the Docker image — see
 **Feature guides:**
 
 - [docs/ADVANCED.md](docs/ADVANCED.md) — mass scanning (`--targets-file`/`--targets-list` + CIDR), WAF evasion (`--evade`), deep accuracy (`--verify`).
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — module 50 read-only vulnerability verification: benign-marker XSS/SQLi/traversal reachability proof.
 - [docs/RULES.md](docs/RULES.md) — the plugin rule engine (`--rules`): extend the built-in CVE + misconfig knowledge with your own YAML/JSON.
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — authenticated scanning: static session material, automated login, multi-role profiling.
 - [docs/RESILIENCE.md](docs/RESILIENCE.md) — the transparent retry/backoff layer, external-service degradation, and per-module timeouts.
