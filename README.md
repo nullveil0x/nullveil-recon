@@ -344,6 +344,10 @@ python3 nullveil_recon.py example.com -a vulnverify                      # benig
 # v3.9.0: automation — external plugins + headless JSON API
 python3 nullveil_recon.py example.com -a all --plugin my_policy.py       # run external Python plugin(s) over the results
 python3 nullveil_recon.py --serve-api                                    # JSON scan API on :8900 (POST /scan, GET /health)
+# v3.9.0: platform — scan timeline DB + multi-worker fleet scanning
+python3 nullveil_recon.py example.com -a all --timeline                  # index the scan into a SQLite timeline
+python3 nullveil_recon.py --timeline-query example.com                   # exposure trend + first-seen assets
+python3 nullveil_recon.py --targets-file t.txt -a all --workers 4 -o fleet.json  # scan 4 targets concurrently
 
 # v3.2.0: client-ready PDF report
 python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
@@ -570,6 +574,8 @@ Three advanced-operator features — all still **read-only / defensive**:
   - Every hit becomes a standard finding (JSON/HTML/PDF/dashboard/CVSS/ATT&CK/remediation/webhooks). Results under `vuln_verify` (`tested`, `xss`, `sqli`, `traversal`). See [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 - **External Plugins** (`--plugin FILE.py`, repeatable) load plain Python modules that run **after** the scan and turn organisation-specific logic into first-class findings. A plugin defines `run(ctx)` and returns `(severity, check, detail)` tuples (or strings → `INFO`); the `ctx` object exposes the results, summary, target, a `findings()` helper and a `log()`. Plugin findings flow into CVSS/ATT&CK/remediation/report/webhooks like any other, and are inventoried under `plugins` + `plugin_runs`. A **crashing plugin never aborts the scan** (recorded, skipped). Only load plugins you trust. See [`docs/AUTOMATION.md`](docs/AUTOMATION.md) and [`examples/plugin_example.py`](examples/plugin_example.py).
 - **Headless JSON API** (`--serve-api [PORT]`, `--api-host`) turns NULLVEIL into a service for CI/CD: `POST /scan` (JSON body → full report JSON), `GET /health`, `GET /report?id=…`. One scan runs at a time (concurrent `POST /scan` → `429`), `id` is validated against path traversal, errors are always JSON, and it binds to **localhost by default**. Authentication is off by default in the API. See [`docs/AUTOMATION.md`](docs/AUTOMATION.md).
+- **Scan Timeline** (`--timeline`, `--timeline-db`, `--timeline-query`) indexes every completed scan into a local **SQLite** DB *next to* (never replacing) the JSON history, so you can query what a folder of JSON cannot: `--timeline-query <target>` prints the **exposure-score trend** and a **first-seen** table for subdomains/ports. Append-only, and it **never becomes a dependency** — if the DB is unwritable the scan is completely unaffected (`"timeline": {"enabled": false}`). See [`docs/PLATFORM.md`](docs/PLATFORM.md).
+- **Multi-Worker Fleet Scanning** (`--workers N`) runs up to N batch targets **concurrently**, each through the full pipeline. Each target keeps its own name-suffixed report (no collisions) and the combined index is always assembled in **target order**, so output stays deterministic; a failing target is recorded (`"ok": false`), not fatal. `--workers 1` (default) is the original sequential behaviour. See [`docs/PLATFORM.md`](docs/PLATFORM.md).
 
 ### v3.8.0 notes (plugin rule engine + resilient scanning)
 
@@ -710,6 +716,7 @@ All five export to JSON, render as CLI panels and dashboard sections, and feed `
 - [x] **Advanced operator pack** (`--targets-file`/`--targets-list`, `--evade`, `--verify`) — mass scanning, WAF evasion, deep-accuracy false-positive reduction
 - [x] **Read-Only Vulnerability Verification** (`-a vulnverify`) — benign-marker XSS/SQLi/traversal reachability proof (no payloads, no extraction)
 - [x] **Automation layer** (`--plugin`, `--serve-api`) — external Python plugins + headless JSON scan API for CI/CD
+- [x] **Platform layer** (`--timeline`, `--workers`) — SQLite scan timeline with trend/first-seen queries + concurrent fleet scanning
 
 Contributions welcome — open an issue or PR.
 
@@ -739,7 +746,7 @@ ensuring every target you scan is authorized. See [SECURITY.md](SECURITY.md) and
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 96 tests: registry, scoring, helpers, rules, advanced scanning, vuln-verify, plugins/API, Tier-2 intel, report, integration
+python -m pytest tests/ -q          # 106 tests: registry, scoring, helpers, rules, advanced scanning, vuln-verify, plugins/API, timeline/workers, Tier-2 intel, report, integration
 ```
 
 **Lint** (bug classes only — undefined names, unused imports/vars, redefinitions):
@@ -781,6 +788,7 @@ bug-class lint, a coverage report, and builds the Docker image — see
 - [docs/ADVANCED.md](docs/ADVANCED.md) — mass scanning (`--targets-file`/`--targets-list` + CIDR), WAF evasion (`--evade`), deep accuracy (`--verify`).
 - [docs/VERIFICATION.md](docs/VERIFICATION.md) — module 50 read-only vulnerability verification: benign-marker XSS/SQLi/traversal reachability proof.
 - [docs/AUTOMATION.md](docs/AUTOMATION.md) — external plugins (`--plugin`) and the headless JSON scan API (`--serve-api`).
+- [docs/PLATFORM.md](docs/PLATFORM.md) — SQLite scan timeline (`--timeline`) and multi-worker fleet scanning (`--workers`).
 - [docs/RULES.md](docs/RULES.md) — the plugin rule engine (`--rules`): extend the built-in CVE + misconfig knowledge with your own YAML/JSON.
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — authenticated scanning: static session material, automated login, multi-role profiling.
 - [docs/RESILIENCE.md](docs/RESILIENCE.md) — the transparent retry/backoff layer, external-service degradation, and per-module timeouts.

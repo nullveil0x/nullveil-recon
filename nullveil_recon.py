@@ -87,6 +87,7 @@ import tempfile
 import hashlib
 import statistics
 import random
+import sqlite3
 
 # --- Friendly error if dependencies are missing ---
 try:
@@ -666,6 +667,239 @@ class RuleSet:
                 "misconfig_rules": len(self.misconfig), "errors": list(self.errors)}
 
 
+# ============================================================ timeline DB
+class TimelineDB:
+    """SQLite-backed scan timeline (``--timeline``).
+
+    Every completed scan is appended to a small, queryable database so an
+    operator can answer questions a pile of JSON files cannot: *how has the
+    exposure score moved over time?* *when did this subdomain first appear?*
+    *which run introduced this finding?*
+
+    The DB is deliberately **append-only and additive** — it is a *second*
+    index next to the JSON history, never a replacement. If the DB is missing or
+    unwritable the scan is completely unaffected (every method swallows errors):
+    the timeline is a convenience, not a dependency.
+
+    Schema (v1)::
+
+        scans(id, when, target, domain, version, duration_s, score, verdict,
+              mode, modules, high, critical, secrets, subdomains, ports, paths,
+              report_json)
+        findings(scan_id, severity, check, detail, source)
+        assets(scan_id, kind, value)
+
+    ``assets`` is what makes drift queries cheap: one row per discovered asset
+    (subdomain, port, path, …) so "when did X first appear" is a single
+    indexed lookup instead of a full-scan diff.
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path=None):
+        self.path = os.path.expanduser(path or self.default_path())
+        self.conn = None
+        self.enabled = False
+        self.error = None
+        self._init_db()
+
+    @staticmethod
+    def default_path():
+        return os.path.join(WebsiteRecon.HISTORY_DIR, "timeline.db")
+
+    # ---------------------------------------------------------------- setup
+    def _init_db(self):
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            self.conn = sqlite3.connect(self.path, timeout=10)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scanned_at TEXT, target TEXT, domain TEXT, version TEXT,
+                    duration_s REAL, score INTEGER, verdict TEXT, mode TEXT,
+                    modules TEXT, high INTEGER, critical INTEGER,
+                    secrets INTEGER, subdomains INTEGER, ports INTEGER,
+                    paths INTEGER, report_json TEXT);
+                CREATE INDEX IF NOT EXISTS idx_scans_domain ON scans(domain);
+                CREATE INDEX IF NOT EXISTS idx_scans_when   ON scans(scanned_at);
+                CREATE TABLE IF NOT EXISTS findings (
+                    scan_id INTEGER, severity TEXT, check_name TEXT,
+                    detail TEXT, source TEXT);
+                CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);
+                CREATE TABLE IF NOT EXISTS assets (
+                    scan_id INTEGER, kind TEXT, value TEXT);
+                CREATE INDEX IF NOT EXISTS idx_assets_kv ON assets(kind, value);
+                CREATE INDEX IF NOT EXISTS idx_assets_scan ON assets(scan_id);
+                """
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                (str(self.SCHEMA_VERSION),))
+            self.conn.commit()
+            self.enabled = True
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            self.enabled = False
+
+    def close(self):
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- write
+    def record(self, report, recon=None):
+        """Append one finished scan. Returns the new scan id (or None)."""
+        if not self.enabled or not isinstance(report, dict):
+            return None
+        try:
+            summ = report.get("summary", {}) or {}
+            score = None
+            verdict = None
+            if recon is not None:
+                try:
+                    sc = _batch_score(report)
+                    if isinstance(sc, dict):
+                        score, verdict = sc.get("score"), sc.get("verdict")
+                except Exception:
+                    pass
+            if score is None:
+                score = summ.get("exposure_score")
+            when = report.get("started") or datetime.now().isoformat()
+            cur = self.conn.execute(
+                """INSERT INTO scans(scanned_at, target, domain, version, duration_s,
+                        score, verdict, mode, modules, high, critical, secrets,
+                        subdomains, ports, paths, report_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (when, report.get("target", ""), report.get("target", ""),
+                 report.get("version", __version__),
+                 report.get("duration_s"), score, verdict, report.get("mode", ""),
+                 ",".join(report.get("modules_run", []) or []),
+                 int(summ.get("high", 0) or 0), int(summ.get("critical", 0) or 0),
+                 int(summ.get("secrets", 0) or 0), int(summ.get("subdomains", 0) or 0),
+                 int(summ.get("open_ports", 0) or 0), int(summ.get("paths", 0) or 0),
+                 json.dumps(report, ensure_ascii=False, default=str)))
+            scan_id = cur.lastrowid
+
+            # findings need the live recon object (they are a flattened view of
+            # it); assets come straight from the report so they are always
+            # indexed — that is what makes first-seen queries cheap.
+            if recon is not None:
+                try:
+                    for sev, chk, det, src in recon._collect_findings():
+                        self.conn.execute(
+                            "INSERT INTO findings(scan_id, severity, check_name, detail, source) "
+                            "VALUES(?,?,?,?,?)",
+                            (scan_id, sev, chk, det[:400], src))
+                except Exception:
+                    pass
+            try:
+                for kind, values in self._asset_rows(report).items():
+                    for v in values:
+                        self.conn.execute(
+                            "INSERT INTO assets(scan_id, kind, value) VALUES(?,?,?)",
+                            (scan_id, kind, str(v)[:400]))
+            except Exception:
+                pass
+            self.conn.commit()
+            return scan_id
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            return None
+
+    @staticmethod
+    def _asset_rows(report):
+        """Flatten a report into {kind: [values]} for the assets table."""
+        out = {}
+        for kind, key in (("subdomain", "subdomains"), ("port", "open_ports"),
+                          ("tech", "tech_stack")):
+            vals = [str(x) for x in (report.get(key) or []) if x]
+            if vals:
+                out[kind] = vals
+        paths = []
+        for p in (report.get("paths") or []):
+            if isinstance(p, dict) and p.get("path"):
+                paths.append(p["path"])
+            elif p:
+                paths.append(str(p))
+        if paths:
+            out["path"] = paths
+        return out
+
+    # ---------------------------------------------------------------- read
+    def history(self, domain=None, limit=50):
+        """Newest-first scan rows (without the heavy report blob)."""
+        if not self.enabled:
+            return []
+        try:
+            q = ("SELECT id, scanned_at, target, domain, version, duration_s, score, "
+                 "verdict, mode, high, critical, secrets, subdomains, ports, paths "
+                 "FROM scans")
+            args = []
+            if domain:
+                q += " WHERE domain = ?"
+                args.append(domain)
+            q += " ORDER BY id DESC LIMIT ?"
+            args.append(int(limit))
+            cols = ["id", "scanned_at", "target", "domain", "version", "duration_s",
+                    "score", "verdict", "mode", "high", "critical", "secrets",
+                    "subdomains", "ports", "paths"]
+            return [dict(zip(cols, row)) for row in self.conn.execute(q, args).fetchall()]
+        except Exception:
+            return []
+
+    def trend(self, domain, limit=30):
+        """Score-over-time series for one domain, oldest-first."""
+        rows = self.history(domain, limit=limit)
+        return list(reversed([{"when": r["scanned_at"], "score": r["score"],
+                               "verdict": r["verdict"]} for r in rows]))
+
+    def first_seen(self, kind, value):
+        """Scan id/when a particular asset value first appeared."""
+        if not self.enabled:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT a.scan_id, s.scanned_at, s.domain FROM assets a "
+                "JOIN scans s ON s.id = a.scan_id "
+                "WHERE a.kind = ? AND a.value = ? ORDER BY a.scan_id ASC LIMIT 1",
+                (kind, str(value))).fetchone()
+            if row:
+                return {"scan_id": row[0], "when": row[1], "domain": row[2]}
+        except Exception:
+            pass
+        return None
+
+    def latest(self, domain=None):
+        h = self.history(domain, limit=1)
+        return h[0] if h else None
+
+    def stats(self):
+        if not self.enabled:
+            return {"enabled": False, "path": self.path, "error": self.error,
+                    "scans": 0, "domains": 0, "findings": 0, "assets": 0}
+        try:
+            scans = self.conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+            domains = self.conn.execute("SELECT COUNT(DISTINCT domain) FROM scans").fetchone()[0]
+            findings = self.conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+            assets = self.conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+            return {"enabled": True, "path": self.path, "error": None,
+                    "scans": scans, "domains": domains, "findings": findings,
+                    "assets": assets}
+        except Exception as e:
+            return {"enabled": True, "path": self.path, "error": str(e),
+                    "scans": 0, "domains": 0, "findings": 0, "assets": 0}
+
+    def summary(self):
+        return self.stats()
+
+
 # ============================================================ evasion transport
 # Coherent, browser-like request profiles. Each profile is a *set* of headers
 # that belong together (a real Chrome does not send a Firefox UA with a Safari
@@ -1223,6 +1457,7 @@ class WebsiteRecon:
         self._auth_cmd = []    # "Name: value" strings for subprocess tools
         self.ruleset = None    # external --rules plugin set (wired in main)
         self.plugins = None    # external --plugin Python modules (wired in main)
+        self.timeline_db = None  # SQLite timeline (--timeline; wired in main)
 
     def _build_transport(self, concurrency=None):
         """Create the shared httpx client + concurrency semaphore.
@@ -1552,6 +1787,14 @@ class WebsiteRecon:
         if hid and not getattr(self, "quiet", False):
             console.print(f"[dim]Scan saved to history:[/] [cyan]{hid}[/]  "
                           f"[dim](list: nullveil <target> --history)[/]")
+
+        # --- timeline DB (--timeline): append this scan for trend queries ---
+        tdb = getattr(self, "timeline_db", None)
+        if tdb is not None and getattr(tdb, "enabled", False):
+            sid = tdb.record(report, recon=self)
+            if sid and not getattr(self, "quiet", False):
+                console.print(f"[dim]Timeline:[/] scan #{sid} indexed "
+                              f"[dim]({tdb.path})[/]")
 
         # --- ATT&CK Navigator layer export (module 46) ---------------------
         layer_path = str(getattr(self, "attack_layer_path", "") or "")
@@ -10453,6 +10696,8 @@ class WebsiteRecon:
             "plugins": (self.plugins.summary() if getattr(self, "plugins", None)
                         else {"files": [], "loaded": 0, "findings": 0, "errors": []}),
             "plugin_runs": self.results.get('plugin_runs', []),
+            "timeline": (self.timeline_db.stats() if getattr(self, "timeline_db", None)
+                         else {"enabled": False}),
             "retries": (getattr(getattr(self, "_retry_transport", None), "retries", 0) or 0),
             "evasion": {
                 "level": getattr(self, "evade_level", "none") or "none",
@@ -11887,6 +12132,84 @@ def _api_scan(payload, target):
     return out.get("report") or out
 
 
+def _timeline_report(target, db_path=None):
+    """Print the timeline trend + first-seen assets for a target (--timeline-query)."""
+    db = TimelineDB(db_path)
+    st = db.stats()
+    console.print(Panel(f"[bold cyan]{st['path']}[/]\n"
+                        f"[dim]{st['scans']} scan(s) · {st['domains']} domain(s) · "
+                        f"{st['findings']} finding row(s) · {st['assets']} asset row(s)[/]",
+                        title="[bold magenta]◈ NULLVEIL TIMELINE ◈[/]", border_style="magenta"))
+    if not st["enabled"]:
+        console.print(f"[yellow]Timeline DB not available:[/] {st['error']}")
+        db.close()
+        return
+    domain = target.strip().lower()
+    for pfx in ("https://", "http://"):
+        if domain.startswith(pfx):
+            domain = domain[len(pfx):]
+    domain = domain.split("/")[0].split(":")[0]
+
+    rows = db.history(domain, limit=50)
+    if not rows:
+        console.print(f"[yellow]No timeline entries for[/] [bold]{domain}[/] "
+                      f"[dim](run a scan with --timeline first)[/]")
+        db.close()
+        return
+
+    tt = Table(box=rbox.SIMPLE_HEAVY, header_style="bold white on dark_blue",
+               title=f"[bold]{domain}[/] — {len(rows)} scan(s)")
+    tt.add_column("#", style="bold cyan", justify="right")
+    tt.add_column("When")
+    tt.add_column("Score", justify="right")
+    tt.add_column("Verdict")
+    tt.add_column("High/ Crit", justify="right")
+    tt.add_column("Subs", justify="right")
+    tt.add_column("Ports", justify="right")
+    for r in rows:
+        sc = r.get("score")
+        color = ("red" if isinstance(sc, int) and sc >= 60
+                 else "yellow" if isinstance(sc, int) and sc >= 30 else "green")
+        tt.add_row(str(r.get("id")), str(r.get("scanned_at", ""))[:16],
+                   f"[{color}]{sc if sc is not None else '—'}[/]",
+                   str(r.get("verdict") or "—"),
+                   f"{r.get('high', 0)}/{r.get('critical', 0)}",
+                   str(r.get("subdomains", 0)), str(r.get("ports", 0)))
+    console.print(tt)
+
+    trend = db.trend(domain, limit=30)
+    if len(trend) >= 2:
+        first, last = trend[0].get("score"), trend[-1].get("score")
+        if isinstance(first, int) and isinstance(last, int):
+            delta = last - first
+            arrow = "[red]▲[/]" if delta > 0 else "[green]▼[/]" if delta < 0 else "[dim]▬[/]"
+            console.print(f"\n{arrow} [bold]Exposure trend:[/] {first} → {last} "
+                          f"({'+' if delta >= 0 else ''}{delta}) over {len(trend)} scan(s)")
+
+    # first-seen: when did each currently-known asset first show up?
+    try:
+        fs = db.conn.execute(
+            "SELECT a.kind, a.value, MIN(a.scan_id) AS first_id, s.scanned_at "
+            "FROM assets a JOIN scans s ON s.id = a.scan_id "
+            "WHERE s.domain = ? AND a.kind IN ('subdomain','port') "
+            "GROUP BY a.kind, a.value ORDER BY a.kind, a.scan_id ASC LIMIT 40",
+            (domain,)).fetchall()
+        if fs:
+            ft = Table(box=rbox.SIMPLE, header_style="bold white on dark_blue",
+                       title="First seen (subdomains / ports)")
+            ft.add_column("Kind", style="cyan")
+            ft.add_column("Asset", style="bold")
+            ft.add_column("Scan #", justify="right")
+            ft.add_column("First seen")
+            for kind, value, first_id, seen_at in fs:
+                ft.add_row(str(kind), str(value)[:60], str(first_id),
+                           str(seen_at or "")[:16])
+            console.print(ft)
+    except Exception:
+        pass
+    db.close()
+
+
 # ---------------------------------------------------------- batch targets
 def _expand_targets(spec_list):
     """Expand a list of target specs (domains/URLs/CIDRs) into a flat, ordered,
@@ -11968,6 +12291,9 @@ def main():
                "  nullveil --targets-file t.txt -a all -o out.json -> mass scan + combined index\n"
                "  nullveil example.com --evade light --retries 4 --verify -> evasive, resilient, low-FP scan\n"
                "  nullveil example.com -a vulnverify  -> read-only XSS/SQLi/traversal reachability proof\n"
+               "  nullveil example.com -a all --timeline -> index the scan for trend/first-seen queries\n"
+               "  nullveil --timeline-query example.com -> exposure trend + first-seen assets\n"
+               "  nullveil --targets-file t.txt --workers 4 -o fleet.json -> concurrent fleet scan\n"
                "  nullveil --pdf-from old.json --pdf out.pdf -> convert saved JSON to PDF\n"
                "  nullveil -l                         -> list attack modules\n\n"
                "Owner: NULLVEIL | Use only on authorized targets."
@@ -12035,6 +12361,16 @@ def main():
                            "report JSON, GET /health, GET /report?id=…  — for CI/CD integration")
     advg.add_argument("--api-host", metavar="HOST", default="127.0.0.1",
                       help="Bind address for --serve-api (default: 127.0.0.1 — localhost only)")
+    advg.add_argument("--timeline", action="store_true",
+                      help="Index every completed scan into a local SQLite timeline DB (added to the JSON history, "
+                           "never replacing it) for trend / first-seen queries")
+    advg.add_argument("--timeline-db", metavar="FILE", default=None,
+                      help="Path to the timeline SQLite DB (default: ~/.nullveil/history/timeline.db)")
+    advg.add_argument("--timeline-query", metavar="TARGET", default=None,
+                      help="Print the exposure-score trend + first-seen assets for TARGET from the timeline DB and exit")
+    advg.add_argument("--workers", type=int, metavar="N", default=1,
+                      help="Batch mode: scan N targets concurrently (default: 1 = sequential). Each worker runs the "
+                           "full pipeline against one target at a time; reports never overlap")
     authg = parser.add_argument_group("authenticated scanning (module 31: auth)")
     authg.add_argument("--auth-header", action="append", metavar="'Name: Value'",
                        help="Header injected into EVERY scan request (repeatable), e.g. --auth-header 'X-Api-Key: abc'")
@@ -12156,6 +12492,10 @@ def main():
             console.print("\n[dim]Resume: nullveil <target> --resume [ID][/]")
         return
 
+    if args.timeline_query:
+        _timeline_report(args.timeline_query, db_path=args.timeline_db)
+        return
+
     if args.pdf_from:
         if not args.pdf:
             console.print("[yellow]--pdf-from needs --pdf FILE[/] (e.g. --pdf-from old.json --pdf out.pdf)")
@@ -12231,8 +12571,15 @@ def main():
                       + ("  [dim](sequential, one report each)[/]" if not args.quiet else ""))
 
     targets = batch if batch else [args.target]
+    workers = max(1, int(getattr(args, "workers", 1) or 1))
+    if batch and workers > 1:
+        workers = min(workers, len(targets))
+        if not args.quiet:
+            console.print(f"[dim]{workers} worker(s) — reports never overlap (per-target suffix)[/]")
     batch_index = []
-    for _ti, _tgt in enumerate(targets, 1):
+
+    def _one(job):
+        _ti, _tgt = job
         if batch and not args.quiet:
             console.print(f"\n[bold magenta]━━ scan {_ti}/{len(targets)}:[/] [bold white]{_tgt}[/] ━━")
         suffix = ""
@@ -12241,19 +12588,33 @@ def main():
             suffix = f".{safe}"
         try:
             _summary = _scan_target(args, attack_indices, ports, _tgt, suffix)
-            if batch:
-                _sc = (_summary or {}).get("score") or {}
-                batch_index.append({"target": _tgt, "ok": True,
-                                    "exposure": _sc.get("score") if isinstance(_sc, dict) else _sc,
-                                    "verdict": _sc.get("verdict") if isinstance(_sc, dict) else None})
+            _sc = (_summary or {}).get("score") or {}
+            return {"target": _tgt, "ok": True,
+                    "exposure": _sc.get("score") if isinstance(_sc, dict) else _sc,
+                    "verdict": _sc.get("verdict") if isinstance(_sc, dict) else None}
         except SystemExit:
             raise
         except Exception as e:
             console.print(f"[bold red]scan failed for {_tgt}:[/] {type(e).__name__} — {e}")
-            if batch:
-                batch_index.append({"target": _tgt, "ok": False, "error": str(e)})
-            else:
+            return {"target": _tgt, "ok": False, "error": str(e)}
+
+    jobs = list(enumerate(targets, 1))
+    if batch and workers > 1:
+        # targets run concurrently; each writes its own name-suffixed report so
+        # outputs never collide. Results are collected in target order.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            batch_index = list(pool.map(_one, jobs))
+    else:
+        for job in jobs:
+            try:
+                res = _one(job)
+            except SystemExit:
                 raise
+            except Exception:
+                raise
+            if batch:
+                batch_index.append(res)
 
     # combined batch index
     if batch and args.output:
@@ -12329,6 +12690,15 @@ def _scan_target(args, attack_indices, ports, target, out_suffix=""):
                           f"{', '.join(s['files'])}")
         for err in s["errors"]:
             console.print(f"[yellow]! {err}[/]")
+    # ---- SQLite timeline (--timeline) ----
+    if args.timeline:
+        recon.timeline_db = TimelineDB(args.timeline_db)
+        st = recon.timeline_db.stats()
+        if st["enabled"]:
+            console.print(f"[bold green]✓ Timeline DB[/] — {st['path']} "
+                          f"[dim]({st['scans']} scan(s), {st['domains']} domain(s))[/]")
+        else:
+            console.print(f"[yellow]! Timeline DB unavailable:[/] {st['error']}")
     recon.auth_cfg = {
         "headers": args.auth_header or [],
         "cookies": args.auth_cookie or [],
