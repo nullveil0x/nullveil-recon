@@ -108,6 +108,17 @@ python3 nullveil_recon.py --targets-file assets.txt -a all --workers 4 -o fleet.
   name-suffixed report (`fleet.<target>.json`), and the combined
   `fleet.index.json` is always assembled in **target order**, so output is
   deterministic regardless of which worker finished first.
+* **Each worker gets its own parsed config.** Workers never share the mutable
+  argument namespace, so a target running in one worker cannot clobber another
+  worker's target or results.
+* **The timeline survives concurrency.** When `--timeline` is combined with
+  `--workers`, every worker's scan is appended exactly once — the DB uses WAL,
+  a busy timeout and a short retry so parallel writers do not lose rows to
+  `database is locked`.
+* **The change-diff is port-aware.** Baselines are matched on the exact
+  `scheme://host:port` first (falling back to the bare domain), so scanning
+  `host:8080` and `host:8443` diffs each against its own previous scan rather
+  than against its sibling port.
 * **A failing target is recorded, not fatal** — the batch completes and the
   index shows `"ok": false` plus the error for that target.
 * **`--workers 1` (the default) is fully sequential** — the behaviour you had

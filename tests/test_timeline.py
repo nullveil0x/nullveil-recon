@@ -132,6 +132,82 @@ def test_timeline_record_exposes_own_scan_id(nv, tmp_path):
     db.close()
 
 
+def test_timeline_concurrent_records_all_land(nv, tmp_path):
+    """Parallel workers (--workers N) each open their own TimelineDB on the same
+    file — every record must land, with no 'database is locked' drop."""
+    import threading
+    path = str(tmp_path / "t.db")
+    # open all handles first, mirroring concurrent workers starting together
+    dbs = [nv.TimelineDB(path) for _ in range(5)]
+    assert all(d.enabled for d in dbs)
+    errors = []
+
+    def _work(i):
+        try:
+            for j in range(4):
+                dbs[i].record({"target": f"h{i}.test",
+                               "started": f"2026-01-0{j + 1}T00:00:00",
+                               "summary": {}, "subdomains": [f"s{j}.h{i}.test"]})
+        except Exception as e:                      # pragma: no cover
+            errors.append(repr(e))
+
+    ts = [threading.Thread(target=_work, args=(i,)) for i in range(5)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors
+    for d in dbs:
+        d.close()
+    # read with a fresh connection (each handle has its own snapshot)
+    import sqlite3 as _sq
+    c = _sq.connect(path)
+    n = c.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+    c.close()
+    assert n == 20, f"expected 20 rows, got {n}"
+
+
+def test_history_ids_are_unique_per_target(nv):
+    """Two workers scanning the same host (different ports) in the same second
+    must not collide on the same history id."""
+    import hashlib
+    ts = "20260101-000000-000001"
+    a = hashlib.md5(("http://h:8080" + ts).encode()).hexdigest()[:6]
+    b = hashlib.md5(("http://h:8443" + ts).encode()).hexdigest()[:6]
+    assert a != b
+
+
+# ------------------------------------------------------------------ diff baseline
+def test_diff_prefers_exact_target_over_domain(nv, tmp_path, monkeypatch):
+    """Same host on two ports must diff against its own scan, not the sibling."""
+    monkeypatch.setattr(nv.WebsiteRecon, "HISTORY_DIR", str(tmp_path))
+    sib = {"id": "s1", "target": "http://h:8080", "domain": "h",
+           "when": "2026-01-02T00:00:00", "report": {"paths": [{"path": "/a"}]}}
+    own = {"id": "s2", "target": "http://h:8443", "domain": "h",
+           "when": "2026-01-01T00:00:00", "report": {"paths": [{"path": "/a"}]}}
+    # newest-first list has the sibling first (it is more recent)
+    monkeypatch.setattr(nv.WebsiteRecon, "_history_list",
+                        classmethod(lambda cls: [sib, own]))
+    recon = nv.WebsiteRecon("http://h:8443/")
+    report = {"paths": [{"path": "/a"}], "summary": {}}
+    recon._compute_diff(report)
+    d = recon.results["diff"]
+    assert d["available"] is True
+    assert d["baseline_id"] == "s2"                # exact target, not the sibling
+
+
+def test_diff_falls_back_to_domain(nv, tmp_path, monkeypatch):
+    """Older history entries without a matching target fall back to domain."""
+    monkeypatch.setattr(nv.WebsiteRecon, "_history_list",
+                        classmethod(lambda cls: [
+                            {"id": "old", "target": "", "domain": "h",
+                             "when": "2026-01-01T00:00:00",
+                             "report": {"paths": [{"path": "/a"}]}}]))
+    recon = nv.WebsiteRecon("http://h:8443/")
+    recon._compute_diff({"paths": [{"path": "/a"}], "summary": {}})
+    assert recon.results["diff"]["baseline_id"] == "old"
+
+
 # ------------------------------------------------------------------ workers
 def test_workers_flag_in_parser(nv):
     """--workers must exist and default to 1 (sequential)."""

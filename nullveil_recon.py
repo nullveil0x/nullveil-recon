@@ -88,6 +88,7 @@ import hashlib
 import statistics
 import random
 import sqlite3
+import threading
 
 # --- Friendly error if dependencies are missing ---
 try:
@@ -701,6 +702,9 @@ class TimelineDB:
         self.conn = None
         self.enabled = False
         self.error = None
+        # guards writes when one TimelineDB is shared across threads; a no-op
+        # for the normal one-DB-per-worker case
+        self._lock = threading.Lock()
         self._init_db()
 
     @staticmethod
@@ -711,8 +715,21 @@ class TimelineDB:
     def _init_db(self):
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            self.conn = sqlite3.connect(self.path, timeout=10)
-            self.conn.execute("PRAGMA journal_mode=WAL")
+            # check_same_thread=False + self._lock: safe whether each worker owns
+            # its own DB handle or a single handle is shared across threads.
+            # timeout=30 + busy_timeout: parallel workers (--workers N) may open
+            # the same DB file at once; without a busy timeout the loser of the
+            # journal-mode switch raises "database is locked" immediately.
+            self.conn = sqlite3.connect(self.path, timeout=30,
+                                        check_same_thread=False)
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            # switching to WAL needs a brief exclusive lock — retry a few times
+            for _attempt in range(20):
+                try:
+                    self.conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError:
+                    time.sleep(0.1)
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.executescript(
                 """
@@ -758,60 +775,81 @@ class TimelineDB:
         """Append one finished scan. Returns the new scan id (or None)."""
         if not self.enabled or not isinstance(report, dict):
             return None
-        try:
-            summ = report.get("summary", {}) or {}
-            score = None
-            verdict = None
-            if recon is not None:
+        # Serialise writes through the handle lock (matters only when a single
+        # TimelineDB is shared across threads) and retry briefly on
+        # "database is locked" instead of silently dropping the row.
+        last_err = None
+        with self._lock:
+            for _attempt in range(6):
                 try:
-                    sc = _batch_score(report)
-                    if isinstance(sc, dict):
-                        score, verdict = sc.get("score"), sc.get("verdict")
-                except Exception:
-                    pass
-            if score is None:
-                score = summ.get("exposure_score")
-            when = report.get("started") or datetime.now().isoformat()
-            cur = self.conn.execute(
-                """INSERT INTO scans(scanned_at, target, domain, version, duration_s,
-                        score, verdict, mode, modules, high, critical, secrets,
-                        subdomains, ports, paths, report_json)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (when, report.get("target", ""), report.get("target", ""),
-                 report.get("version", __version__),
-                 report.get("duration_s"), score, verdict, report.get("mode", ""),
-                 ",".join(report.get("modules_run", []) or []),
-                 int(summ.get("high", 0) or 0), int(summ.get("critical", 0) or 0),
-                 int(summ.get("secrets", 0) or 0), int(summ.get("subdomains", 0) or 0),
-                 int(summ.get("open_ports", 0) or 0), int(summ.get("paths", 0) or 0),
-                 json.dumps(report, ensure_ascii=False, default=str)))
-            scan_id = cur.lastrowid
+                    return self._record_once(report, recon)
+                except sqlite3.OperationalError as e:
+                    last_err = e
+                    if "lock" in str(e).lower():
+                        time.sleep(0.2 * (_attempt + 1))
+                        continue
+                    self.error = f"{type(e).__name__}: {e}"
+                    return None
+                except Exception as e:
+                    self.error = f"{type(e).__name__}: {e}"
+                    return None
+        if last_err is not None:
+            self.error = f"{type(last_err).__name__}: {last_err}"
+        return None
 
-            # findings need the live recon object (they are a flattened view of
-            # it); assets come straight from the report so they are always
-            # indexed — that is what makes first-seen queries cheap.
-            if recon is not None:
-                try:
-                    for sev, chk, det, src in recon._collect_findings():
-                        self.conn.execute(
-                            "INSERT INTO findings(scan_id, severity, check_name, detail, source) "
-                            "VALUES(?,?,?,?,?)",
-                            (scan_id, sev, chk, det[:400], src))
-                except Exception:
-                    pass
+    def _record_once(self, report, recon=None):
+        if not self.enabled or not isinstance(report, dict):
+            return None
+        summ = report.get("summary", {}) or {}
+        score = None
+        verdict = None
+        if recon is not None:
             try:
-                for kind, values in self._asset_rows(report).items():
-                    for v in values:
-                        self.conn.execute(
-                            "INSERT INTO assets(scan_id, kind, value) VALUES(?,?,?)",
-                            (scan_id, kind, str(v)[:400]))
+                sc = _batch_score(report)
+                if isinstance(sc, dict):
+                    score, verdict = sc.get("score"), sc.get("verdict")
             except Exception:
                 pass
-            self.conn.commit()
-            return scan_id
-        except Exception as e:
-            self.error = f"{type(e).__name__}: {e}"
-            return None
+        if score is None:
+            score = summ.get("exposure_score")
+        when = report.get("started") or datetime.now().isoformat()
+        cur = self.conn.execute(
+            """INSERT INTO scans(scanned_at, target, domain, version, duration_s,
+                    score, verdict, mode, modules, high, critical, secrets,
+                    subdomains, ports, paths, report_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (when, report.get("target", ""), report.get("target", ""),
+             report.get("version", __version__),
+             report.get("duration_s"), score, verdict, report.get("mode", ""),
+             ",".join(report.get("modules_run", []) or []),
+             int(summ.get("high", 0) or 0), int(summ.get("critical", 0) or 0),
+             int(summ.get("secrets", 0) or 0), int(summ.get("subdomains", 0) or 0),
+             int(summ.get("open_ports", 0) or 0), int(summ.get("paths", 0) or 0),
+             json.dumps(report, ensure_ascii=False, default=str)))
+        scan_id = cur.lastrowid
+
+        # findings need the live recon object (they are a flattened view of
+        # it); assets come straight from the report so they are always
+        # indexed — that is what makes first-seen queries cheap.
+        if recon is not None:
+            try:
+                for sev, chk, det, src in recon._collect_findings():
+                    self.conn.execute(
+                        "INSERT INTO findings(scan_id, severity, check_name, detail, source) "
+                        "VALUES(?,?,?,?,?)",
+                        (scan_id, sev, chk, det[:400], src))
+            except Exception:
+                pass
+        try:
+            for kind, values in self._asset_rows(report).items():
+                for v in values:
+                    self.conn.execute(
+                        "INSERT INTO assets(scan_id, kind, value) VALUES(?,?,?)",
+                        (scan_id, kind, str(v)[:400]))
+        except Exception:
+            pass
+        self.conn.commit()
+        return scan_id
 
     @staticmethod
     def _asset_rows(report):
@@ -9056,8 +9094,11 @@ class WebsiteRecon:
             return None
         try:
             os.makedirs(self.HISTORY_DIR, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            hid = f"{ts}-{hashlib.md5((self.domain + ts).encode()).hexdigest()[:6]}"
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            # include the full target (scheme://host:port) + microseconds so that
+            # parallel workers scanning the same host (different ports) in the
+            # same second never collide on the same history id/filename.
+            hid = f"{ts}-{hashlib.md5((self.base_url + ts).encode()).hexdigest()[:6]}"
             report = report or self.export_dict()
             entry = {
                 "id": hid, "target": self.base_url, "domain": self.domain,
@@ -9157,12 +9198,23 @@ class WebsiteRecon:
         paths, API endpoints, cookies, tech …), with a CLI + report + dashboard view."""
         if getattr(self, "no_history", False) or getattr(self, "diff_disabled", False):
             return
-        # newest prior entry that is not this very scan (save happens after us)
+        # newest prior entry that is not this very scan (save happens after us).
+        # Prefer an exact target match (scheme://host:port) so that scanning
+        # host:8080 and host:8443 do not diff against each other; fall back to
+        # the bare domain for older history entries that lack a full target.
         prev = None
+        prev_domain = None
+        _base = (self.base_url or "").lower().rstrip("/")
         for e in self._history_list():
-            if e.get("domain", "").lower() == self.domain.lower():
+            edom = (e.get("domain") or "").lower()
+            etgt = (e.get("target") or "").lower().rstrip("/")
+            if etgt and etgt == _base:
                 prev = e
                 break
+            if edom == self.domain.lower() and prev_domain is None:
+                prev_domain = e
+        if prev is None:
+            prev = prev_domain
         if not prev:
             self.results['diff'] = {
                 "available": False, "baseline": None,
@@ -12587,6 +12639,11 @@ def main():
 
     def _one(job):
         _ti, _tgt = job
+        # Each worker gets its OWN copy of the parsed args. _scan_target sets
+        # args.target and reads many attributes; a shared object would let
+        # concurrent workers clobber each other's target/report.
+        import copy as _copy
+        _args = _copy.copy(args)
         if batch and not args.quiet:
             console.print(f"\n[bold magenta]━━ scan {_ti}/{len(targets)}:[/] [bold white]{_tgt}[/] ━━")
         suffix = ""
@@ -12594,7 +12651,7 @@ def main():
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", _tgt)[:80]
             suffix = f".{safe}"
         try:
-            _summary = _scan_target(args, attack_indices, ports, _tgt, suffix)
+            _summary = _scan_target(_args, attack_indices, ports, _tgt, suffix)
             _sc = (_summary or {}).get("score") or {}
             return {"target": _tgt, "ok": True,
                     "exposure": _sc.get("score") if isinstance(_sc, dict) else _sc,
