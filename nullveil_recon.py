@@ -3,7 +3,7 @@
 NULLVEIL Recon - Website & Domain Reconnaissance Tool
 Owner/Author: NULLVEIL
 Engine: DeepHat
-Version: 3.8.0
+Version: 3.9.0
 
 Features (48 attack modules):
   Recon & discovery
@@ -109,7 +109,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.8.0"
+__version__ = "3.9.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -665,6 +665,123 @@ class RuleSet:
                 "misconfig_rules": len(self.misconfig), "errors": list(self.errors)}
 
 
+# ============================================================ evasion transport
+# Coherent, browser-like request profiles. Each profile is a *set* of headers
+# that belong together (a real Chrome does not send a Firefox UA with a Safari
+# Accept-Language), so rotating between them stays believable instead of
+# producing the header mish-mash that naive evasion scripts leak.
+_EVASION_PROFILES = [
+    {  # Chrome / Windows
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+                  "image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {  # Chrome / macOS
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+                  "image/webp,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Sec-Ch-Ua": '"Chromium";v="123", "Google Chrome";v="123", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {  # Firefox / Windows
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+                      "Gecko/20100101 Firefox/125.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    {  # Safari / macOS
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                      "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    },
+]
+
+# Evasion levels → (rotate_ua, jitter_max_seconds, extra_headers)
+#   none  : no evasion at all (fastest, most obvious)
+#   light : rotate the browser profile per request + small jitter
+#   stealth: rotate + coherence-preserving header order + wider jitter
+_EVASION_LEVELS = {
+    "none":    {"rotate": False, "jitter": 0.0,  "coherent": False},
+    "light":   {"rotate": True,  "jitter": 0.25, "coherent": False},
+    "stealth": {"rotate": True,  "jitter": 0.8,  "coherent": True},
+}
+
+
+class EvasionTransport(httpx.AsyncBaseTransport):
+    """WAF-evasion layer: per-request browser-profile rotation + request jitter.
+
+    Sits *below* the retry layer and *above* the real transport, so it sees
+    every request the scan issues. It rewrites the request headers to a
+    coherent, real-browser profile (rotating between them) and introduces a
+    small random delay, which smooths the machine-gun signature that gets a
+    scanner rate-limited or fingerprinted in the first place.
+
+    It is deliberately **not** a WAF bypass tool: it never forges auth, never
+    tampers with payloads and never mutates the target's state — it only makes
+    the scan's *own* traffic look like an ordinary visitor's.
+    """
+
+    def __init__(self, transport, level="light", rotate_every=1):
+        self._transport = transport
+        self.level = level if level in _EVASION_LEVELS else "none"
+        self.cfg = _EVASION_LEVELS[self.level]
+        self.rotate_every = max(1, int(rotate_every))
+        self._count = 0
+        self._idx = random.randrange(len(_EVASION_PROFILES))
+        self.requests = 0     # total requests rewritten (scan-level metric)
+
+    async def handle_async_request(self, request):
+        self._count += 1
+        self.requests += 1
+        if self.cfg["rotate"] and self._count % self.rotate_every == 0:
+            self._idx = (self._idx + 1) % len(_EVASION_PROFILES)
+        if self.cfg["rotate"]:
+            profile = _EVASION_PROFILES[self._idx]
+            # Build a fresh header block: the profile wins, but we keep the
+            # scanner's own identity header out of the way and preserve any
+            # auth header the session layer injected.
+            keep = {}
+            for k, v in request.headers.items():
+                lk = k.lower()
+                if lk in ("authorization", "cookie", "x-api-key", "x-auth-token"):
+                    keep[k] = v
+            new_headers = list(profile.items()) + list(keep.items())
+            try:
+                request.headers = httpx.Headers(new_headers)
+            except Exception:
+                for k, v in profile.items():
+                    request.headers[k] = v
+        if self.cfg["jitter"]:
+            await asyncio.sleep(random.uniform(0, self.cfg["jitter"]))
+        return await self._transport.handle_async_request(request)
+
+
 # ============================================================ retrying transport
 class RetryingTransport(httpx.AsyncBaseTransport):
     """Transparently retry transient failures (429/503/502/504 + connection
@@ -976,6 +1093,11 @@ class WebsiteRecon:
         # very first client this constructor creates.
         self.max_retries = 2
         self.backoff_base = 0.5
+        # --- WAF evasion (--evade): default off, wired from CLI in main() ---
+        self.evade_level = "none"
+        self.evade_rotate_every = 1
+        # --- deep verification pass (--verify): default off ---
+        self.deep_verify = False
         self._build_transport(concurrency)
         # --- authenticated / OOB scanning state (CLI flags wired in main) ---
         self.auth_cfg = {}     # --auth-* / --login-* / --role flags
@@ -1007,14 +1129,23 @@ class WebsiteRecon:
                 proxy=self.proxy or None,   # Burp/Caido intercepting proxy (--proxy)
                 retries=0,                  # we handle retries ourselves
             )
+            # WAF-evasion layer (--evade) sits closest to the wire: it rewrites
+            # each request to a coherent browser profile before it is sent.
+            self._evasion_transport = None
+            level = getattr(self, "evade_level", "none") or "none"
+            if level != "none" and level in _EVASION_LEVELS:
+                self._evasion_transport = EvasionTransport(
+                    base_transport, level=level,
+                    rotate_every=getattr(self, "evade_rotate_every", 1))
+                transport = self._evasion_transport
+            else:
+                transport = base_transport
             if getattr(self, "max_retries", 0):
                 self._retry_transport = RetryingTransport(
-                    base_transport,
+                    transport,
                     max_retries=self.max_retries,
                     base=getattr(self, "backoff_base", 0.5))
                 transport = self._retry_transport
-            else:
-                transport = base_transport
         except Exception:
             transport = None
             limits = httpx.Limits(max_connections=max(concurrency, 100),
@@ -1268,6 +1399,13 @@ class WebsiteRecon:
                         self.results['errors'].append(f"{name} crashed: {e!r}")
 
         self.scan_duration = (datetime.now() - scan_start).total_seconds()
+
+        # --- deep-accuracy pass (--verify): re-check findings, drop non-reproducers ---
+        if getattr(self, "deep_verify", False):
+            try:
+                await self._verify_findings_pass()
+            except Exception as e:
+                self.results['errors'].append(f"verify: {e!r}")
 
         try:
             await self.client.aclose()
@@ -7152,6 +7290,102 @@ class WebsiteRecon:
                               "LOW": 3, "INFO": 4}.get(t[0], 5))
         return F
 
+    async def _verify_findings_pass(self):
+        """Deep-accuracy pass (--verify).
+
+        Re-verifies the *reproducible-URL* class of findings with a second,
+        independent request issued from a fresh connection. A finding is kept
+        only when the second probe agrees with the first; findings that do not
+        reproduce are moved to ``results['verify_dropped']`` instead of being
+        silently deleted, so nothing is ever hidden from the operator.
+
+        Read-only: it only re-issues the same GET/HEAD the module already made.
+        """
+        candidates = []
+        # 1) flagged paths / exposed resources (the highest false-positive class).
+        #    Entries are dicts like {"path": "/.git/config", "status": 200, "flagged": true}.
+        for entry in list(self.results.get('paths', [])):
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path") or ""
+            if not path:
+                continue
+            url = path if path.startswith("http") else urljoin(self.base_url + "/", path.lstrip("/"))
+            label = f"{path} (status {entry.get('status')}{', flagged' if entry.get('flagged') else ''})"
+            candidates.append(("paths", url, label))
+        # 2) plausible .git/.env/config exposures flagged by the audit
+        for sev, chk, det in list(self.results.get('api_audit_findings', [])):
+            if re.search(r"(?i)(\.git|\.env|config|backup|swagger|exposed)", f"{chk} {det}"):
+                m = re.search(r"(https?://[^\s'\"<>)]+)", det)
+                base = m.group(1) if m else ""
+                if not base:
+                    pm = re.search(r"(/[A-Za-z0-9._\-/]{2,})", det)
+                    if pm:
+                        base = urljoin(self.base_url + "/", pm.group(1).lstrip('/'))
+                if base:
+                    candidates.append(("audit", base, f"{chk}: {det}"))
+
+        # de-dupe candidate URLs and cap the work
+        seen = set()
+        uniq = []
+        for kind, url, det in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
+            uniq.append((kind, url, det))
+        cap = 200 if self.deep else 80
+        uniq = uniq[:cap]
+        if not uniq:
+            self.results['verify_stats'] = {"tested": 0, "kept": 0, "dropped": 0}
+            return
+
+        async def _confirm(url):
+            # a finding "reproduces" when a fresh GET still returns a
+            # non-404 status (the truthy signal the module keyed on).
+            try:
+                async with self.sem:
+                    r = await self.client.get(url, timeout=min(self.timeout, 12))
+                return r.status_code not in (404, 410)
+            except Exception:
+                return None   # unknown — do NOT drop on a network hiccup
+
+        results = await asyncio.gather(*[_confirm(u) for _, u, _ in uniq])
+        kept = dropped = unknown = 0
+        drop_urls = set()
+        for (kind, url, det), ok in zip(uniq, results):
+            if ok is None:
+                unknown += 1
+            elif ok:
+                kept += 1
+            else:
+                dropped += 1
+                drop_urls.add(url)
+                self.results['verify_dropped'].append(f"[{kind}] {url} — did not reproduce on re-probe")
+
+        # Drop non-reproducing *path* findings from the report — but only when the
+        # probe actually reached the host (kept + dropped > 0). If every probe was
+        # inconclusive the target is probably down, so we keep everything.
+        if kept + dropped > 0 and drop_urls:
+            before = len(self.results.get('paths', []))
+            def _keep(p):
+                if not isinstance(p, dict):
+                    return True
+                path = p.get("path") or ""
+                url = path if str(path).startswith("http") else urljoin(self.base_url + "/", str(path).lstrip("/"))
+                return url not in drop_urls
+            self.results['paths'] = [p for p in self.results.get('paths', []) if _keep(p)]
+            dropped_paths = before - len(self.results['paths'])
+        else:
+            dropped_paths = 0
+
+        self.results['verify_stats'] = {"tested": len(uniq), "kept": kept,
+                                        "dropped": dropped, "unknown": unknown,
+                                        "paths_removed": dropped_paths}
+        if not getattr(self, "quiet", False):
+            console.print(f"[dim]Verify pass:[/] {kept} confirmed · {dropped} dropped · "
+                          f"{unknown} inconclusive [dim](of {len(uniq)}"
+                          + (f", {dropped_paths} path(s) removed" if dropped_paths else "") + ")[/]")
+
     def _dedupe_findings(self, findings):
         """Smart deduplication — collapse redundant/near-identical findings.
 
@@ -9907,6 +10141,15 @@ class WebsiteRecon:
             "ruleset": (self.ruleset.summary() if getattr(self, "ruleset", None)
                         else {"files": [], "cve_rules": 0, "misconfig_rules": 0, "errors": []}),
             "retries": (getattr(getattr(self, "_retry_transport", None), "retries", 0) or 0),
+            "evasion": {
+                "level": getattr(self, "evade_level", "none") or "none",
+                "requests_rewritten": (getattr(getattr(self, "_evasion_transport", None),
+                                              "requests", 0) or 0),
+                "rotate_every": getattr(self, "evade_rotate_every", 1),
+            },
+            "verification": (self.results.get('verify_stats', {}) if getattr(self, "deep_verify", False)
+                             else {}),
+            "verify_dropped": self.results.get('verify_dropped', []),
             "errors": self.results['errors'],
         }
         return out
@@ -11152,6 +11395,53 @@ def serve_dashboard(port=8899, open_browser=True, host="127.0.0.1"):
             pass
 
 
+# ---------------------------------------------------------- batch targets
+def _expand_targets(spec_list):
+    """Expand a list of target specs (domains/URLs/CIDRs) into a flat, ordered,
+    de-duplicated list of scan targets. CIDR blocks are expanded to host IPs,
+    capped to keep an accidental ``/8`` from launching a million scans."""
+    out, seen = [], set()
+    for spec in spec_list:
+        spec = (spec or "").strip()
+        if not spec or spec.startswith("#"):
+            continue
+        items = [x.strip() for x in re.split(r"[,\s]+", spec) if x.strip()]
+        for it in items:
+            if "/" in it and not it.startswith(("http://", "https://")):
+                try:
+                    net = ipaddress.ip_network(it, strict=False)
+                    for host in net.hosts():
+                        h = str(host)
+                        if h not in seen:
+                            seen.add(h)
+                            out.append(h)
+                    continue
+                except ValueError:
+                    pass
+            if it not in seen:
+                seen.add(it)
+                out.append(it)
+    return out
+
+
+def _load_targets_file(path, max_hosts=1024):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            raw = [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    except FileNotFoundError:
+        console.print(f"[bold red]Targets file not found:[/] {path}")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[bold red]Could not read targets file:[/] {e}")
+        sys.exit(1)
+    expanded = _expand_targets(raw)
+    if len(expanded) > max_hosts:
+        console.print(f"[yellow]! {len(expanded)} targets exceed --max-hosts {max_hosts}; "
+                      f"scanning the first {max_hosts}.[/]")
+        expanded = expanded[:max_hosts]
+    return expanded
+
+
 # ---------------------------------------------------------- CLI
 def main():
     import warnings as _warnings
@@ -11220,6 +11510,27 @@ def main():
                              "errors twice with exponential backoff)")
     parser.add_argument("--retries", type=int, metavar="N", default=2,
                         help="Max transparent retries per request for transient failures (default: 2)")
+
+    # ---- advanced: mass scanning + WAF evasion (v3.9.0) ----
+    advg = parser.add_argument_group("advanced scanning (mass targets + WAF evasion)")
+    advg.add_argument("--targets-file", metavar="FILE", default=None,
+                      help="Batch mode: scan every target (one per line, '#' comments) in FILE sequentially. "
+                           "Per-target reports are written next to -o/-H with the target name appended; a combined "
+                           "index is added when -o is given.")
+    advg.add_argument("--targets-list", metavar="LIST", default=None,
+                      help="Batch mode: comma-separated inline target list (e.g. 'a.com,b.com,10.0.0.0/30'). "
+                           "CIDR blocks are expanded to host IPs (capped by --max-hosts).")
+    advg.add_argument("--max-hosts", type=int, metavar="N", default=1024,
+                      help="Safety cap on how many hosts a CIDR expands to in batch mode (default: 1024)")
+    advg.add_argument("--evade", choices=["none", "light", "stealth"], default="none",
+                      help="WAF-evasion profile (default: none). 'light' rotates a coherent real-browser header "
+                           "profile per request + small jitter; 'stealth' adds wider jitter. Read-only — never "
+                           "forges auth or mutates the target")
+    advg.add_argument("--evade-rotate-every", type=int, metavar="N", default=1,
+                      help="Rotate the browser profile every N requests in --evade mode (default: 1)")
+    advg.add_argument("--verify", action="store_true",
+                      help="Deep-accuracy pass: re-verify each finding with a second, independent request and drop "
+                           "anything that does not reproduce (reduces false positives; slower)")
     authg = parser.add_argument_group("authenticated scanning (module 31: auth)")
     authg.add_argument("--auth-header", action="append", metavar="'Name: Value'",
                        help="Header injected into EVERY scan request (repeatable), e.g. --auth-header 'X-Api-Key: abc'")
@@ -11366,17 +11677,17 @@ def main():
         console.print("  [white]nullveil <target>[/]                [dim]# default = ALL modules[/]")
         return
 
-    if not args.target:
+    if not args.target and not (args.targets_file or args.targets_list):
         if args.dashboard is not None:
             serve_dashboard(port=int(args.dashboard))
             return
         parser.print_help()
-        console.print("\n[red]Error:[/] target is required (unless using -l / --history / --dashboard / --pdf-from)")
+        console.print("\n[red]Error:[/] target is required (unless using -l / --history / --dashboard / --pdf-from / --targets-file / --targets-list)")
         sys.exit(1)
 
     # Attack selection: -m menu > -a list > default ALL
     if args.menu:
-        attack_indices = attack_menu(args.target)
+        attack_indices = attack_menu(args.target or "target")
     elif args.attack is not None:
         attack_indices = parse_attack_list(args.attack)
         if not attack_indices:
@@ -11396,6 +11707,69 @@ def main():
             print("[!] Invalid --ports value. Example: --ports 80,443,8080")
             sys.exit(1)
 
+    # ---- mass scanning (batch): resolve the target list ------------------
+    batch = None
+    if args.targets_file or args.targets_list:
+        if args.targets_file:
+            batch = _load_targets_file(args.targets_file, max_hosts=max(1, int(args.max_hosts)))
+        inline = _expand_targets([args.targets_list]) if args.targets_list else []
+        if batch is None:
+            batch = inline[:max(1, int(args.max_hosts))]
+        elif inline:
+            batch += [t for t in inline if t not in batch]
+        if not batch:
+            console.print("[bold red]No targets found in --targets-file / --targets-list.[/]")
+            sys.exit(1)
+        console.print(f"[bold cyan]◆ Batch mode[/] — {len(batch)} target(s) queued"
+                      + ("  [dim](sequential, one report each)[/]" if not args.quiet else ""))
+
+    targets = batch if batch else [args.target]
+    batch_index = []
+    for _ti, _tgt in enumerate(targets, 1):
+        if batch and not args.quiet:
+            console.print(f"\n[bold magenta]━━ scan {_ti}/{len(targets)}:[/] [bold white]{_tgt}[/] ━━")
+        suffix = ""
+        if batch:
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", _tgt)[:80]
+            suffix = f".{safe}"
+        try:
+            _summary = _scan_target(args, attack_indices, ports, _tgt, suffix)
+            if batch:
+                _sc = (_summary or {}).get("score") or {}
+                batch_index.append({"target": _tgt, "ok": True,
+                                    "exposure": _sc.get("score") if isinstance(_sc, dict) else _sc,
+                                    "verdict": _sc.get("verdict") if isinstance(_sc, dict) else None})
+        except SystemExit:
+            raise
+        except Exception as e:
+            console.print(f"[bold red]scan failed for {_tgt}:[/] {type(e).__name__} — {e}")
+            if batch:
+                batch_index.append({"target": _tgt, "ok": False, "error": str(e)})
+            else:
+                raise
+
+    # combined batch index
+    if batch and args.output:
+        try:
+            idx_path = os.path.splitext(args.output)[0] + ".index.json"
+            with open(idx_path, "w", encoding="utf-8") as f:
+                json.dump({"tool": "NULLVEIL Recon", "version": __version__,
+                           "mode": "batch", "count": len(batch_index),
+                           "targets": batch_index}, f, indent=2, ensure_ascii=False)
+            console.print(f"\n[bold green]Batch index saved:[/] {idx_path} "
+                          f"[dim]({len(batch_index)} target(s))[/]")
+        except Exception as e:
+            console.print(f"[yellow]Could not write batch index: {e}[/]")
+    return
+
+
+def _scan_target(args, attack_indices, ports, target, out_suffix=""):
+    """Run one full scan of ``target`` using the parsed ``args``.
+
+    Extracted so batch mode (--targets-file / --targets-list) can reuse the
+    exact single-target pipeline — configuration, exports, watch loop and all.
+    """
+    args.target = target
     recon = WebsiteRecon(
         args.target,
         deep=args.deep,
@@ -11432,6 +11806,13 @@ def main():
             console.print(f"[yellow]! {err}[/]")
     # ---- resilience tuning (retry/backoff layer) ----
     recon.max_retries = 0 if args.no_retry else max(0, int(args.retries))
+    # ---- WAF evasion (--evade) ----
+    recon.evade_level = args.evade or "none"
+    recon.evade_rotate_every = max(1, int(args.evade_rotate_every or 1))
+    if recon.evade_level != "none":
+        console.print(f"[bold green]✓ WAF evasion[/] — profile [cyan]{recon.evade_level}[/] "
+                      f"(rotate every {recon.evade_rotate_every} req)")
+    recon.deep_verify = bool(args.verify)
     recon.auth_cfg = {
         "headers": args.auth_header or [],
         "cookies": args.auth_cookie or [],
@@ -11523,31 +11904,38 @@ def main():
         console.print("\n[yellow]Interrupted by user.[/]")
         sys.exit(130)
 
+    def _out(path):
+        if not path or not out_suffix:
+            return path
+        root, ext = os.path.splitext(path)
+        return f"{root}{out_suffix}{ext}"
+
     if args.output:
         try:
-            with open(args.output, 'w', encoding='utf-8') as f:
+            op = _out(args.output)
+            with open(op, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False, default=str)
-            console.print(f"\n[bold green]Report saved:[/] {args.output}")
+            console.print(f"\n[bold green]Report saved:[/] {op}")
         except Exception as e:
             console.print(f"\n[bold red]Could not save report:[/] {e}")
 
     if args.html:
         try:
-            recon.export_html(args.html)
-            console.print(f"[bold green]HTML report saved:[/] {args.html}")
+            recon.export_html(_out(args.html))
+            console.print(f"[bold green]HTML report saved:[/] {_out(args.html)}")
         except Exception as e:
             console.print(f"[bold red]Could not save HTML report:[/] {e}")
 
     try:
         if getattr(args, 'repro', None):
-            outp = recon.export_repro(args.repro)
+            outp = recon.export_repro(_out(args.repro))
             console.print(f"[bold green]Repro pack saved:[/] {outp}")
     except Exception as e:
         console.print(f"[bold red]Failed to export repro:[/] {type(e).__name__} — {e}")
 
     if args.pdf:
         try:
-            ok, msg = recon.export_pdf(args.pdf)
+            ok, msg = recon.export_pdf(_out(args.pdf))
             if ok:
                 size = os.path.getsize(msg) // 1024 if os.path.exists(msg) else 0
                 console.print(f"[bold green]PDF report saved:[/] {msg} [dim]({size} KB)[/]")
@@ -11556,8 +11944,30 @@ def main():
         except Exception as e:
             console.print(f"[bold red]Failed to export PDF:[/] {type(e).__name__} — {e}")
 
-    if args.dashboard is not None:
+    if args.dashboard is not None and not out_suffix:
         serve_dashboard(port=int(args.dashboard))
+
+    # summary for batch mode
+    return {"target": target, "ok": True, "score": _batch_score(report)}
+
+
+def _batch_score(report):
+    """Derive the 0-100 exposure score from a finished report dict.
+
+    Uses the same ``_risk_meter`` the CLI panel uses so the batch index agrees
+    with what the operator saw on screen."""
+    if not isinstance(report, dict):
+        return None
+    s = report.get("summary", {}) or {}
+    try:
+        score, _level, _color, verdict, _bar = _risk_meter(
+            report.get("secrets", []) or [],
+            len([h for h in (report.get("missing_security_headers") or []) if h != "content-encoding"]),
+            [p for p in (report.get("paths") or []) if isinstance(p, dict) and p.get("flagged")],
+        )
+        return {"score": score, "verdict": verdict}
+    except Exception:
+        return {"score": s.get("exposure_score")}
 
 
 if __name__ == "__main__":

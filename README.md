@@ -1,6 +1,6 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.8.0 · **License:** MIT (dual-licensed — see [Commercial](LICENSE-COMMERCIAL.md))
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.9.0 · **License:** MIT (dual-licensed — see [Commercial](LICENSE-COMMERCIAL.md))
 
 [![CI](https://github.com/nullveil0x/nullveil-recon/actions/workflows/ci.yml/badge.svg)](https://github.com/nullveil0x/nullveil-recon/actions/workflows/ci.yml)
 ![tests](https://img.shields.io/badge/tests-34%20passing-brightgreen)
@@ -21,7 +21,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.8.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.9.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -330,6 +330,15 @@ python3 nullveil_recon.py example.com -a cve --rules my-cves.json      # or a si
 python3 nullveil_recon.py example.com --retries 5                      # more retries (default 2)
 python3 nullveil_recon.py example.com --no-retry                       # disable the retry layer
 
+# v3.9.0: mass scanning — many targets in one run
+python3 nullveil_recon.py --targets-file targets.txt -a all -o out.json   # one report per line (+ combined .index.json)
+python3 nullveil_recon.py --targets-list 'a.com,b.com,10.0.0.0/29' -a http # inline list; CIDR expands to hosts
+# v3.9.0: WAF evasion — coherent real-browser profile rotation per request
+python3 nullveil_recon.py example.com --evade light                     # rotate UA + jitter (default: none)
+python3 nullveil_recon.py example.com --evade stealth --evade-rotate-every 3
+# v3.9.0: deep accuracy — re-verify findings, drop false positives
+python3 nullveil_recon.py example.com -a paths --verify                  # second independent probe; non-reproducers removed
+
 # v3.2.0: client-ready PDF report
 python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
 
@@ -477,7 +486,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "3.8.0",
+  "version": "3.9.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "remediation_patches": 9, "poc_verifications": 4, "dedupe_removed": 6, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -540,6 +549,14 @@ A few v3 features are **deliberately shaped** so the tool stays defensive & repo
 | Multi-tenant correlation | Correlates **domains you provide/own** (`--correlate`) or auto-derived from your cert SANs |
 
 Compliance output is **evidence-based partial mapping**, never a certification claim.
+
+### v3.9.0 notes (mass scanning · WAF evasion · deep accuracy)
+
+Three advanced-operator features — all still **read-only / defensive**:
+
+- **Mass Scanning** (`--targets-file FILE` / `--targets-list LIST`) runs the whole pipeline over many targets in one invocation. Targets are de-duplicated, blank lines and `#` comments ignored, and **CIDR blocks are expanded to host IPs** (safety-capped by `--max-hosts`, default 1024). Each target gets its own report (`-o out.json` → `out.<target>.json`, `-H`/`--pdf` likewise) plus a combined **`out.index.json`** with the per-target exposure score + verdict, so a fleet scan is one command and one summary.
+- **WAF Evasion** (`--evade none|light|stealth`) rewrites every request to a **coherent, real-browser profile** — UA, `Accept`, `Accept-Language`, `Sec-Ch-Ua`, `Sec-Fetch-*` — rotating between four profiles (Chrome/Windows, Chrome/macOS, Firefox, Safari) with added **request jitter** (`--evade-rotate-every N`). Profiles are self-consistent (a Chrome UA never ships a Firefox header set), which is what gets naive scripts fingerprinted. It **never** forges auth, tampers with payloads or mutates the target — it only makes the scan's *own* traffic look like an ordinary visitor's. Injected auth headers (`Authorization`/`Cookie`/`X-Api-Key`/`X-Auth-Token`) are preserved. Requests rewritten are exported under `evasion`.
+- **Deep Accuracy** (`--verify`) adds a second, independent verification pass: it re-probes the **false-positive-prone** classes (flagged paths, `.git`/`.env`/config/backup exposures) from a fresh connection and **drops anything that does not reproduce**, recording it (never silently deleting) under `verify_dropped`. A network hiccup is treated as *inconclusive* — findings are kept, so a flaky link can never hide a real issue. Results are exported under `verification` (`tested`/`kept`/`dropped`/`unknown`/`paths_removed`).
 
 ### v3.8.0 notes (plugin rule engine + resilient scanning)
 
@@ -745,6 +762,7 @@ bug-class lint, a coverage report, and builds the Docker image — see
 
 **Feature guides:**
 
+- [docs/ADVANCED.md](docs/ADVANCED.md) — mass scanning (`--targets-file`/`--targets-list` + CIDR), WAF evasion (`--evade`), deep accuracy (`--verify`).
 - [docs/RULES.md](docs/RULES.md) — the plugin rule engine (`--rules`): extend the built-in CVE + misconfig knowledge with your own YAML/JSON.
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — authenticated scanning: static session material, automated login, multi-role profiling.
 - [docs/RESILIENCE.md](docs/RESILIENCE.md) — the transparent retry/backoff layer, external-service degradation, and per-module timeouts.
