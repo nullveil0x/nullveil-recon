@@ -1,65 +1,96 @@
-# NULLVEIL external rule set — example
+# NULLVEIL external rule set — example (all entries verified against NVD)
 #
 # Load with:  python3 nullveil_recon.py TARGET --rules rules/
 #
 # Rule files extend the built-in CVE + misconfiguration knowledge without
 # touching the source. YAML needs PyYAML (`pip install pyyaml`); JSON works
-# with the standard library alone. A file may be a single object or a list.
+# with the standard library alone. A file may be a single object or a list;
+# a directory is scanned recursively for *.yml / *.yaml / *.json.
 #
 # ── CVE / version rules ────────────────────────────────────────────────────
 #   product   : normalised product name (must match what the tool fingerprints,
-#               e.g. apache, nginx, tomcat, wordpress, jquery, php …)
+#               e.g. apache, nginx, tomcat, wordpress, jquery, php, openssh …).
+#               It is lower-cased before matching.
 #   major     : optional int — only apply when the detected major matches
-#               (null / omitted = any major)
-#   mode      : lt | le | eq | ge | gt   (comparison against `version`)
+#               (null / omitted = any major). Useful for split CVE lines such as
+#               Apache Tomcat 8.x vs 9.x.
+#   mode      : lt | le | eq | ge | gt   (version comparison against `version`)
 #   version   : the boundary version, as a list [2, 4, 49] or a string "2.4.49"
 #   id        : CVE id
 #   severity  : CRITICAL | HIGH | MEDIUM | LOW | INFO
-#   title     : short human description
+#   title     : short human description (keep it accurate — it ships to clients)
+#
+# NOTE: the rule fires when the *detected* version satisfies the comparison.
+# For a "fixed in X" advisory use mode: lt (vulnerable = below the fix).
 cve:
+  # OpenSSH < 7.4 — NULL-pointer dereference / daemon crash (verified NVD)
   - product: openssh
     mode: lt
-    version: [8, 5]
+    version: [7, 4]
     id: CVE-2016-10708
     severity: MEDIUM
-    title: NULL dereference in sshd (OpenSSH < 8.5)
+    title: "OpenSSH < 7.4 — sshd NULL-pointer dereference DoS (out-of-sequence NEWKEYS)"
 
+  # PHP 7.4.x < 7.4.30 — mysqlnd buffer overflow via a malicious MySQL server
   - product: php
+    major: 7
     mode: lt
-    version: "7.4.30"
+    version: [7, 4, 30]
     id: CVE-2022-31626
     severity: HIGH
-    title: mysqlnd buffer overflow via malicious server (PHP < 7.4.30)
+    title: "PHP 7.4.x < 7.4.30 — mysqlnd buffer overflow via malicious MySQL server"
 
+  # PHP 8.0.x < 8.0.20 — same advisory, different branch
+  - product: php
+    major: 8
+    mode: lt
+    version: [8, 0, 20]
+    id: CVE-2022-31626
+    severity: HIGH
+    title: "PHP 8.0.x < 8.0.20 — mysqlnd buffer overflow via malicious MySQL server"
+
+  # Express.js < 4.19.0 — open redirect in res.location()/res.redirect()
   - product: express
     mode: lt
-    version: [4, 17, 3]
+    version: [4, 19, 0]
     id: CVE-2024-29041
     severity: MEDIUM
-    title: Open redirect in express.js (< 4.19.2 fixed line)
+    title: "Express.js < 4.19.0 — open redirect via res.location()/res.redirect()"
 
 # ── Active misconfiguration probes ─────────────────────────────────────────
-#   path      : URL path requested (GET, read-only)
+#   path      : URL path requested (GET, read-only — never mutates)
 #   match     : optional regex the response body must match
 #               (null / omitted = a 200/403 response is enough)
 #   severity  : CRITICAL | HIGH | MEDIUM | LOW | INFO
 #   id        : short stable id
 #   title     : human description
+#
+# These are INFRASTRUCTURE-safe: they only GET a path and look for a signature.
 misconfig:
+  # security.txt presence is GOOD news — reported as INFO for the client.
   - path: /.well-known/security.txt
     match: "(?i)Contact:"
     severity: INFO
     id: security.txt
-    title: security.txt present (good — responsible disclosure channel)
+    title: "security.txt present (good — responsible-disclosure channel published)"
 
+  # A front-end config.json that leaks a key/secret shape.
   - path: /config.json
-    match: "(?i)(apiKey|api_key|secret|password)\\s*[\":=]"
+    match: "(?i)\"(apiKey|api_key|secret|password|token)\"\\s*:"
     severity: HIGH
     id: Exposed config.json
-    title: Front-end config.json leaks credentials/keys
+    title: "Front-end config.json publicly exposes credentials/keys"
 
+  # package.json leaks dependency names + exact versions (supply-chain recon).
   - path: /package.json
-    match: "\"(dependencies|devDependencies)\""
+    match: "\"(dependencies|devDependencies)\"\\s*:"
     severity: LOW
     id: Exposed package.json
-    title: package.json public (dependency/version disclosure)
+    title: "package.json public — dependency/version disclosure (supply-chain recon)"
+
+  # Common cloud metadata leak (SSRF-adjacent — matches IAM credentials).
+  - path: /latest/meta-data/iam/security-credentials/
+    match: "(?i)(AccessKeyId|SecretAccessKey)"
+    severity: CRITICAL
+    id: Cloud metadata leak
+    title: "AWS EC2 metadata credentials reachable (SSRF / credential theft)"

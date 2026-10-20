@@ -743,6 +743,12 @@ docker run --rm nullveil-recon https://example.com -a all
 bug-class lint, a coverage report, and builds the Docker image — see
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
+**Feature guides:**
+
+- [docs/RULES.md](docs/RULES.md) — the plugin rule engine (`--rules`): extend the built-in CVE + misconfig knowledge with your own YAML/JSON.
+- [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — authenticated scanning: static session material, automated login, multi-role profiling.
+- [docs/RESILIENCE.md](docs/RESILIENCE.md) — the transparent retry/backoff layer, external-service degradation, and per-module timeouts.
+
 **Commercial use / consulting:** [docs/CONSULTING.md](docs/CONSULTING.md) ·
 **pricing:** [docs/PRICING.md](docs/PRICING.md) ·
 **support:** [`.github/FUNDING.yml`](.github/FUNDING.yml).

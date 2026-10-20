@@ -1,21 +1,22 @@
 {
+  "_comment": "NULLVEIL rule set — JSON form (stdlib only, no PyYAML needed). Load with --rules rules/example.json",
   "cve": [
     {
       "product": "nginx",
       "mode": "lt",
-      "version": [1, 21, 0],
+      "version": [1, 20, 1],
       "id": "CVE-2021-23017",
       "severity": "HIGH",
-      "title": "Resolver off-by-one (JSON rule example)"
+      "title": "nginx < 1.20.1 (and 1.21.x < 1.21.0) — resolver off-by-one 1-byte memory overwrite"
     }
   ],
   "misconfig": [
     {
       "path": "/healthz",
-      "match": "(?i)(ok|healthy|status)",
+      "match": "(?i)(\"status\"\\s*:\\s*\"?(ok|healthy|up)|^ok$)",
       "severity": "INFO",
-      "id": "K8s health endpoint",
-      "title": "Kubernetes-style health endpoint exposed"
+      "id": "Health endpoint",
+      "title": "Orchestrator health endpoint publicly exposed (info disclosure)"
     }
   ]
 }
