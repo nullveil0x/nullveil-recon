@@ -1792,9 +1792,16 @@ class WebsiteRecon:
         tdb = getattr(self, "timeline_db", None)
         if tdb is not None and getattr(tdb, "enabled", False):
             sid = tdb.record(report, recon=self)
-            if sid and not getattr(self, "quiet", False):
-                console.print(f"[dim]Timeline:[/] scan #{sid} indexed "
-                              f"[dim]({tdb.path})[/]")
+            if sid:
+                # the report was serialised before the row existed, so refresh
+                # the embedded stats + record this scan's own id in place.
+                st = tdb.stats()
+                st = dict(st) if isinstance(st, dict) else {"enabled": True}
+                st["indexed_scan_id"] = sid
+                report["timeline"] = st
+                if not getattr(self, "quiet", False):
+                    console.print(f"[dim]Timeline:[/] scan #{sid} indexed "
+                                  f"[dim]({tdb.path})[/]")
 
         # --- ATT&CK Navigator layer export (module 46) ---------------------
         layer_path = str(getattr(self, "attack_layer_path", "") or "")

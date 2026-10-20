@@ -119,6 +119,19 @@ def test_timeline_exported_in_report(nv, tmp_path):
     recon.timeline_db.close()
 
 
+def test_timeline_record_exposes_own_scan_id(nv, tmp_path):
+    """After record(), the DB lookup used to refresh the report must find the
+    row we just wrote (this is what run() patches into report['timeline'])."""
+    db = nv.TimelineDB(str(tmp_path / "t.db"))
+    sid = db.record({"target": "x.com", "started": "2026-01-01T00:00:00",
+                     "summary": {}})
+    st = db.stats()
+    assert sid == 1
+    assert st["scans"] == 1
+    assert st["domains"] == 1
+    db.close()
+
+
 # ------------------------------------------------------------------ workers
 def test_workers_flag_in_parser(nv):
     """--workers must exist and default to 1 (sequential)."""
