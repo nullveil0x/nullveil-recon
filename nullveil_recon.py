@@ -91,9 +91,7 @@ try:
     from rich.text import Text
     from rich import box as rbox
     from rich.align import Align
-    from rich.live import Live
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-    from rich import print as rprint
+    from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn
 except ImportError as e:
     missing = getattr(e, "name", None) or str(e).split("'")[-2] if "'" in str(e) else None
     missing = missing or "unknown module"
@@ -665,6 +663,8 @@ def _norm_paths(v):
             if p.get("source"):
                 rec["source"] = p.get("source")
         else:
+            if p is None:
+                continue
             path = str(p).strip()
             if not path:
                 continue
@@ -3136,7 +3136,7 @@ class WebsiteRecon:
         "wp-admin": 92, "wp-login": 90, "mail": 78, "webmail": 86, "owa": 88, "exchange": 84,
         "staging": 72, "stage": 72, "dev": 60, "test": 56, "demo": 42, "beta": 56, "uat": 72,
         "sandbox": 66, "internal": 86, "intranet": 88, "portal": 76, "crm": 82, "erp": 86,
-        "upload": 76, "backup": 92, "bak": 88, "grafana": 80, "jenkins": 86, "gitlab": 80,
+        "upload": 76, "backup": 92, "bak": 88, "grafana": 80, "gitlab": 80,
         "gitea": 74, "kibana": 80, "elastic": 74, "k8s": 86, "kube": 86, "prometheus": 74,
         "monitor": 64, "metrics": 60, "status": 54, "shop": 76, "store": 76, "account": 76,
         "user": 60, "member": 66, "remote": 82, "gateway": 74, "jira": 76, "confluence": 76,
@@ -3149,7 +3149,7 @@ class WebsiteRecon:
     CRIT_PORTS = {
         22: 72, 21: 66, 23: 88, 25: 56, 110: 70, 143: 70, 445: 92, 1433: 95, 3306: 96, 3389: 92,
         5432: 96, 5900: 76, 6379: 92, 8080: 54, 8443: 56, 8500: 82, 9090: 62, 9200: 86, 11211: 74,
-        2375: 96, 2376: 90, 5672: 72, 9092: 72, 27017: 94, 11211: 74, 5984: 82, 15672: 76,
+        2375: 96, 2376: 90, 5672: 72, 9092: 72, 27017: 94, 5984: 82, 15672: 76,
     }
 
     async def criticality_classify(self):
@@ -4625,7 +4625,6 @@ class WebsiteRecon:
         source maps (``.map`` → ``sourcesContent``). Scans all recovered text for
         API keys / tokens / private keys and dangerous DOM sinks. Sends only GET,
         never mutates anything. Secrets are **masked** in the report."""
-        import json as _json
         js_urls = set()
         for u in (self.results.get('js_files') or []):
             if isinstance(u, str):
@@ -7080,7 +7079,7 @@ class WebsiteRecon:
         if re.search(r"(?i)path|admin|swagger|api|endpoint|directory|expos", c):
             m = re.search(r"(/[A-Za-z0-9_\-./?=&%]+)", detail)
             p = m.group(1) if m else "/"
-            cmds.append({"desc": f"HEAD the endpoint (no body, no side-effects)",
+            cmds.append({"desc": "HEAD the endpoint (no body, no side-effects)",
                          "cmd": f"curl -sSI {base}{p}"})
             cmds.append({"desc": "Fetch status only (GET, headers suppressed)",
                          "cmd": f"curl -sS -o /dev/null -w '%{{http_code}}\\n' {base}{p}"})
@@ -8637,13 +8636,12 @@ class WebsiteRecon:
         # --- WAF / CDN ---
         if self.results.get('waf') or self.results.get('cdn'):
             wafs = self.results.get('waf', [])
-            cdns = self.results.get('cdn', [])
             sec_wafs = self.results.get('waf_security', [])
             grid = "   ".join(
                 (f"[bold red]🛡 {w}[/]" if w in sec_wafs else f"[bold cyan]☁ {w}[/]")
                 for w in wafs)
             body = f"  [bold white]Detected:[/] {grid}\n"
-            body += f"  [dim]Red shield = security WAF · Cyan cloud = CDN/edge only[/]\n\n"
+            body += "  [dim]Red shield = security WAF · Cyan cloud = CDN/edge only[/]\n\n"
             body += "\n".join(f"  [dim]•[/] [white]{ev}[/]" for ev in self.results.get('waf_evidence', []))
             if not wafs:
                 body = "  [bold green]No WAF/CDN fingerprint detected[/]"
@@ -8821,7 +8819,7 @@ class WebsiteRecon:
                 eps = kat.get('endpoints', [])[:40]
                 if eps:
                     body += "\n" + "\n".join(f"  [cyan]•[/] {e}" for e in eps)
-                console.print(Panel(body, title=f"[bold cyan]◈ KATANA CRAWLER ◈[/]",
+                console.print(Panel(body, title="[bold cyan]◈ KATANA CRAWLER ◈[/]",
                                     border_style="cyan", box=rbox.ROUNDED))
             elif kat.get('note'):
                 console.print(Panel(f"  [yellow]•[/] {kat['note']}",
@@ -9133,7 +9131,7 @@ class WebsiteRecon:
             if ex.get('pdf'):
                 body += f"\n  [green]✓[/] executive PDF ({ex.get('pdf_engine', '')}) → [cyan]{ex.get('pdf')}[/]"
             elif getattr(self, "exec_pdf_path", ""):
-                body += f"\n  [yellow]•[/] PDF skipped — install weasyprint / reportlab / playwright"
+                body += "\n  [yellow]•[/] PDF skipped — install weasyprint / reportlab / playwright"
             console.print(Panel(body, title="[bold blue]◈ EXECUTIVE REPORT ◈[/]",
                                 border_style="blue", box=rbox.ROUNDED))
         # --- Smart deduplication stats ---
@@ -9801,7 +9799,7 @@ class WebsiteRecon:
                 parts.append(sec("Discovered Parameters",
                                  tbl(["Parameter", "Seen on", "Reflected"],
                                      [[_e(p['name']), p['seen_on'],
-                                       f"<span class='chip yellow'>YES ⚠</span>" if p.get('reflected') else "no"]
+                                       "<span class='chip yellow'>YES ⚠</span>" if p.get('reflected') else "no"]
                                       for p in cpar[:80]]), "#a78bfa"))
             cforms = cr.get('forms', [])
             if cforms:
@@ -10161,7 +10159,7 @@ class WebsiteRecon:
         # Unified API pool
         pool = d.get('api_pool', [])
         if pool:
-            seen, src_map = set(), {}
+            src_map = {}
             for e in pool:
                 p = str(e.get('path', ''))
                 if p:
@@ -10267,12 +10265,6 @@ class WebsiteRecon:
 </body>
 </html>"""
         return html_doc
-
-    def export_html(self, path):
-        """Generate a standalone dark-themed HTML report (no external assets)."""
-        with open(path, 'w', encoding='utf-8') as fh:
-            fh.write(self._render_html(self.export_dict()))
-        return path
 
     @staticmethod
     def render_html_from_dict(d, path):

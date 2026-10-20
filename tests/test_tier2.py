@@ -4,7 +4,6 @@ These exercise the pure/heuristic logic without any real network traffic:
 ATT&CK mapping, CVE offline intel, the takeover fingerprint table and the
 change-monitor asset/diff helpers.
 """
-import pytest
 
 
 # ---------------------------------------------------------------- ATT&CK (46)

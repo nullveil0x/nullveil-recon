@@ -687,7 +687,23 @@ ensuring every target you scan is authorized. See [SECURITY.md](SECURITY.md) and
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 34 tests: registry, scoring, Tier-2 intel, report, integration
+python -m pytest tests/ -q          # 52 tests: registry, scoring, helpers, Tier-2 intel, report, integration
+```
+
+**Lint** (bug classes only — undefined names, unused imports/vars, redefinitions):
+
+```bash
+pip install ruff
+ruff check nullveil_recon.py tests/ --select F,E9
+```
+
+**Coverage** (line coverage is concentrated on pure logic — normalisers, scoring,
+dedupe, registry, report schema — while the network modules are validated
+behaviourally via crash/error sweeps and integration tests):
+
+```bash
+pip install coverage
+coverage run --include="nullveil_recon.py" -m pytest tests/ -q && coverage report
 ```
 
 **Install as a package** (console entry point `nullveil-recon`):
@@ -704,8 +720,9 @@ docker build -t nullveil-recon .
 docker run --rm nullveil-recon https://example.com -a all
 ```
 
-**CI** runs compile + smoke + the full test suite on Python 3.9–3.12 and builds
-the Docker image — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+**CI** runs compile + smoke + the full test suite (Python 3.9–3.13), a ruff
+bug-class lint, a coverage report, and builds the Docker image — see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 **Commercial use / consulting:** [docs/CONSULTING.md](docs/CONSULTING.md) ·
 **pricing:** [docs/PRICING.md](docs/PRICING.md) ·

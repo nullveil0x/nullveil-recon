@@ -13,6 +13,9 @@ build/
 dist/
 *.egg-info/
 .pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Scan output / evidence — never commit target screenshots or reports
 nullveil_shots/

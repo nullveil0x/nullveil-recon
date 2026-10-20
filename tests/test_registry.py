@@ -25,10 +25,11 @@ def test_module_by_num_matches_registry(nv):
 def test_every_module_method_exists(nv):
     """Each registry number maps to a real coroutine on WebsiteRecon."""
     import inspect
-    names = {n for n, _ in inspect.getmembers(nv.WebsiteRecon, inspect.iscoroutinefunction)}
+    n_coros = len([1 for n, _ in inspect.getmembers(nv.WebsiteRecon, inspect.iscoroutinefunction)])
     # registry name -> method is resolved elsewhere; just ensure the module
     # exposes the documented count and no method is missing for the entries
     # the tool advertises by number.
+    assert n_coros >= len(nv.ALL_MODULE_NUMS) - 5
     assert len(nv.ALL_MODULE_NUMS) >= 40
 
 
