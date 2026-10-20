@@ -1,6 +1,6 @@
 # 🥷 NULLVEIL RECON
 
-> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.7.0 · **License:** MIT (dual-licensed — see [Commercial](LICENSE-COMMERCIAL.md))
+> **Owner:** NULLVEIL · **Engine:** DeepHat · **Version:** 3.8.0 · **License:** MIT (dual-licensed — see [Commercial](LICENSE-COMMERCIAL.md))
 
 [![CI](https://github.com/nullveil0x/nullveil-recon/actions/workflows/ci.yml/badge.svg)](https://github.com/nullveil0x/nullveil-recon/actions/workflows/ci.yml)
 ![tests](https://img.shields.io/badge/tests-34%20passing-brightgreen)
@@ -21,7 +21,7 @@ A fast, colorful, modular **website & domain reconnaissance** tool built in Pyth
 ║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝       ╚═══╝  ╚══════╝╚═╝╚═╝            ║
 ║                   R E C O N N A I S S A N C E   S U I T E                   ║
 ║                                                                              ║
-║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.7.0   Status: OPERATIONAL   ║
+║   Owner: NULLVEIL   Engine: DeepHat   Version: 3.8.0   Status: OPERATIONAL   ║
 ║                 Licensed use only — authorized targets only                 ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
@@ -321,6 +321,15 @@ python3 nullveil_recon.py example.com -a all --attack-layer layer.json   # ATT&C
 python3 nullveil_recon.py example.com --watch            # loop until Ctrl+C, alert on drift
 python3 nullveil_recon.py example.com --watch 24 --interval 3600         # hourly, 24 runs (CI gate)
 
+# v3.8.0: plugin rule engine — extend the built-in CVE + misconfig knowledge
+python3 nullveil_recon.py example.com -a cve --rules rules/            # load a directory of YAML/JSON rules
+python3 nullveil_recon.py example.com -a cve --rules my-cves.json      # or a single file
+# see rules/example.yaml + rules/example.json for the rule schema
+
+# v3.8.0: resilient scanning — transparent retry/backoff on 429/503 + connection errors
+python3 nullveil_recon.py example.com --retries 5                      # more retries (default 2)
+python3 nullveil_recon.py example.com --no-retry                       # disable the retry layer
+
 # v3.2.0: client-ready PDF report
 python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
 
@@ -468,7 +477,7 @@ python3 nullveil_recon.py example.com -o report.json
 {
   "tool": "NULLVEIL Recon",
   "owner": "NULLVEIL",
-  "version": "3.7.0",
+  "version": "3.8.0",
   "summary": { "dns_records": 3, "api_endpoints": 16, "remediation_patches": 9, "poc_verifications": 4, "dedupe_removed": 6, "...": "..." },
   "dns": [...],
   "subdomains": [...],
@@ -531,6 +540,16 @@ A few v3 features are **deliberately shaped** so the tool stays defensive & repo
 | Multi-tenant correlation | Correlates **domains you provide/own** (`--correlate`) or auto-derived from your cert SANs |
 
 Compliance output is **evidence-based partial mapping**, never a certification claim.
+
+### v3.8.0 notes (plugin rule engine + resilient scanning)
+
+Two power-user features that make NULLVEIL **extensible** and **robust under real-world throttling**:
+
+- **Plugin Rule Engine** (`--rules PATH` — file or directory, repeatable) loads external **YAML or JSON** rule files that extend the built-in knowledge without editing the source. Two rule kinds:
+  - **CVE / version rules** — `product`, `mode` (`lt|le|eq|ge|gt`), `version` (boundary, list or string), optional `major`, `id`, `severity`, `title`. Merged with the built-in `CVE_RULES` and matched by the version-fingerprint engine in module 15.
+  - **Misconfiguration probes** — `path`, optional `match` regex, `severity`, `id`, `title`. Merged with the built-in probes; **user rules always run in full**, even on a quick (non-`--deep`) scan.
+  - Every external rule becomes a real finding (JSON/HTML/PDF/dashboard/notifications), and the loaded rule inventory is recorded in the report under `ruleset` (`files`, `cve_rules`, `misconfig_rules`, `errors`). See [`rules/example.yaml`](rules/example.yaml) and [`rules/example.json`](rules/example.json) for the schema. YAML needs `PyYAML`; **JSON works with the standard library alone**.
+- **Transparent Retry / Backoff Layer** — the HTTP transport now retries transient failures (**429 / 502 / 503 / 504** and connection errors) with **exponential backoff + jitter**, honouring a server's `Retry-After` header. It wraps the transport, so **every** request — discovery, audit, fuzzing, subprocess-driven — benefits without a single call-site change, keeping scans **polite** under rate-limiting instead of silently dropping data. Tune with `--retries N` (default 2) or disable with `--no-retry`; the scan-wide retry count is exported as `retries`.
 
 ### v3.7.0 notes (Tier-1 advanced discovery)
 
@@ -687,7 +706,7 @@ ensuring every target you scan is authorized. See [SECURITY.md](SECURITY.md) and
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 52 tests: registry, scoring, helpers, Tier-2 intel, report, integration
+python -m pytest tests/ -q          # 65 tests: registry, scoring, helpers, rules, Tier-2 intel, report, integration
 ```
 
 **Lint** (bug classes only — undefined names, unused imports/vars, redefinitions):

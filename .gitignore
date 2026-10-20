@@ -21,3 +21,7 @@ htmlcov/
 nullveil_shots/
 nullveil-exec-*.html
 nullveil-exec-*.pdf
+
+# ...but example plugin rule files ARE source (JSON rules, despite *.json above)
+!rules/*.json
+!rules/**/*.json

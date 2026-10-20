@@ -3,7 +3,7 @@
 NULLVEIL Recon - Website & Domain Reconnaissance Tool
 Owner/Author: NULLVEIL
 Engine: DeepHat
-Version: 3.7.0
+Version: 3.8.0
 
 Features (48 attack modules):
   Recon & discovery
@@ -52,6 +52,12 @@ Features (48 attack modules):
   - Burp Suite / Caido   (traffic bridge)    -> --proxy routing + --har import
   - interactsh-client    (OOB)               -> out-of-band SSRF callbacks
 
+  Extensibility & resilience (v3.8.0)
+  - Plugin rule engine: external YAML/JSON rule sets (--rules) extend the
+    built-in CVE + misconfiguration knowledge without editing the source
+  - Transparent retry layer: automatic exponential backoff on 429/502/503/504
+    and connection errors, honouring Retry-After (--retries / --no-retry)
+
   Output
   - JSON report, standalone HTML report, client-ready PDF, evidence/repro pack
   - Executive report, local web dashboard, scan history + resume (Ctrl+C-safe)
@@ -80,6 +86,7 @@ import math
 import tempfile
 import hashlib
 import statistics
+import random
 
 # --- Friendly error if dependencies are missing ---
 try:
@@ -102,7 +109,7 @@ except ImportError as e:
     )
     sys.exit(1)
 
-__version__ = "3.7.0"
+__version__ = "3.8.0"
 
 # --- Global Configuration ---
 COMMON_SUBDOMAINS = [
@@ -494,6 +501,228 @@ def module_entry(num):
 ALL_MODULE_NUMS = sorted(MODULE_BY_NUM)
 
 
+# ============================================================ plugin rule engine
+class RuleSet:
+    """External rule set loaded from YAML/JSON — extends the built-in CVE and
+    misconfiguration knowledge without touching the source.
+
+    A rule file is either a single object or a list. Supported shapes::
+
+        # rules/cve.yaml
+        cve:
+          - product: nginx
+            major: null            # optional int, or null for "any major"
+            mode: lt               # lt | le | eq | ge | gt
+            version: [1, 20, 1]    # comparison boundary
+            id: CVE-2021-23017
+            severity: HIGH
+            title: Resolver off-by-one DNS poisoning
+
+        # rules/misconfig.yaml
+        misconfig:
+          - path: /.git/config
+            match: "(?i)\\[core\\]"   # optional regex, null = any 2xx/403
+            severity: HIGH
+            id: Exposed .git config
+            title: Git config public
+
+    YAML needs ``PyYAML`` (optional); JSON always works with the stdlib.
+    """
+
+    def __init__(self):
+        self.cve = []          # (product, major, mode, boundary_tuple, id, sev, title)
+        self.misconfig = []    # (path, regex_or_None, sev, id, title)
+        self.sources = []      # file paths that were loaded
+        self.errors = []       # human-readable load problems
+
+    # ---------------------------------------------------------- loading
+    def load_paths(self, paths):
+        """Load every rule file under each path (file or directory)."""
+        import glob as _glob
+        files = []
+        for p in (paths or []):
+            if not p:
+                continue
+            p = os.path.expanduser(str(p))
+            if os.path.isdir(p):
+                for ext in ("yml", "yaml", "json"):
+                    files += sorted(_glob.glob(os.path.join(p, "**", f"*.{ext}"), recursive=True))
+            elif os.path.isfile(p):
+                files.append(p)
+            else:
+                self.errors.append(f"rules: path not found: {p}")
+        for f in files:
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    raw = fh.read()
+                data = self._parse(raw, f)
+                if data is None:
+                    continue
+                n_cve, n_mis = self._ingest(data, f)
+                if n_cve or n_mis:
+                    self.sources.append(f)
+            except Exception as e:
+                self.errors.append(f"rules: {f}: {type(e).__name__} — {e}")
+        return self
+
+    @staticmethod
+    def _parse(raw, fname):
+        text = raw.lstrip()
+        if fname.lower().endswith(".json") or text[:1] in "[{":
+            import json as _json
+            return _json.loads(raw)
+        try:
+            import yaml  # optional dependency
+        except ImportError:
+            raise RuntimeError(
+                "PyYAML not installed — use .json rule files or: pip install pyyaml")
+        return yaml.safe_load(raw)
+
+    def _ingest(self, data, fname):
+        n_cve = n_mis = 0
+        if isinstance(data, list):
+            data = {"cve": data}
+        if not isinstance(data, dict):
+            return 0, 0
+        for item in (data.get("cve") or []):
+            rec = self._cve_rule(item)
+            if rec:
+                self.cve.append(rec)
+                n_cve += 1
+            else:
+                self.errors.append(f"rules: {fname}: skipped malformed cve rule: {item!r}")
+        for item in (data.get("misconfig") or data.get("probe") or []):
+            rec = self._mis_rule(item)
+            if rec:
+                self.misconfig.append(rec)
+                n_mis += 1
+            else:
+                self.errors.append(f"rules: {fname}: skipped malformed misconfig rule: {item!r}")
+        return n_cve, n_mis
+
+    @staticmethod
+    def _ver_tuple(v):
+        if isinstance(v, (list, tuple)):
+            parts = [re.sub(r"\D", "", str(x)) for x in v]
+        else:
+            parts = re.split(r"[._-]", str(v))
+        out = []
+        for p in parts:
+            if p == "":
+                continue
+            if p.isdigit():
+                out.append(int(p))
+            else:
+                break
+        return tuple(out)
+
+    @classmethod
+    def _cve_rule(cls, item):
+        if not isinstance(item, dict):
+            return None
+        prod = str(item.get("product") or "").strip().lower()
+        boundary = cls._ver_tuple(item.get("version", item.get("boundary")))
+        mode = str(item.get("mode") or "lt").strip().lower()
+        cid = str(item.get("id") or item.get("cve") or "").strip()
+        title = str(item.get("title") or "").strip()
+        sev = str(item.get("severity") or "MEDIUM").strip().upper()
+        if not (prod and boundary and cid):
+            return None
+        if mode not in ("lt", "le", "eq", "ge", "gt"):
+            mode = "lt"
+        if sev not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+            sev = "MEDIUM"
+        major = item.get("major", None)
+        try:
+            major = int(major) if major is not None else None
+        except Exception:
+            major = None
+        return (prod, major, mode, tuple(boundary), cid, sev, title or cid)
+
+    @staticmethod
+    def _mis_rule(item):
+        if not isinstance(item, dict):
+            return None
+        path = str(item.get("path") or "").strip()
+        if not path:
+            return None
+        rx = item.get("match", item.get("regex"))
+        rx = str(rx) if rx else None
+        if rx:
+            try:
+                re.compile(rx)          # fail fast on bad patterns
+            except re.error:
+                rx = None
+        sev = str(item.get("severity") or "MEDIUM").strip().upper()
+        if sev not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+            sev = "MEDIUM"
+        pid = str(item.get("id") or path).strip()
+        title = str(item.get("title") or pid).strip()
+        return (path, rx, sev, pid, title)
+
+    def summary(self):
+        return {"files": list(self.sources), "cve_rules": len(self.cve),
+                "misconfig_rules": len(self.misconfig), "errors": list(self.errors)}
+
+
+# ============================================================ retrying transport
+class RetryingTransport(httpx.AsyncBaseTransport):
+    """Transparently retry transient failures (429/503/502/504 + connection
+    errors) with exponential backoff + jitter, honouring ``Retry-After``.
+
+    Wrapping the transport means *every* request the scan makes — discovery,
+    audit, fuzzing — gets resilience without changing a single call site, which
+    keeps the tool polite under rate-limiting instead of silently dropping data.
+    """
+
+    _RETRY_STATUS = {429, 502, 503, 504}
+
+    def __init__(self, transport, max_retries=2, base=0.5, respect_retry_after=True):
+        self._transport = transport
+        self.max_retries = max(0, int(max_retries))
+        self.base = float(base)
+        self.respect_retry_after = respect_retry_after
+        self.retries = 0          # total retried requests (scan-level metric)
+
+    async def handle_async_request(self, request):
+        last_exc = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = await self._transport.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError,
+                    httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                last_exc = e
+                if attempt >= self.max_retries:
+                    raise
+                await asyncio.sleep(self._delay(attempt, None))
+                self.retries += 1
+                continue
+            if resp.status_code in self._RETRY_STATUS and attempt < self.max_retries:
+                delay = self._delay(attempt, resp)
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+                await asyncio.sleep(delay)
+                self.retries += 1
+                continue
+            return resp
+        if last_exc:
+            raise last_exc
+        raise httpx.TransportError("retry budget exhausted")
+
+    def _delay(self, attempt, resp):
+        if self.respect_retry_after and resp is not None:
+            ra = resp.headers.get("retry-after")
+            if ra:
+                try:
+                    return min(10.0, max(0.0, float(ra)))
+                except Exception:
+                    pass
+        delay = self.base * (2 ** attempt)
+        return min(8.0, delay) + random.uniform(0, delay / 2 or 0.1)
+
+
 def parse_attack_list(s: str):
     s = s.lower().strip()
     if s in ("all", "full", "*"):
@@ -742,12 +971,18 @@ class WebsiteRecon:
         self.scalar_results = {}
         self.scan_duration = 0.0
         self.attack_set = list(ALL_MODULE_NUMS)  # all modules
+        # --- resilience: retry/backoff on transient throttling (429/503) ---
+        # set BEFORE _build_transport so the retrying transport is used on the
+        # very first client this constructor creates.
+        self.max_retries = 2
+        self.backoff_base = 0.5
         self._build_transport(concurrency)
         # --- authenticated / OOB scanning state (CLI flags wired in main) ---
         self.auth_cfg = {}     # --auth-* / --login-* / --role flags
         self.oob_cfg = {}      # --oob / --oob-server / --oob-wait flags
         self.roles = {}        # multi-role profiles (parsed during auth setup)
         self._auth_cmd = []    # "Name: value" strings for subprocess tools
+        self.ruleset = None    # external --rules plugin set (wired in main)
 
     def _build_transport(self, concurrency=None):
         """Create the shared httpx client + concurrency semaphore.
@@ -757,19 +992,49 @@ class WebsiteRecon:
         loop (a client/semaphore created under a previous ``asyncio.run()`` is
         dead once that loop closes)."""
         concurrency = concurrency or self.concurrency
-        self.client = httpx.AsyncClient(
+        # Build the low-level transport ourselves so it can be wrapped with the
+        # retry/backoff layer (429/503 + connection errors). http2/proxy/verify
+        # all keep working because the httpcore transport still handles them.
+        limits = httpx.Limits(max_connections=max(concurrency, 100),
+                              max_keepalive_connections=40,
+                              keepalive_expiry=30.0)
+        self._retry_transport = None
+        try:
+            base_transport = httpx.AsyncHTTPTransport(
+                verify=False,               # recon: expired/self-signed certs still interesting
+                http2=True,
+                limits=limits,
+                proxy=self.proxy or None,   # Burp/Caido intercepting proxy (--proxy)
+                retries=0,                  # we handle retries ourselves
+            )
+            if getattr(self, "max_retries", 0):
+                self._retry_transport = RetryingTransport(
+                    base_transport,
+                    max_retries=self.max_retries,
+                    base=getattr(self, "backoff_base", 0.5))
+                transport = self._retry_transport
+            else:
+                transport = base_transport
+        except Exception:
+            transport = None
+            limits = httpx.Limits(max_connections=max(concurrency, 100),
+                                  max_keepalive_connections=40,
+                                  keepalive_expiry=30.0)
+        kw = dict(
             follow_redirects=True,
             timeout=self.timeout,
-            verify=False,  # recon: expired/self-signed certs still interesting
-            http2=True,
-            proxy=self.proxy or None,   # Burp/Caido intercepting proxy (--proxy)
-            # tuned pooling: fewer TCP/TLS handshakes under high concurrency
-            limits=httpx.Limits(max_connections=max(concurrency, 100),
-                                max_keepalive_connections=40,
-                                keepalive_expiry=30.0),
+            verify=False,
+            limits=limits,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                    f"(KHTML, like Gecko) Chrome/124.0 Safari/537.36 NULLVEIL-Recon/{__version__}"}
         )
+        if transport is not None:
+            kw["transport"] = transport
+        else:
+            # fallback: plain client (no custom transport)
+            kw["http2"] = True
+            kw["proxy"] = self.proxy or None
+        self.client = httpx.AsyncClient(**kw)
         self.sem = None
         try:
             self.sem = asyncio.Semaphore(concurrency)
@@ -2425,6 +2690,22 @@ class WebsiteRecon:
         ("/h2-console",       r"(?i)H2 Console|H2 Database", "HIGH",  "H2 Console",              "H2 database console exposed (RCE if reachable)"),
     ]
 
+    def _active_cve_rules(self):
+        """Built-in CVE rules + any external rules loaded via --rules."""
+        rules = list(self.CVE_RULES)
+        rs = getattr(self, "ruleset", None)
+        if rs is not None:
+            rules += list(rs.cve)
+        return rules
+
+    def _active_misconfig_probes(self):
+        """Built-in misconfig probes + any external probes loaded via --rules."""
+        probes = list(self.MISCONFIG_PROBES)
+        rs = getattr(self, "ruleset", None)
+        if rs is not None:
+            probes += list(rs.misconfig)
+        return probes
+
     async def cve_scan(self):
         """Version fingerprinting -> CVE correlation + active misconfiguration probes."""
         findings = []          # (severity, id, title, evidence)
@@ -2460,12 +2741,14 @@ class WebsiteRecon:
             if not parts:
                 return
             versions.append((product, ver_str, source))
-            for prod, rule_major, mode, boundary, cve, sev, title in self.CVE_RULES:
+            for prod, rule_major, mode, boundary, cve, sev, title in self._active_cve_rules():
                 if prod != product:
                     continue
                 if rule_major is not None and parts[0] != rule_major:
                     continue
-                hit = (_cmp(parts, boundary) == 0) if mode == 'eq' else (_cmp(parts, boundary) < 0)
+                c = _cmp(parts, boundary)
+                hit = {"eq": c == 0, "lt": c < 0, "le": c <= 0,
+                       "gt": c > 0, "ge": c >= 0}.get(mode, c < 0)
                 if hit:
                     findings.append((sev, cve, title,
                                      f"detected {product} {ver_str} ({source})"))
@@ -2512,9 +2795,15 @@ class WebsiteRecon:
         # (filled by tls/ssl modules if run — best effort)
 
         # ---------- 2) active misconfig probes ----------
-        probes = [(p, rx, sev, pid, title) for p, rx, sev, pid, title in self.MISCONFIG_PROBES if p and pid]
+        all_probes = [(p, rx, sev, pid, title)
+                      for p, rx, sev, pid, title in self._active_misconfig_probes() if p and pid]
         if not self.deep:
-            probes = probes[:7]
+            # quick scans probe only the first few *built-in* checks, but every
+            # user-supplied external rule is always kept (never silently dropped).
+            builtins_n = len([1 for p, rx, sev, pid, title in self.MISCONFIG_PROBES if p and pid])
+            probes = all_probes[:min(7, builtins_n)] + all_probes[builtins_n:]
+        else:
+            probes = all_probes
 
         async def probe(path, expect, sev, pid, title):
             url = urljoin(self.base_url + "/", path.lstrip('/'))
@@ -9615,6 +9904,9 @@ class WebsiteRecon:
             "cve_intel": self.results.get('cve_intel', {}),
             "takeover_v3": self.results.get('takeover_v3', {}),
             "watch": self.results.get('watch', {}),
+            "ruleset": (self.ruleset.summary() if getattr(self, "ruleset", None)
+                        else {"files": [], "cve_rules": 0, "misconfig_rules": 0, "errors": []}),
+            "retries": (getattr(getattr(self, "_retry_transport", None), "retries", 0) or 0),
             "errors": self.results['errors'],
         }
         return out
@@ -10920,6 +11212,14 @@ def main():
                         help="Custom nuclei template path/dir (used by -a nuclei)")
     parser.add_argument("--ffuf-wordlist", metavar="FILE", default=None,
                         help="Custom path wordlist for ffuf (used by -a ffuf; default: built-in API list)")
+    parser.add_argument("--rules", action="append", metavar="PATH", default=None,
+                        help="Load external plugin rules (YAML/JSON file or directory, repeatable) that extend the "
+                             "built-in CVE + misconfig rule sets — e.g. --rules rules/. YAML needs PyYAML; JSON always works")
+    parser.add_argument("--no-retry", action="store_true",
+                        help="Disable the transparent retry/backoff layer (default: retry 429/503 + connection "
+                             "errors twice with exponential backoff)")
+    parser.add_argument("--retries", type=int, metavar="N", default=2,
+                        help="Max transparent retries per request for transient failures (default: 2)")
     authg = parser.add_argument_group("authenticated scanning (module 31: auth)")
     authg.add_argument("--auth-header", action="append", metavar="'Name: Value'",
                        help="Header injected into EVERY scan request (repeatable), e.g. --auth-header 'X-Api-Key: abc'")
@@ -11119,6 +11419,19 @@ def main():
         pass
     recon.nuclei_templates = args.nuclei_templates
     recon.ffuf_wordlist = args.ffuf_wordlist
+    # ---- plugin rule engine (--rules): extend CVE + misconfig knowledge ----
+    recon.ruleset = RuleSet()
+    if args.rules:
+        recon.ruleset.load_paths(args.rules)
+        s = recon.ruleset.summary()
+        if s["cve_rules"] or s["misconfig_rules"]:
+            console.print(f"[bold green]✓ Rules loaded[/] — "
+                          f"{s['cve_rules']} CVE · {s['misconfig_rules']} misconfig "
+                          f"from {len(s['files'])} file(s)")
+        for err in s["errors"]:
+            console.print(f"[yellow]! {err}[/]")
+    # ---- resilience tuning (retry/backoff layer) ----
+    recon.max_retries = 0 if args.no_retry else max(0, int(args.retries))
     recon.auth_cfg = {
         "headers": args.auth_header or [],
         "cookies": args.auth_cookie or [],

@@ -1,0 +1,21 @@
+{
+  "cve": [
+    {
+      "product": "nginx",
+      "mode": "lt",
+      "version": [1, 21, 0],
+      "id": "CVE-2021-23017",
+      "severity": "HIGH",
+      "title": "Resolver off-by-one (JSON rule example)"
+    }
+  ],
+  "misconfig": [
+    {
+      "path": "/healthz",
+      "match": "(?i)(ok|healthy|status)",
+      "severity": "INFO",
+      "id": "K8s health endpoint",
+      "title": "Kubernetes-style health endpoint exposed"
+    }
+  ]
+}

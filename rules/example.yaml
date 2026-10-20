@@ -1,0 +1,65 @@
+# NULLVEIL external rule set — example
+#
+# Load with:  python3 nullveil_recon.py TARGET --rules rules/
+#
+# Rule files extend the built-in CVE + misconfiguration knowledge without
+# touching the source. YAML needs PyYAML (`pip install pyyaml`); JSON works
+# with the standard library alone. A file may be a single object or a list.
+#
+# ── CVE / version rules ────────────────────────────────────────────────────
+#   product   : normalised product name (must match what the tool fingerprints,
+#               e.g. apache, nginx, tomcat, wordpress, jquery, php …)
+#   major     : optional int — only apply when the detected major matches
+#               (null / omitted = any major)
+#   mode      : lt | le | eq | ge | gt   (comparison against `version`)
+#   version   : the boundary version, as a list [2, 4, 49] or a string "2.4.49"
+#   id        : CVE id
+#   severity  : CRITICAL | HIGH | MEDIUM | LOW | INFO
+#   title     : short human description
+cve:
+  - product: openssh
+    mode: lt
+    version: [8, 5]
+    id: CVE-2016-10708
+    severity: MEDIUM
+    title: NULL dereference in sshd (OpenSSH < 8.5)
+
+  - product: php
+    mode: lt
+    version: "7.4.30"
+    id: CVE-2022-31626
+    severity: HIGH
+    title: mysqlnd buffer overflow via malicious server (PHP < 7.4.30)
+
+  - product: express
+    mode: lt
+    version: [4, 17, 3]
+    id: CVE-2024-29041
+    severity: MEDIUM
+    title: Open redirect in express.js (< 4.19.2 fixed line)
+
+# ── Active misconfiguration probes ─────────────────────────────────────────
+#   path      : URL path requested (GET, read-only)
+#   match     : optional regex the response body must match
+#               (null / omitted = a 200/403 response is enough)
+#   severity  : CRITICAL | HIGH | MEDIUM | LOW | INFO
+#   id        : short stable id
+#   title     : human description
+misconfig:
+  - path: /.well-known/security.txt
+    match: "(?i)Contact:"
+    severity: INFO
+    id: security.txt
+    title: security.txt present (good — responsible disclosure channel)
+
+  - path: /config.json
+    match: "(?i)(apiKey|api_key|secret|password)\\s*[\":=]"
+    severity: HIGH
+    id: Exposed config.json
+    title: Front-end config.json leaks credentials/keys
+
+  - path: /package.json
+    match: "\"(dependencies|devDependencies)\""
+    severity: LOW
+    id: Exposed package.json
+    title: package.json public (dependency/version disclosure)
