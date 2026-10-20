@@ -783,6 +783,118 @@ class EvasionTransport(httpx.AsyncBaseTransport):
         return await self._transport.handle_async_request(request)
 
 
+# ============================================================ plugin system
+class PluginContext:
+    """Read-only view of a finished scan handed to a plugin's ``run()``.
+
+    Plugins are ordinary Python modules loaded from a path (``--plugin``). They
+    receive this context, may read any result the scan produced, and return a
+    list of findings ``(severity, check, detail)`` — or nothing.
+
+    The context is deliberately **read-only-ish**: a plugin *can* reach the
+    live ``recon`` object, but the documented surface is the helpers below.
+    """
+
+    def __init__(self, recon):
+        self.recon = recon
+        self.results = recon.results
+        self.report = None       # filled by the engine after run()
+        self.target = getattr(recon, "domain", "")
+        self.base_url = getattr(recon, "base_url", "")
+        self.version = __version__
+
+    # convenience accessors ------------------------------------------------
+    def get(self, key, default=None):
+        return self.results.get(key, default)
+
+    def summary(self):
+        return (self.report or {}).get("summary", {})
+
+    def findings(self):
+        """The flat, normalised finding list every reporting module sees."""
+        try:
+            return self.recon._collect_findings()
+        except Exception:
+            return []
+
+    def log(self, msg):
+        console.print(f"[dim cyan]plugin:[/] {msg}")
+
+
+class PluginManager:
+    """Load and run external Python plugin modules (``--plugin``).
+
+    A plugin is a ``.py`` file that defines ``def run(ctx)`` (required) and
+    optionally ``NAME`` / ``VERSION`` module attributes. ``run`` may return an
+    iterable of ``(severity, check, detail)`` tuples — each becomes a normal
+    finding that flows into CVSS, ATT&CK, remediation, the report and
+    notifications.
+
+    Safety: loading a plugin executes arbitrary local Python. It is an
+    **operator-supplied** file, exactly like a build script — only load plugins
+    you trust.
+    """
+
+    def __init__(self):
+        self.plugins = []      # (name, module)
+        self.errors = []
+        self.produced = 0
+
+    def load_paths(self, paths):
+        import importlib.util
+        for p in (paths or []):
+            if not p:
+                continue
+            p = os.path.expanduser(str(p))
+            if not os.path.isfile(p):
+                self.errors.append(f"plugin: not found: {p}")
+                continue
+            name = os.path.splitext(os.path.basename(p))[0]
+            try:
+                spec = importlib.util.spec_from_file_location(f"nv_plugin_{name}", p)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if not hasattr(mod, "run") or not callable(mod.run):
+                    self.errors.append(f"plugin {name}: no callable run(ctx)")
+                    continue
+                self.plugins.append((name, mod))
+            except Exception as e:
+                self.errors.append(f"plugin {name}: load failed: {type(e).__name__}: {e}")
+        return self
+
+    def summary(self):
+        return {"files": [n for n, _ in self.plugins], "loaded": len(self.plugins),
+                "findings": self.produced, "errors": list(self.errors)}
+
+    def run_all(self, ctx):
+        """Run every plugin, collecting findings into the scan results."""
+        for name, mod in self.plugins:
+            label = getattr(mod, "NAME", name)
+            try:
+                out = mod.run(ctx)
+                n = 0
+                for item in (out or []):
+                    if isinstance(item, (list, tuple)) and len(item) >= 3:
+                        ctx.results['plugin_findings'].append(
+                            (str(item[0]).upper(), str(item[1]), str(item[2])))
+                        n += 1
+                    elif isinstance(item, str):
+                        ctx.results['plugin_findings'].append(("INFO", label, item))
+                        n += 1
+                self.produced += n
+                ctx.results['plugin_runs'].append({"plugin": label, "findings": n, "ok": True})
+                if n:
+                    ctx.log(f"{label}: {n} finding(s)")
+            except Exception as e:
+                self.errors.append(f"plugin {name}: run failed: {type(e).__name__}: {e}")
+                ctx.results['plugin_runs'].append({"plugin": label, "findings": 0,
+                                                   "ok": False, "error": str(e)})
+        return self
+
+
+# ============================================================ plugin system end
+
+
 # ============================================================ retrying transport
 class RetryingTransport(httpx.AsyncBaseTransport):
     """Transparently retry transient failures (429/503/502/504 + connection
@@ -1110,6 +1222,7 @@ class WebsiteRecon:
         self.roles = {}        # multi-role profiles (parsed during auth setup)
         self._auth_cmd = []    # "Name: value" strings for subprocess tools
         self.ruleset = None    # external --rules plugin set (wired in main)
+        self.plugins = None    # external --plugin Python modules (wired in main)
 
     def _build_transport(self, concurrency=None):
         """Create the shared httpx client + concurrency semaphore.
@@ -1413,6 +1526,15 @@ class WebsiteRecon:
                 await self._verify_findings_pass()
             except Exception as e:
                 self.results['errors'].append(f"verify: {e!r}")
+
+        # --- external Python plugins (--plugin): run over the finished results ---
+        if getattr(self, "plugins", None) is not None:
+            try:
+                ctx = PluginContext(self)
+                ctx.report = self.export_dict()
+                self.plugins.run_all(ctx)
+            except Exception as e:
+                self.results['errors'].append(f"plugins: {e!r}")
 
         try:
             await self.client.aclose()
@@ -7255,6 +7377,7 @@ class WebsiteRecon:
                          ("ext_findings", "ext"), ("tls_findings", "tls"),
                          ("admin_findings", "auth"), ("proxy_findings", "burp"),
                          ("vuln_verify_findings", "vulnverify"),
+                         ("plugin_findings", "plugin"),
                          ("diff_findings", "diff")):
             for t in (r.get(key) or []):
                 if isinstance(t, (list, tuple)) and len(t) >= 3:
@@ -10327,6 +10450,9 @@ class WebsiteRecon:
             "watch": self.results.get('watch', {}),
             "ruleset": (self.ruleset.summary() if getattr(self, "ruleset", None)
                         else {"files": [], "cve_rules": 0, "misconfig_rules": 0, "errors": []}),
+            "plugins": (self.plugins.summary() if getattr(self, "plugins", None)
+                        else {"files": [], "loaded": 0, "findings": 0, "errors": []}),
+            "plugin_runs": self.results.get('plugin_runs', []),
             "retries": (getattr(getattr(self, "_retry_transport", None), "retries", 0) or 0),
             "evasion": {
                 "level": getattr(self, "evade_level", "none") or "none",
@@ -11582,6 +11708,185 @@ def serve_dashboard(port=8899, open_browser=True, host="127.0.0.1"):
             pass
 
 
+# ---------------------------------------------------------- headless JSON API
+def serve_api(host="127.0.0.1", port=8900):
+    """Headless JSON scan API for CI/CD and automation (``--serve-api``).
+
+    Endpoints (localhost-only by default):
+
+    * ``GET  /health``            → liveness + version
+    * ``POST /scan``              → run a scan, return the full report JSON
+          body: {"target": "example.com", "modules": "all", "deep": false,
+                 "timeout": 10, "concurrency": 100, "verify": false,
+                 "evade": "none", "retries": 2}
+    * ``GET  /report?id=SCAN_ID`` → a saved history report
+
+    A single scan runs at a time (scans are network-heavy); concurrent POSTs
+    queue on a lock. Every response is JSON. This is a **scanning** API — bind
+    it to localhost or a trusted network only.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    _lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "NULLVEIL-API"
+
+        def log_message(self, *a):
+            pass
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            qs = parse_qs(u.query)
+            if u.path == "/health":
+                return self._json({"status": "ok", "tool": "NULLVEIL Recon",
+                                   "version": __version__})
+            if u.path == "/report":
+                sid = (qs.get("id") or [""])[0]
+                if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", sid or ""):
+                    return self._json({"error": "invalid id"}, 400)
+                p = os.path.join(WebsiteRecon.HISTORY_DIR, sid + ".json")
+                if not os.path.isfile(p):
+                    return self._json({"error": "scan not found"}, 404)
+                try:
+                    with open(p, encoding="utf-8") as fh:
+                        return self._json(json.load(fh).get("report", {}))
+                except Exception as ex:
+                    return self._json({"error": str(ex)}, 500)
+            if u.path in ("/", "/index.html"):
+                return self._json({"tool": "NULLVEIL Recon", "version": __version__,
+                                   "endpoints": ["GET /health", "POST /scan",
+                                                 "GET /report?id=…"]})
+            return self._json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            if u.path != "/scan":
+                return self._json({"error": "not found"}, 404)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(n) or b"{}")
+            except Exception as ex:
+                return self._json({"error": f"bad JSON: {ex}"}, 400)
+            target = str(payload.get("target") or "").strip()
+            if not target:
+                return self._json({"error": "target is required"}, 400)
+            if not _lock.acquire(timeout=1):
+                return self._json({"error": "a scan is already running; retry shortly"}, 429)
+            try:
+                report = _api_scan(payload, target)
+                return self._json(report)
+            except Exception as ex:
+                return self._json({"error": f"{type(ex).__name__}: {ex}"}, 500)
+            finally:
+                _lock.release()
+
+    try:
+        httpd = ThreadingHTTPServer((host, port), Handler)
+    except OSError as ex:
+        console.print(f"[red]Cannot start API on {host}:{port}[/] — {ex}")
+        return
+    url = f"http://{host}:{port}"
+    console.print(Panel(
+        f"[bold green]JSON scan API live →[/] [bold cyan]{url}[/]\n"
+        f"[dim]POST /scan  ·  GET /health  ·  GET /report?id=…[/]\n"
+        f"[dim]{host}-only · Ctrl+C to stop[/]",
+        title="[bold magenta]◈ NULLVEIL API ◈[/]", border_style="magenta"))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n[dim]API stopped.[/]")
+    finally:
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+
+
+def _api_scan(payload, target):
+    """Build a minimal args namespace and run exactly one scan for the API."""
+    ns = argparse.Namespace()
+    # defaults for every attribute _scan_target / WebsiteRecon touches
+    ns.target = target
+    ns.deep = bool(payload.get("deep", False))
+    ns.timeout = int(payload.get("timeout", 10))
+    ns.concurrency = int(payload.get("concurrency", 100))
+    ns.ports = payload.get("ports")
+    ns.wordlist = payload.get("wordlist")
+    ns.proxy = payload.get("proxy")
+    ns.output = None
+    ns.html = None
+    ns.pdf = None
+    ns.repro = None
+    ns.dashboard = None
+    ns.quiet = True
+    ns.har = payload.get("har") or []
+    ns.hibp_key = payload.get("hibp_key")
+    ns.correlate = payload.get("correlate")
+    ns.dot = None
+    ns.nuclei_templates = payload.get("nuclei_templates")
+    ns.ffuf_wordlist = None
+    ns.rules = payload.get("rules")
+    ns.no_retry = False
+    ns.retries = int(payload.get("retries", 2))
+    ns.evade = payload.get("evade", "none")
+    ns.evade_rotate_every = 1
+    ns.verify = bool(payload.get("verify", False))
+    ns.plugin = payload.get("plugin")
+    # auth — off by default in the API (avoid touching private data implicitly)
+    for a in ("auth_header", "auth_cookie", "role", "login_extra"):
+        setattr(ns, a, [])
+    ns.auth_token = None
+    ns.auth_api_key = None
+    ns.auth_api_key_header = "X-API-Key"
+    ns.login_url = None
+    ns.login_user = None
+    ns.login_pass = None
+    ns.login_user_field = "username"
+    ns.login_pass_field = "password"
+    ns.login_body = None
+    ns.login_form = False
+    ns.login_token_path = None
+    ns.oob = False
+    ns.oob_server = None
+    ns.oob_wait = 0
+    ns.no_history = False
+    ns.module_timeout = 180.0
+    ns.module_timeout_heavy = 300.0
+    ns.no_dedupe = False
+    ns.exec_report = None
+    ns.exec_pdf = None
+    ns.webhook_slack = ns.webhook_telegram = ns.webhook_discord = ns.webhook_teams = None
+    ns.attack_layer = None
+    ns.cve_live = bool(payload.get("cve_live", False))
+    ns.watch = None
+    ns.interval = 300
+    ns.resume = None
+
+    mod_spec = payload.get("modules", "all")
+    attack_indices = parse_attack_list(mod_spec) or list(ALL_MODULE_NUMS)
+    ports = None
+    if ns.ports:
+        try:
+            ports = sorted({int(p) for p in str(ns.ports).split(",") if p.strip()})
+        except ValueError:
+            ports = None
+    out = _scan_target(ns, attack_indices, ports, target, out_suffix="") or {}
+    return out.get("report") or out
+
+
 # ---------------------------------------------------------- batch targets
 def _expand_targets(spec_list):
     """Expand a list of target specs (domains/URLs/CIDRs) into a flat, ordered,
@@ -11721,6 +12026,15 @@ def main():
     advg.add_argument("--verify", action="store_true",
                       help="Deep-accuracy pass: re-verify each finding with a second, independent request and drop "
                            "anything that does not reproduce (reduces false positives; slower)")
+    advg.add_argument("--plugin", action="append", metavar="FILE.py", default=None,
+                      help="Load an external Python plugin (repeatable) that runs over the finished results. The "
+                           "file must define run(ctx) and may return (severity, check, detail) findings — they flow "
+                           "into CVSS/report/webhooks. Only load plugins you trust (arbitrary local code).")
+    advg.add_argument("--serve-api", nargs="?", const="8900", metavar="PORT", default=None,
+                      help="Serve a headless JSON scan API (default port 8900): POST /scan {target,modules,…} -> "
+                           "report JSON, GET /health, GET /report?id=…  — for CI/CD integration")
+    advg.add_argument("--api-host", metavar="HOST", default="127.0.0.1",
+                      help="Bind address for --serve-api (default: 127.0.0.1 — localhost only)")
     authg = parser.add_argument_group("authenticated scanning (module 31: auth)")
     authg.add_argument("--auth-header", action="append", metavar="'Name: Value'",
                        help="Header injected into EVERY scan request (repeatable), e.g. --auth-header 'X-Api-Key: abc'")
@@ -11871,8 +12185,11 @@ def main():
         if args.dashboard is not None:
             serve_dashboard(port=int(args.dashboard))
             return
+        if args.serve_api is not None:
+            serve_api(port=int(args.serve_api), host=args.api_host or "127.0.0.1")
+            return
         parser.print_help()
-        console.print("\n[red]Error:[/] target is required (unless using -l / --history / --dashboard / --pdf-from / --targets-file / --targets-list)")
+        console.print("\n[red]Error:[/] target is required (unless using -l / --history / --dashboard / --pdf-from / --targets-file / --targets-list / --serve-api)")
         sys.exit(1)
 
     # Attack selection: -m menu > -a list > default ALL
@@ -12003,6 +12320,15 @@ def _scan_target(args, attack_indices, ports, target, out_suffix=""):
         console.print(f"[bold green]✓ WAF evasion[/] — profile [cyan]{recon.evade_level}[/] "
                       f"(rotate every {recon.evade_rotate_every} req)")
     recon.deep_verify = bool(args.verify)
+    # ---- external Python plugins (--plugin) ----
+    if args.plugin:
+        recon.plugins = PluginManager().load_paths(args.plugin)
+        s = recon.plugins.summary()
+        if s["loaded"]:
+            console.print(f"[bold green]✓ Plugins loaded[/] — {s['loaded']}: "
+                          f"{', '.join(s['files'])}")
+        for err in s["errors"]:
+            console.print(f"[yellow]! {err}[/]")
     recon.auth_cfg = {
         "headers": args.auth_header or [],
         "cookies": args.auth_cookie or [],
@@ -12138,7 +12464,8 @@ def _scan_target(args, attack_indices, ports, target, out_suffix=""):
         serve_dashboard(port=int(args.dashboard))
 
     # summary for batch mode
-    return {"target": target, "ok": True, "score": _batch_score(report)}
+    return {"target": target, "ok": True, "score": _batch_score(report),
+            "report": report}
 
 
 def _batch_score(report):

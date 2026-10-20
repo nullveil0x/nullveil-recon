@@ -341,6 +341,9 @@ python3 nullveil_recon.py example.com --evade stealth --evade-rotate-every 3
 python3 nullveil_recon.py example.com -a paths --verify                  # second independent probe; non-reproducers removed
 # v3.9.0: read-only vulnerability verification (reachability proof, no payloads)
 python3 nullveil_recon.py example.com -a vulnverify                      # benign-marker XSS / SQL-error / traversal proof
+# v3.9.0: automation — external plugins + headless JSON API
+python3 nullveil_recon.py example.com -a all --plugin my_policy.py       # run external Python plugin(s) over the results
+python3 nullveil_recon.py --serve-api                                    # JSON scan API on :8900 (POST /scan, GET /health)
 
 # v3.2.0: client-ready PDF report
 python3 nullveil_recon.py example.com -a all -H report.html --pdf report.pdf
@@ -565,6 +568,8 @@ Three advanced-operator features — all still **read-only / defensive**:
   - **SQL-injection surface** — a marker plus a single quote is sent; a hit requires **both** the marker **and** a recognised database-error signature in the body (the marker prevents a pre-existing error page matching). No data is read.
   - **Path traversal** — traversal sequences are tried only against file-ish parameters, and a hit is confirmed against a **control request** that does not contain the sequence, matched to a known system-file signature. No file contents are extracted or stored.
   - Every hit becomes a standard finding (JSON/HTML/PDF/dashboard/CVSS/ATT&CK/remediation/webhooks). Results under `vuln_verify` (`tested`, `xss`, `sqli`, `traversal`). See [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+- **External Plugins** (`--plugin FILE.py`, repeatable) load plain Python modules that run **after** the scan and turn organisation-specific logic into first-class findings. A plugin defines `run(ctx)` and returns `(severity, check, detail)` tuples (or strings → `INFO`); the `ctx` object exposes the results, summary, target, a `findings()` helper and a `log()`. Plugin findings flow into CVSS/ATT&CK/remediation/report/webhooks like any other, and are inventoried under `plugins` + `plugin_runs`. A **crashing plugin never aborts the scan** (recorded, skipped). Only load plugins you trust. See [`docs/AUTOMATION.md`](docs/AUTOMATION.md) and [`examples/plugin_example.py`](examples/plugin_example.py).
+- **Headless JSON API** (`--serve-api [PORT]`, `--api-host`) turns NULLVEIL into a service for CI/CD: `POST /scan` (JSON body → full report JSON), `GET /health`, `GET /report?id=…`. One scan runs at a time (concurrent `POST /scan` → `429`), `id` is validated against path traversal, errors are always JSON, and it binds to **localhost by default**. Authentication is off by default in the API. See [`docs/AUTOMATION.md`](docs/AUTOMATION.md).
 
 ### v3.8.0 notes (plugin rule engine + resilient scanning)
 
@@ -704,6 +709,7 @@ All five export to JSON, render as CLI panels and dashboard sections, and feed `
 - [x] **Continuous Change Monitor** (`-a watch`, `--watch`, `--interval`) — baseline drift alerting & CI gate
 - [x] **Advanced operator pack** (`--targets-file`/`--targets-list`, `--evade`, `--verify`) — mass scanning, WAF evasion, deep-accuracy false-positive reduction
 - [x] **Read-Only Vulnerability Verification** (`-a vulnverify`) — benign-marker XSS/SQLi/traversal reachability proof (no payloads, no extraction)
+- [x] **Automation layer** (`--plugin`, `--serve-api`) — external Python plugins + headless JSON scan API for CI/CD
 
 Contributions welcome — open an issue or PR.
 
@@ -733,7 +739,7 @@ ensuring every target you scan is authorized. See [SECURITY.md](SECURITY.md) and
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 85 tests: registry, scoring, helpers, rules, advanced scanning, vuln-verify, Tier-2 intel, report, integration
+python -m pytest tests/ -q          # 96 tests: registry, scoring, helpers, rules, advanced scanning, vuln-verify, plugins/API, Tier-2 intel, report, integration
 ```
 
 **Lint** (bug classes only — undefined names, unused imports/vars, redefinitions):
@@ -774,6 +780,7 @@ bug-class lint, a coverage report, and builds the Docker image — see
 
 - [docs/ADVANCED.md](docs/ADVANCED.md) — mass scanning (`--targets-file`/`--targets-list` + CIDR), WAF evasion (`--evade`), deep accuracy (`--verify`).
 - [docs/VERIFICATION.md](docs/VERIFICATION.md) — module 50 read-only vulnerability verification: benign-marker XSS/SQLi/traversal reachability proof.
+- [docs/AUTOMATION.md](docs/AUTOMATION.md) — external plugins (`--plugin`) and the headless JSON scan API (`--serve-api`).
 - [docs/RULES.md](docs/RULES.md) — the plugin rule engine (`--rules`): extend the built-in CVE + misconfig knowledge with your own YAML/JSON.
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — authenticated scanning: static session material, automated login, multi-role profiling.
 - [docs/RESILIENCE.md](docs/RESILIENCE.md) — the transparent retry/backoff layer, external-service degradation, and per-module timeouts.
