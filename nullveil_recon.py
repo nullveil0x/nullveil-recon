@@ -6374,6 +6374,24 @@ class WebsiteRecon:
                      "evidence": f"CVSS4 {e['cvss4_score']} / CVSS3.1 {e['cvss31_score']} — {e['cwe_name']}"}
                     for e in top if e["severity"] in ("CRITICAL", "HIGH")]
         mean = round(sum(e["score"] for e in entries) / len(entries), 2) if entries else 0.0
+        # Link CVSS entries to root findings
+        try:
+            roots = getattr(self.results, 'get', lambda x,d: d)('root_findings') or {}
+            idx = self.results.get('finding_index') or {}
+            fp_map = {}
+            for f in idx.get('findings', []):
+                fp_map[(f.get('check'), str(f.get('detail',''))[:80])] = f.get('fingerprint')
+                fp_map[f.get('fingerprint')] = f.get('fingerprint')
+            for e in entries:
+                fp = fp_map.get((e.get('check'), str(e.get('detail',''))[:80]))
+                e['fingerprint'] = fp
+                e['root_finding_id'] = roots.get(fp) if fp else None
+            for e in top:
+                fp = fp_map.get((e.get('check'), str(e.get('detail',''))[:80]))
+                e['fingerprint'] = fp
+                e['root_finding_id'] = roots.get(fp) if fp else None
+        except Exception:
+            pass
         self.results['cvss'] = {
             "available": True, "count": len(entries),
             "mean_score": mean,
@@ -6525,6 +6543,23 @@ class WebsiteRecon:
                          "maxValue": max([t["count"] for t in tlist] + [1])},
             "legendItems": [{"label": "Observed technique", "color": "#d32f2f"}],
         }
+        try:
+            roots = self.results.get('root_findings') or {}
+            idx = self.results.get('finding_index') or {}
+            fp_map = {}
+            for f in idx.get('findings', []):
+                fp_map[(f.get('check'), str(f.get('detail',''))[:80])] = f.get('fingerprint')
+            for t in techniques.values():
+                for ex in t.get('examples', []):
+                    fp = fp_map.get((ex.get('check'), str(ex.get('detail',''))[:150][:80]))
+                    ex['fingerprint'] = fp
+                    ex['root_finding_id'] = roots.get(fp) if fp else None
+            for f in findings:
+                fp = fp_map.get((f.get('check'), str(f.get('detail',''))[:110][:80]))
+                f['fingerprint'] = fp
+                f['root_finding_id'] = roots.get(fp) if fp else None
+        except Exception:
+            pass
         self.results['attack_map'] = {
             "available": True, "technique_count": len(tlist),
             "tactic_count": len(tactics), "techniques": tlist, "tactics": tactics,
@@ -8154,6 +8189,18 @@ class WebsiteRecon:
                              "LOW": 4, "INFO": 5}.get(sev, 5),
             })
         patches.sort(key=lambda p: p["priority"])
+        try:
+            roots = self.results.get('root_findings') or {}
+            idx = self.results.get('finding_index') or {}
+            fp_map = {}
+            for f in idx.get('findings', []):
+                fp_map[(f.get('check'), str(f.get('detail',''))[:80])] = f.get('fingerprint')
+            for p in patches:
+                fp = fp_map.get((p.get('check'), str(p.get('finding',''))[:80]))
+                p['fingerprint'] = fp
+                p['root_finding_id'] = roots.get(fp) if fp else None
+        except Exception:
+            pass
         self.results['patch'] = {
             "generated": len(patches), "patches": patches[:200],
             "categories": sorted({p["title"] for p in patches}),
@@ -8229,6 +8276,18 @@ class WebsiteRecon:
                 "severity": sev, "check": check, "source": src, "finding": det,
                 "commands": self._poc_commands_for(sev, check, det),
             })
+        try:
+            roots = self.results.get('root_findings') or {}
+            idx = self.results.get('finding_index') or {}
+            fp_map = {}
+            for f in idx.get('findings', []):
+                fp_map[(f.get('check'), str(f.get('detail',''))[:80])] = f.get('fingerprint')
+            for p in pocs:
+                fp = fp_map.get((p.get('check'), str(p.get('finding',''))[:80]))
+                p['fingerprint'] = fp
+                p['root_finding_id'] = roots.get(fp) if fp else None
+        except Exception:
+            pass
         self.results['poc'] = {
             "generated": len(pocs), "pocs": pocs[:200],
             "policy": "Read-only verification only — HEAD/GET/OPTIONS/dig/openssl; no payloads, no writes, no brute-force.",
@@ -8425,11 +8484,19 @@ class WebsiteRecon:
             except Exception:
                 continue
         F_exec = actionable if actionable else [f for f in F if f[0] != "INFO"]
+        # Prefer verified findings for scoring weight
+        lc = (report.get('finding_lifecycle') or getattr(self.results if hasattr(self,'results') else {}, 'get','lambda x,d: d')('finding_lifecycle',{})) or {}
+        verified = set()
+        for vf in (lc.get('findings') or []):
+            if str(vf.get('lifecycle','')).upper() == 'VERIFIED':
+                verified.add((vf.get('check'), str(vf.get('detail',''))[:80]))
         sev_count = {k: len([f for f in F_exec if f[0] == k])
                      for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
         crit, high, med = sev_count["CRITICAL"], sev_count["HIGH"], sev_count["MEDIUM"]
-        score = min(100, crit * 20 + high * 9 + med * 4 + (s.get("secrets", 0) or 0) * 8
-                    + (s.get("takeover_risks", 0) or 0) * 15)
+        vcrit = sum(1 for f in F_exec if f[0]=='CRITICAL' and (f[1], str(f[2])[:80]) in verified)
+        vhigh = sum(1 for f in F_exec if f[0]=='HIGH' and (f[1], str(f[2])[:80]) in verified)
+        score = min(100, crit * 18 + high * 8 + med * 3 + vcrit * 6 + vhigh * 3 + (s.get("secrets", 0) or 0) * 4
+                    + (s.get("takeover_risks", 0) or 0) * 10)
         verdict = ("CRITICAL EXPOSURE" if score >= 70 else "HIGH EXPOSURE" if score >= 40
                    else "MODERATE EXPOSURE" if score >= 15 else "LOW RISK")
         comp = report.get("compliance", {}) or {}
@@ -10715,6 +10782,11 @@ class WebsiteRecon:
         return out
 
     def export_dict(self):
+        # Ensure linkage/lifecycle are up to date
+        try:
+            self._apply_finding_lifecycle()
+        except Exception:
+            pass
         out = {
             "tool": "NULLVEIL Recon",
             "owner": "NULLVEIL",
@@ -10724,6 +10796,9 @@ class WebsiteRecon:
             "duration_s": round(getattr(self, "scan_duration", 0.0), 1),
             "mode": "deep" if self.deep else "normal",
             "modules_run": self._modules_run_names(),
+            "finding_index": self.results.get('finding_index', {}),
+            "root_findings": self.results.get('root_findings', {}),
+            "finding_lifecycle": self.results.get('finding_lifecycle', {}),
             "summary": {
                 "dns_records": len(self.results['dns']),
                 "subdomains": len(set(self.results['subdomains'])),
