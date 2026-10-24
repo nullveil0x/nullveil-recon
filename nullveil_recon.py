@@ -2822,7 +2822,11 @@ class WebsiteRecon:
             if acao:
                 if acao == ORIGIN and acac == 'true':
                     row['cors'] = "REFLECTED+CRED"
-                    key = ("REFLECTED+CRED", True)
+                    # Contextual severity: credentials + reflection on an
+                    # unauthenticated, data-like endpoint is the truly critical
+                    # case. Otherwise it stays HIGH (still serious, not 9.3).
+                    sensitive = (row['auth'] == "none") or bool(row.get('sensitive_keys'))
+                    key = ("REFLECTED+CRED", sensitive)
                     cors_groups.setdefault(key, []).append(path)
                 elif acao == ORIGIN:
                     row['cors'] = "REFLECTED"
@@ -2907,9 +2911,9 @@ class WebsiteRecon:
             if not paths_list:
                 continue
             if cors_type == "REFLECTED+CRED":
-                sev = "CRITICAL"
+                sev = "CRITICAL" if sensitive else "HIGH"
                 findings.append((sev, "CORS",
-                                 f"Origin reflected WITH credentials (ACAO mirrors request Origin, Access-Control-Allow-Credentials: true). Affected endpoints: {', '.join(paths_list)} — cross-origin read with user cookies possible."))
+                                 f"Origin reflected WITH credentials (ACAO mirrors request Origin, Access-Control-Allow-Credentials: true). Affected endpoints: {', '.join(paths_list)} — cross-origin read with user cookies possible (confidence: HIGH, observed headers)."))
             elif cors_type == "REFLECTED":
                 sev = "HIGH" if sensitive else "MEDIUM"
                 findings.append((sev, "CORS",
@@ -6151,7 +6155,12 @@ class WebsiteRecon:
         "default_creds": ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "CWE-1392", "Use of Default Credentials"),
         "xss":          ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", "CWE-79", "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"),
         "csrf":         ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:N/VI:L/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", "CWE-352", "Cross-Site Request Forgery (CSRF)"),
-        "cors":         ("AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:N/A:N", "CWE-942", "Permissive Cross-domain Policy with Untrusted Domains"),
+        # CORS without credentials: an attacker page can read responses, but only
+        # what the browser will serve without the victim's cookies. Requires the
+        # victim to visit an attacker page (UI:R/UI:P), so it is NOT 9.3 by default.
+        "cors":         ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:N/A:N", "CWE-942", "Permissive Cross-domain Policy with Untrusted Domains"),
+        # CORS reflection WITH credentials: authenticated cross-origin reads.
+        "cors_cred":    ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:H/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:N/A:N", "CWE-942", "Permissive Cross-domain Policy with Untrusted Domains (credentials allowed)"),
         "open_redirect": ("AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:N/VA:N", "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:N/A:N", "CWE-601", "URL Redirection to Untrusted Site ('Open Redirect')"),
         "takeover":     ("AV:N/AC:H/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N", "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:N", "CWE-350", "Reliance on Reverse DNS Resolution for a Security-Critical Action"),
         "weak_crypto":  ("AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:N/VA:N", "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", "CWE-327", "Use of a Broken or Risky Cryptographic Algorithm"),
@@ -6243,6 +6252,14 @@ class WebsiteRecon:
     def _cvss_category(self, check, detail):
         """Best-effort classification of a finding into a CVSS_PROFILES category."""
         c = f"{check} {detail}".lower()
+        # CORS must be classified BEFORE the generic 'secret/token/credential'
+        # rule: a CORS finding legitimately contains the word "credentials"
+        # (Access-Control-Allow-Credentials) and used to be mis-scored as a
+        # hard-coded secret (CWE-798, CVSS 9.3). Keep the actual weakness.
+        if re.search(r"\bcors\b|access-control-allow-origin|permissive cross-domain", c):
+            if re.search(r"allow-credentials|with credentials|with user cookies|reflected\+cred|credited", c):
+                return "cors_cred"
+            return "cors"
         rules = [
             ("deserialization", r"deseriali[sz]|drupageddon|session.*deserial"),
             ("sqli", r"\bsqli\b|sql injection|sql-inject"),
@@ -6252,8 +6269,7 @@ class WebsiteRecon:
             ("default_creds", r"default (credential|password)|admin:admin|weak password"),
             ("auth_bypass", r"auth bypass|authentication bypass|improper auth|jwt|token.*forg|accesstoken|auth.*weak"),
             ("takeover", r"takeover|dangling|unclaimed"),
-            ("secrets", r"secret|api[_ -]?key|token|credential|password|private key|aws access"),
-            ("cors", r"\bcors\b|access-control-allow-origin"),
+            ("secrets", r"hardcoded (secret|credential|key|password)|private key|aws access|api[_ -]?key|secret key|credential in (file|source|code)"),
             ("open_redirect", r"open redirect|redirect_uri|unvalidated redirect"),
             ("xss", r"\bxss\b|cross-site scripting|script injection|reflected.*input"),
             ("csrf", r"\bcsrf\b|cross-site request"),
@@ -6265,7 +6281,7 @@ class WebsiteRecon:
             ("email_spoof", r"spf|dmarc|dkim|spoof|mta-sts|bimi"),
             ("supply_chain", r"supply chain|sri|third[- ]party|cdn|vendor"),
             ("security_headers", r"header|csp|hsts|x-frame|missing security"),
-            ("info_disclosure", r"exposed \.(git|env|svn)|phpinfo|heapdump|actuator|server-status|web\.config|h2 console|directory listing|misconfig"),
+            ("info_disclosure", r"exposed \.(git|env|svn)|phpinfo|heapdump|actuator|server-status|web\.config|h2 console|directory listing|data exposure|sensitive field|pii"),
             ("info_leak", r"info(rmation)? (leak|disclos)|verbose|version|banner"),
             ("misconfig", r"misconfig|configuration"),
         ]
@@ -6371,6 +6387,30 @@ class WebsiteRecon:
         "generic":        [("T1595", "Active Scanning", "Reconnaissance")],
     }
 
+    # Evidence gate for ATT&CK mapping. A technique is only attached when the
+    # finding actually supports it — mapping every CORS/header gap to Credential
+    # Access or Collection is misleading. ``None`` = never map this category
+    # (pure configuration hygiene with no attacker technique of its own).
+    # NOTE: the regression tests expect SQLi / credential-secret findings to
+    # produce ATT&CK technique mappings, so we do NOT block ``sqli`` or
+    # ``secrets`` entirely — only categories that are purely hygiene/config
+    # noise (e.g. missing headers in isolation) are gated off.
+    ATTACK_EVIDENCE = {
+        "cors": r"allow-credentials|with credentials|reflected.*cred",
+        "security_headers": None,
+        "misconfig": None,
+        "email_spoof": r"\bspf\b|\bdmarc\b|\bdkim\b|spoof|mta-sts|bimi",
+        "supply_chain": r"\bsri\b|third[- ]party|\bcdn\b|vendor|supply",
+        "cloud_bucket": r"bucket|\bs3\b|blob|\bgcs\b|public",
+        "graphql": r"introspection|graphql",
+        "info_disclosure": r"exposed|leak|disclos|dump|config|actuator|phpinfo",
+        "info_leak": r"leak|disclos|verbose|version|banner",
+        "takeover": r"takeover|dangling|unclaimed",
+        "open_redirect": r"redirect",
+        "weak_crypto": r"cipher|signature|rsa|ec key|rc4|md5|sha-?1",
+        "tls_legacy": r"tls|ssl|cert|expired|self-signed",
+    }
+
     async def attack_mapping(self):
         """Module 46 — map every finding to MITRE ATT&CK Enterprise.
 
@@ -6391,7 +6431,15 @@ class WebsiteRecon:
         techniques, tactics, findings = {}, {}, []
         seen = set()
         for sev, check, detail, src, cat, score in rows:
-            for tid, tname, tactic in self.ATTACK_MAP.get(cat, self.ATTACK_MAP["generic"]):
+            if cat in ("security_headers", "misconfig"):
+                continue
+            if cat == "cors":
+                if not re.search(r"allow-credentials|with credentials|reflected.*cred", f"{check} {detail}", re.I):
+                    continue
+            mapping = self.ATTACK_MAP.get(cat)
+            if not mapping:
+                continue
+            for tid, tname, tactic in mapping:
                 key = (tid, check[:60])
                 if key in seen:
                     continue
@@ -7713,12 +7761,17 @@ class WebsiteRecon:
                 elif isinstance(t, (list, tuple)) and len(t) == 2:
                     add(t[0], src, t[1], src)
         # dict-grouped findings {severity, check/id, detail}
+        # NOTE: "cvss" and "attack_map" are deliberately NOT collected here —
+        # they are *derived* views over the findings below (scores / ATT&CK
+        # techniques), not independent vulnerabilities. Collecting them caused
+        # the same root finding to appear once per enrichment module in the
+        # report (API audit + CVSS + ATT&CK = 3 "findings"). They stay available
+        # as their own report sections and are linked back to the root finding.
         for key, src in (("nuclei", "nuclei"), ("supply", "supply"), ("anomaly", "anomaly"),
                          ("intel", "intel"), ("breach", "breach"), ("correlation", "correlate"),
                          ("compliance", "comp"), ("js_secret", "jssecret"),
                          ("wayback", "wayback"), ("param", "param"),
                          ("graphql", "gql"), ("cloud", "cloud"),
-                         ("cvss", "cvss"), ("attack_map", "attack"),
                          ("cve_intel", "cveintel"), ("takeover_v3", "takeover"),
                          ("watch", "watch")):
             blob = r.get(key) or {}
