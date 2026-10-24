@@ -9508,6 +9508,7 @@ class WebsiteRecon:
             "score": score, "verdict": verdict,
             "summary": {k: len(v) for k, v in added.items()},
             "findings": findings,
+            "status": {"new": sum(len(v) for v in added.values()), "resolved": sum(len(v) for v in removed.values()), "persistent": "N/A", "changed": bool(findings)},
         }
         # surface notable new assets as first-class findings too
         if added.get("ports"):
