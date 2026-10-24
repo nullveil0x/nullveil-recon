@@ -2662,7 +2662,7 @@ class WebsiteRecon:
             if len(includes) > 10:
                 findings.append(("LOW", f"SPF has {len(includes)} includes — DNS lookup limit is 10, may break"))
         else:
-            findings.append(("HIGH", "No SPF record — anyone can spoof this domain in the From header"))
+            findings.append(("MEDIUM", "No SPF record — domain spoofing possible for phishing [Configuration Gap]"))
         self.results['spf'] = spf_record or ""
         self.results['spf_includes'] = sorted(set(re.findall(r'(?:include|redirect):([\w.\-]+)', spf_record))) if spf_record else []
 
@@ -2682,8 +2682,8 @@ class WebsiteRecon:
         await asyncio.gather(*[try_dkim(s) for s in dkim_selectors])
         self.results['dkim'] = {k: v for k, v in dkim_found.items()}
         if not dkim_found:
-            findings.append(("MEDIUM", f"No DKIM found on {len(dkim_selectors)} common selectors "
-                                       f"(not proof of absence — custom selector possible)"))
+            findings.append(("LOW", f"DKIM not detected on {len(dkim_selectors)} common selectors "
+                                       f"(NOT_PROVEN — custom selector possible) [Configuration Gap]"))
 
         # ---------- DMARC ----------
         dmarc_record = next((t for t in dmarc_txt if t.lower().startswith('v=dmarc1')), None)
@@ -2693,24 +2693,24 @@ class WebsiteRecon:
             policy = policy_m.group(1).lower() if policy_m else "none"
             self.results['dmarc_policy'] = policy
             if policy == "none":
-                findings.append(("MEDIUM", "DMARC policy is 'p=none' — monitoring only, spoofing not blocked"))
+                findings.append(("MEDIUM", "DMARC policy is 'p=none' — monitoring only, spoofing not blocked [Configuration Gap]"))
             elif policy == "quarantine":
-                findings.append(("LOW", "DMARC policy 'p=quarantine' — consider 'p=reject' for full protection"))
+                findings.append(("LOW", "DMARC policy 'p=quarantine' — consider 'p=reject' for full protection [Configuration Gap]"))
             else:
-                findings.append(("INFO", "DMARC policy 'p=reject' — strongest anti-spoofing policy"))
+                findings.append(("INFO", "DMARC policy 'p=reject' — strongest anti-spoofing policy [OK]"))
             if not re.search(r'rua\s*=', dmarc_record):
-                findings.append(("LOW", "DMARC has no 'rua=' aggregate report address — you won't see abuse reports"))
+                findings.append(("LOW", "DMARC has no 'rua=' aggregate report address — you won't see abuse reports [Configuration Gap]"))
             sp_m = re.search(r'(?:^|;)\s*sp\s*=\s*(\w+)', dmarc_record)
             if sp_m and sp_m.group(1).lower() == "none":
-                findings.append(("MEDIUM", "DMARC subdomain policy 'sp=none' — subdomains are unprotected"))
+                findings.append(("MEDIUM", "DMARC subdomain policy 'sp=none' — subdomains are unprotected [Configuration Gap]"))
         else:
-            findings.append(("HIGH", "No DMARC record — domain can be spoofed for phishing"))
+            findings.append(("MEDIUM", "No DMARC record — domain can be spoofed for phishing [Configuration Gap]"))
 
         # ---------- MTA-STS ----------
         mtasts_record = next((t for t in mtasts_txt if 'v=STSv1' in t), None)
         self.results['mta_sts'] = mtasts_record or ""
         if not mtasts_record:
-            findings.append(("LOW", "No MTA-STS — SMTP TLS downgrade attacks possible"))
+            findings.append(("LOW", "No MTA-STS — SMTP TLS downgrade attacks possible [Configuration Gap]"))
 
         # ---------- BIMI ----------
         bimi_record = next((t for t in bimi_txt if 'v=BIMI1' in t), None)
@@ -2791,7 +2791,8 @@ class WebsiteRecon:
 
         ORIGIN = "https://nullveil-audit.probe"
 
-        # ---------- per-endpoint checks ----------
+        # ---------- per-endpoint checks (collect CORS for grouping) ----------
+        cors_groups = {}
         async def audit_endpoint(path):
             url = urljoin(self.base_url + "/", path.lstrip('/'))
             row = {"path": path, "status": None, "auth": "-", "cors": "-", "methods": "",
@@ -2815,27 +2816,30 @@ class WebsiteRecon:
             elif r.status_code in (200, 201, 204):
                 row['auth'] = "none"
 
-            # --- CORS misconfig ---
+            # --- CORS misconfig (collect for grouping) ---
             acao = r.headers.get('access-control-allow-origin', '')
             acac = r.headers.get('access-control-allow-credentials', '').lower()
             if acao:
                 if acao == ORIGIN and acac == 'true':
                     row['cors'] = "REFLECTED+CRED"
-                    findings.append(("CRITICAL", "CORS",
-                                     f"{path}: origin reflected WITH credentials — any website can read this API with user cookies"))
+                    key = ("REFLECTED+CRED", True)
+                    cors_groups.setdefault(key, []).append(path)
                 elif acao == ORIGIN:
                     row['cors'] = "REFLECTED"
-                    findings.append(("HIGH", "CORS",
-                                     f"{path}: foreign origin reflected in ACAO — cross-origin reads allowed"))
+                    key = ("REFLECTED", row['auth'] == "none")
+                    cors_groups.setdefault(key, []).append(path)
                 elif acao == "*":
                     row['cors'] = "*"
                     if acac == 'true':
-                        findings.append(("HIGH", "CORS", f"{path}: ACAO '*' with Allow-Credentials (browsers block it, but intent is unsafe)"))
+                        key = ("STAR+CRED", True)
+                        cors_groups.setdefault(key, []).append(path)
                     else:
-                        findings.append(("INFO", "CORS", f"{path}: ACAO '*' — public API (OK if intended)"))
+                        key = ("STAR", row['auth'] == "none")
+                        cors_groups.setdefault(key, []).append(path)
                 elif acac == 'true':
                     row['cors'] = "CRED"
-                    findings.append(("MEDIUM", "CORS", f"{path}: Allow-Credentials true with origin {acao[:60]}"))
+                    key = ("CRED", row['auth'] == "none")
+                    cors_groups.setdefault(key, []).append(path)
 
             # --- verbose error leak (only on error responses or leak patterns) ---
             body = r.text[:300_000] if 'json' in r.headers.get('content-type', '') or r.status_code >= 500 else ""
@@ -2896,6 +2900,32 @@ class WebsiteRecon:
             endpoint_rows.append(row)
 
         await asyncio.gather(*[audit_endpoint(p) for p in audit_targets])
+
+        # ---------- group CORS findings ----------
+        for (cors_type, sensitive), paths in cors_groups.items():
+            paths_list = sorted(set(paths))
+            if not paths_list:
+                continue
+            if cors_type == "REFLECTED+CRED":
+                sev = "CRITICAL"
+                findings.append((sev, "CORS",
+                                 f"Origin reflected WITH credentials (ACAO mirrors request Origin, Access-Control-Allow-Credentials: true). Affected endpoints: {', '.join(paths_list)} — cross-origin read with user cookies possible."))
+            elif cors_type == "REFLECTED":
+                sev = "HIGH" if sensitive else "MEDIUM"
+                findings.append((sev, "CORS",
+                                 f"Foreign origin reflected in Access-Control-Allow-Origin. Affected endpoints: {', '.join(paths_list)} — cross-origin reads allowed."))
+            elif cors_type == "STAR+CRED":
+                sev = "HIGH"
+                findings.append((sev, "CORS",
+                                 f"ACAO: '*' with Access-Control-Allow-Credentials: true (invalid per spec, often misconfigured). Affected endpoints: {', '.join(paths_list)} — review for cross-origin access with credentials."))
+            elif cors_type == "STAR":
+                sev = "INFO" if not sensitive else "LOW"
+                findings.append((sev, "CORS",
+                                 f"ACAO: '*' allows any origin. Affected endpoints: {', '.join(paths_list)} — public API if intended."))
+            elif cors_type == "CRED":
+                sev = "MEDIUM" if sensitive else "LOW"
+                findings.append((sev, "CORS",
+                                 f"Access-Control-Allow-Credentials: true with specific origin. Affected endpoints: {', '.join(paths_list)} — ensure origin allowlist is strict."))
 
         # ---------- missing-auth check on JSON endpoints ----------
         for row in endpoint_rows:
@@ -3928,21 +3958,30 @@ class WebsiteRecon:
         # ---------- findings ----------
         exec_res = [r for r in resources if r["kind"] in ("script", "stylesheet")]
         no_sri = [r for r in exec_res if not r.get("sri")]
-        unknown = [r for r in exec_res if r.get("vendor_known") is False]
+        unknown = [r for r in exec_res if r.get("vendor_known") is False and not r.get("same_origin")]
+        first_party_exec = [r for r in exec_res if r.get("same_origin")]
         if exec_res and no_sri:
-            sev = "HIGH" if unknown else "MEDIUM"
-            findings.append((sev, "No Subresource Integrity",
-                             f"{len(no_sri)}/{len(exec_res)} third-party executable resources lack SRI — "
-                             f"a CDN/vendor compromise can inject code (add integrity=...)"))
+            third_party_no_sri = [r for r in no_sri if not r.get("same_origin")]
+            if third_party_no_sri:
+                sev = "HIGH" if unknown else "MEDIUM"
+                findings.append((sev, "No Subresource Integrity",
+                                 f"{len(third_party_no_sri)} third-party executable resources lack SRI — "
+                                 f"add integrity + crossorigin where appropriate, pin trusted resources, and review dependencies (not fixable by WAF/CDN alone)"))
+            elif first_party_exec and no_sri:
+                findings.append(("INFO", "No Subresource Integrity (first-party)",
+                                 f"{len(no_sri)} first-party executable resources lack SRI — consider adding integrity where using versioned/CDN-hosted assets"))
         for r in unknown[:8]:
-            findings.append(("HIGH", "Unknown third-party script source",
-                             f"{r['kind']} loaded from unrecognized host: {r['url'][:100]}"))
+            findings.append(("MEDIUM", "Unknown external script source",
+                             f"{r['kind']} loaded from unrecognized host: {r['url'][:100]} (classification: THIRD-PARTY/UNKNOWN)"))
+        for r in first_party_exec[:5]:
+            # Don't flag same-origin app chunks as third-party
+            pass
         if ext_form_actions:
             for scheme, u in ext_form_actions[:6]:
                 sev = "CRITICAL" if scheme == "http" else "MEDIUM"
                 findings.append((sev, "Form submits to third party",
                                  f"form action → {u[:100]} (submitted data leaves this origin)"))
-        scripts3p = [r for r in resources if r["kind"] == "script"]
+        scripts3p = [r for r in resources if r["kind"] == "script" and not r.get("same_origin")]
         if scripts3p:
             try:
                 hdrs = self.scalar_results.get('http_headers') or {}
@@ -3962,8 +4001,9 @@ class WebsiteRecon:
             "vendors": vendors,
             "resources": resources[:60],
             "resources_total": len(resources),
-            "third_party_exec": len(exec_res),
-            "sri_missing": len(no_sri),
+            "third_party_exec": len([r for r in exec_res if not r.get("same_origin")]),
+            "first_party_exec": len(first_party_exec),
+            "sri_missing": len([r for r in no_sri if not r.get("same_origin")]),
             "unknown_sources": [r["url"] for r in unknown],
             "external_form_actions": [u for _, u in ext_form_actions],
             "preconnect": preconnect,
@@ -8247,7 +8287,8 @@ class WebsiteRecon:
             "compliance": {"coverage_pct": comp.get("coverage_pct", 0),
                            "total_fail": comp.get("total_fail", 0),
                            "total_controls": comp.get("total_controls", 0),
-                           "frameworks": comp.get("frameworks", {})},
+                           "frameworks": comp.get("frameworks", {}),
+                           "disclaimer": comp.get("disclaimer", "Indicative Technical Control Mapping — not a certification/compliance attestation")},
             "kpis": {
                 "subdomains": s.get("subdomains", 0), "open_ports": s.get("open_ports", 0),
                 "secrets": s.get("secrets", 0), "api_endpoints": s.get("api_endpoints", 0),
@@ -9453,14 +9494,14 @@ class WebsiteRecon:
         score, level, color, verdict, bar = _risk_meter(
             set(self.results['secrets']),
             len([h for h in self.results['missing_security_headers'] if h != 'content-encoding']),
-            [p for p in self.results['paths'] if p['flagged']],
+            [p for p in self.results['paths'] if isinstance(p, dict) and p.get('flagged')],
         )
         risk_body = Group(
             Text.from_markup(f"{bar}  [bold {color}]{score}/100 — {verdict}[/]"),
             Align.center(Text.from_markup(
                 f"[dim]Risk Level:[/] [bold {color}]{level}[/]   "
                 f"[dim]Secrets:[/] [white]{len(set(self.results['secrets']))}[/]   "
-                f"[dim]Flagged Paths:[/] [white]{len([p for p in self.results['paths'] if p['flagged']])}[/]   "
+                f"[dim]Flagged Paths:[/] [white]{len([p for p in self.results['paths'] if isinstance(p, dict) and p.get('flagged')])}[/]   "
                 f"[dim]Missing Headers:[/] [white]{len([h for h in self.results['missing_security_headers'] if h != 'content-encoding'])}[/]"
             )),
         )
@@ -9482,7 +9523,7 @@ class WebsiteRecon:
             ("Users", len(set(self.results['users']))),
             ("Secrets / Leaks", len(set(self.results['secrets']))),
             ("Tech Stack", len(set(self.results['tech_stack']))),
-            ("API Endpoints", len(self.results.get('api_endpoints', [])) + len(self.results.get('api_endpoints_found', []))),
+            ("API Endpoints", len(set([ep.get('path') if isinstance(ep, dict) else ep for ep in (self.results.get('api_endpoints', []) or [])] + [ep for ep in (self.results.get('api_endpoints_found', []) or []) if ep]))),
             ("API Documents", len(self.results.get('api_docs', []))),
             ("Forms", len(self.results.get('forms', []))),
             ("WAF / CDN", len(self.results.get('waf', []))),
@@ -10461,7 +10502,7 @@ class WebsiteRecon:
                 "users": len(self.results['users']),
                 "secrets": len(set(self.results['secrets'])),
                 "tech_stack": sorted(set(self.results['tech_stack'])),
-                "api_endpoints": len(self.results.get('api_endpoints', [])) + len(self.results.get('api_endpoints_found', [])),
+                "api_endpoints": len(set([ep.get('path') if isinstance(ep, dict) else ep for ep in (self.results.get('api_endpoints', []) or [])] + [ep for ep in (self.results.get('api_endpoints_found', []) or []) if ep])),
                 "api_documents": len(self.results.get('api_docs', [])),
                 "forms": len(self.results.get('forms', [])),
                 "waf": self.results.get('waf', []),
@@ -10641,7 +10682,7 @@ class WebsiteRecon:
                 "total_controls": self.results.get('compliance', {}).get('total_controls', 0),
                 "total_fail": self.results.get('compliance', {}).get('total_fail', 0),
                 "frameworks": self.results.get('compliance', {}).get('frameworks', {}),
-                "disclaimer": self.results.get('compliance', {}).get('disclaimer', ''),
+                "disclaimer": self.results.get('compliance', {}).get('disclaimer', 'Indicative Technical Control Mapping — not a certification/compliance attestation'),
             },
             "attack_graph": {
                 "node_count": self.results.get('graph', {}).get('node_count', 0),
