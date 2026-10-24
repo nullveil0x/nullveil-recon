@@ -2911,11 +2911,11 @@ class WebsiteRecon:
             if not paths_list:
                 continue
             if cors_type == "REFLECTED+CRED":
-                sev = "CRITICAL" if sensitive else "HIGH"
+                sev = "HIGH" if not sensitive else "CRITICAL"
                 findings.append((sev, "CORS",
                                  f"Origin reflected WITH credentials (ACAO mirrors request Origin, Access-Control-Allow-Credentials: true). Affected endpoints: {', '.join(paths_list)} — cross-origin read with user cookies possible (confidence: HIGH, observed headers)."))
             elif cors_type == "REFLECTED":
-                sev = "HIGH" if sensitive else "MEDIUM"
+                sev = "MEDIUM" if not sensitive else "HIGH"
                 findings.append((sev, "CORS",
                                  f"Foreign origin reflected in Access-Control-Allow-Origin. Affected endpoints: {', '.join(paths_list)} — cross-origin reads allowed."))
             elif cors_type == "STAR+CRED":
@@ -2927,7 +2927,7 @@ class WebsiteRecon:
                 findings.append((sev, "CORS",
                                  f"ACAO: '*' allows any origin. Affected endpoints: {', '.join(paths_list)} — public API if intended."))
             elif cors_type == "CRED":
-                sev = "MEDIUM" if sensitive else "LOW"
+                sev = "LOW" if not sensitive else "MEDIUM"
                 findings.append((sev, "CORS",
                                  f"Access-Control-Allow-Credentials: true with specific origin. Affected endpoints: {', '.join(paths_list)} — ensure origin allowlist is strict."))
 
@@ -3651,10 +3651,10 @@ class WebsiteRecon:
                 cipher, bits, nego = res
                 matrix.append((name, "yes", cipher, str(bits), nego))
                 if name == "TLS 1.0":
-                    findings.append(("HIGH", "TLS 1.0 enabled",
+                    findings.append(("INFO", "TLS 1.0 enabled",
                                      "TLS 1.0 accepted — BEAST/POODLE-class risks (PCI DSS: disable)"))
                 elif name == "TLS 1.1":
-                    findings.append(("MEDIUM", "TLS 1.1 enabled",
+                    findings.append(("INFO", "TLS 1.1 enabled",
                                      "TLS 1.1 accepted — deprecated (RFC 8996), disable it"))
                 if WEAK_HARD_RE.search(cipher or ""):
                     findings.append(("HIGH", "Weak cipher", f"{name} negotiates broken-class cipher: {cipher} ({bits}-bit)"))
@@ -8478,14 +8478,14 @@ class WebsiteRecon:
                 if sev in ("CRITICAL", "HIGH", "MEDIUM"):
                     actionable.append(f)
                     continue
-                if sev == "LOW" and any(x in chk or x in det for x in ["exposed", "missing", "misconfig", "weak", "takeover", "dangling", "cookie", "session", "cors"]):
+                if sev == "LOW" and any(x in chk or x in det for x in ["exposed", "missing", "misconfig", "weak", "takeover", "dangling", "cookie", "session", "cors", "rce", "sqli", "ssrf", "xss", "idor", "auth bypass"]):
                     actionable.append(f)
                     continue
             except Exception:
                 continue
         F_exec = actionable if actionable else [f for f in F if f[0] != "INFO"]
         # Prefer verified findings for scoring weight
-        lc = (report.get('finding_lifecycle') or getattr(self.results if hasattr(self,'results') else {}, 'get','lambda x,d: d')('finding_lifecycle',{})) or {}
+        lc = (report.get('finding_lifecycle') or (getattr(self,'results',{}) or {}).get('finding_lifecycle') if hasattr(self,'results') else {}) or {}
         verified = set()
         for vf in (lc.get('findings') or []):
             if str(vf.get('lifecycle','')).upper() == 'VERIFIED':
@@ -8495,10 +8495,19 @@ class WebsiteRecon:
         crit, high, med = sev_count["CRITICAL"], sev_count["HIGH"], sev_count["MEDIUM"]
         vcrit = sum(1 for f in F_exec if f[0]=='CRITICAL' and (f[1], str(f[2])[:80]) in verified)
         vhigh = sum(1 for f in F_exec if f[0]=='HIGH' and (f[1], str(f[2])[:80]) in verified)
-        score = min(100, crit * 18 + high * 8 + med * 3 + vcrit * 6 + vhigh * 3 + (s.get("secrets", 0) or 0) * 4
-                    + (s.get("takeover_risks", 0) or 0) * 10)
-        verdict = ("CRITICAL EXPOSURE" if score >= 70 else "HIGH EXPOSURE" if score >= 40
-                   else "MODERATE EXPOSURE" if score >= 15 else "LOW RISK")
+        # Contextual scoring - configuration gaps don't auto-max out score
+        config_gap = 0
+        for f in F_exec:
+            chk = str(f[1] or "").lower(); det = str(f[2] or "").lower()
+            if any(x in chk or x in det for x in ['missing spf','missing dmarc','missing dkim','security header','hsts missing','csp missing','x-content-type','referrer-policy','permissions-policy']):
+                if f[0] in ('CRITICAL','HIGH'):
+                    config_gap += 1
+        score = crit * 16 + high * 7 + med * 2 + vcrit * 4 + vhigh * 2 + (s.get("secrets", 0) or 0) * 3 + (s.get("takeover_risks", 0) or 0) * 8
+        # Reduce weight of pure config gaps
+        if config_gap and crit == 0 and high <= 2:
+            score = int(score * 0.7)
+        score = min(95, max(0, score))
+        verdict = ("CRITICAL EXPOSURE" if score >= 80 else "HIGH EXPOSURE" if score >= 50 else "MODERATE EXPOSURE" if score >= 20 else "LOW RISK")
         comp = report.get("compliance", {}) or {}
         return {
             "score": score, "verdict": verdict, "sev": sev_count,
