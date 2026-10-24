@@ -8272,7 +8272,23 @@ class WebsiteRecon:
         if not live:
             live = self._collect_findings_from_report(report)
         F = self._dedupe_findings(live)
-        sev_count = {k: len([f for f in F if f[0] == k])
+        # Zero-noise policy: executive shows only actionable findings
+        actionable = []
+        for f in F:
+            try:
+                sev = f[0]
+                chk = str(f[1] or "").lower()
+                det = str(f[2] or "").lower()
+                if sev in ("CRITICAL", "HIGH", "MEDIUM"):
+                    actionable.append(f)
+                    continue
+                if sev == "LOW" and any(x in chk or x in det for x in ["exposed", "missing", "misconfig", "weak", "takeover", "dangling", "cookie", "session", "cors"]):
+                    actionable.append(f)
+                    continue
+            except Exception:
+                continue
+        F_exec = actionable if actionable else [f for f in F if f[0] != "INFO"]
+        sev_count = {k: len([f for f in F_exec if f[0] == k])
                      for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
         crit, high, med = sev_count["CRITICAL"], sev_count["HIGH"], sev_count["MEDIUM"]
         score = min(100, crit * 20 + high * 9 + med * 4 + (s.get("secrets", 0) or 0) * 8
@@ -8282,8 +8298,8 @@ class WebsiteRecon:
         comp = report.get("compliance", {}) or {}
         return {
             "score": score, "verdict": verdict, "sev": sev_count,
-            "findings": F,
-            "top_risks": [f for f in F if f[0] in ("CRITICAL", "HIGH")][:12],
+            "findings": F_exec,
+            "top_risks": [f for f in F_exec if f[0] in ("CRITICAL", "HIGH")][:12],
             "compliance": {"coverage_pct": comp.get("coverage_pct", 0),
                            "total_fail": comp.get("total_fail", 0),
                            "total_controls": comp.get("total_controls", 0),
