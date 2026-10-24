@@ -9211,9 +9211,13 @@ class WebsiteRecon:
         return None
 
     # ---------------------------------------------------------- Change Detection / Diff
-    @staticmethod
-    def _asset_sets(report):
+    def _asset_sets(self, report=None):
         """Normalise a report into comparable sets of assets."""
+        if report is None and isinstance(self, dict):
+            report = self
+        elif report is None and not isinstance(self, WebsiteRecon):
+            # called as static-like
+            report = {}
         r = (report or {}).get("report", report) or {}
 
         def _ports(v):
@@ -9237,12 +9241,52 @@ class WebsiteRecon:
                     out.add(str(p))
             return out
 
+        def _canon_api(rr):
+            out = []
+            seen = set()
+            api = rr.get("api", {}) or {}
+            for ep in api.get("live_endpoints") or []:
+                if isinstance(ep, dict):
+                    p = ep.get('path') or ep.get('url') or ''
+                else:
+                    p = str(ep)
+                if p and p not in seen:
+                    out.append(p); seen.add(p)
+            for ep in api.get("paths_in_source") or []:
+                if isinstance(ep, dict):
+                    p = ep.get('path') or ep.get('url') or ''
+                else:
+                    p = str(ep)
+                if p and p not in seen:
+                    out.append(p); seen.add(p)
+            for ep in rr.get("api_endpoints") or []:
+                if isinstance(ep, dict):
+                    p = ep.get('path') or ep.get('url') or ''
+                else:
+                    p = str(ep)
+                if p and p not in seen:
+                    out.append(p); seen.add(p)
+            for ep in rr.get("api_endpoints_found") or []:
+                if isinstance(ep, dict):
+                    p = ep.get('path') or ep.get('url') or ''
+                else:
+                    p = str(ep)
+                if p and p not in seen:
+                    out.append(p); seen.add(p)
+            return out
+
         api = r.get("api", {}) or {}
+        canon = _canon_api(r)
+        if not canon and hasattr(self, '_canonical_endpoints'):
+            try:
+                canon = self._canonical_endpoints()
+            except Exception:
+                canon = []
         return {
             "subdomains": {str(x).lower() for x in (r.get("subdomains") or []) if x},
             "ports": _ports(r.get("open_ports")),
             "paths": _paths(r.get("paths")),
-            "api_endpoints": _paths(api.get("live_endpoints")) | _paths(api.get("paths_in_source")),
+            "api_endpoints": set(canon),
             "cookies": {str(x) for x in (api.get("cookies") or []) if x},
             "js_files": {str(x) for x in (r.get("js_files") or []) if x},
             "tech_stack": {str(x) for x in (r.get("tech_stack") or []) if x},
@@ -9539,7 +9583,7 @@ class WebsiteRecon:
             ("Users", len(set(self.results['users']))),
             ("Secrets / Leaks", len(set(self.results['secrets']))),
             ("Tech Stack", len(set(self.results['tech_stack']))),
-            ("API Endpoints", len(set([ep.get('path') if isinstance(ep, dict) else ep for ep in (self.results.get('api_endpoints', []) or [])] + [ep for ep in (self.results.get('api_endpoints_found', []) or []) if ep]))),
+            ("API Endpoints", len(self._canonical_endpoints())),
             ("API Documents", len(self.results.get('api_docs', []))),
             ("Forms", len(self.results.get('forms', []))),
             ("WAF / CDN", len(self.results.get('waf', []))),
@@ -10498,6 +10542,40 @@ class WebsiteRecon:
         console.print(t)
 
     # ---------------------------------------------------------- Export
+    def _canonical_endpoints(self):
+        """Single source of truth for all API/endpoints."""
+        out = []
+        seen = set()
+        try:
+            for ep in self.results.get('api_endpoints', []) or []:
+                if isinstance(ep, dict):
+                    p = ep.get('path') or ep.get('url') or ''
+                else:
+                    p = str(ep)
+                if not p or p in seen:
+                    continue
+                out.append(p)
+                seen.add(p)
+            for ep in self.results.get('api_endpoints_found', []) or []:
+                if isinstance(ep, dict):
+                    p = ep.get('path') or ep.get('url') or ''
+                else:
+                    p = str(ep)
+                if p and p not in seen:
+                    out.append(p)
+                    seen.add(p)
+            for ep in self.results.get('endpoints', []) or []:
+                if isinstance(ep, dict):
+                    p = ep.get('path') or ep.get('url') or ep.get('endpoint') or ''
+                else:
+                    p = str(ep)
+                if p and p not in seen:
+                    out.append(p)
+                    seen.add(p)
+        except Exception:
+            pass
+        return out
+
     def export_dict(self):
         out = {
             "tool": "NULLVEIL Recon",
@@ -10518,7 +10596,7 @@ class WebsiteRecon:
                 "users": len(self.results['users']),
                 "secrets": len(set(self.results['secrets'])),
                 "tech_stack": sorted(set(self.results['tech_stack'])),
-                "api_endpoints": len(set([ep.get('path') if isinstance(ep, dict) else ep for ep in (self.results.get('api_endpoints', []) or [])] + [ep for ep in (self.results.get('api_endpoints_found', []) or []) if ep])),
+                "api_endpoints": len(self._canonical_endpoints()),
                 "api_documents": len(self.results.get('api_docs', [])),
                 "forms": len(self.results.get('forms', [])),
                 "waf": self.results.get('waf', []),
@@ -10547,7 +10625,7 @@ class WebsiteRecon:
                 "har_entries": self.results.get('burp', {}).get('har_entries', 0),
                 "auth_gated_apis": self.results.get('authscan', {}).get('auth_gated', 0),
                 "role_hidden_apis": len(self.results.get('authscan', {}).get('role_gated', [])),
-                "admin_api_findings": len(self.results.get('admin_findings', [])),
+                "admin_api_findings": len([f for f in self.results.get('admin_findings', []) if f]),
                 "ssrf_bypass_hits": len(self.results.get('ssrf', {}).get('bypass', [])),
                 "ssrf_metadata_hits": len(self.results.get('ssrf', {}).get('metadata', [])),
                 "vuln_verify_xss": len(self.results.get('vuln_verify', {}).get('xss', [])),
