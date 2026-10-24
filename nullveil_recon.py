@@ -3970,7 +3970,7 @@ class WebsiteRecon:
                 sev = "HIGH" if unknown else "MEDIUM"
                 findings.append((sev, "No Subresource Integrity",
                                  f"{len(third_party_no_sri)} third-party executable resources lack SRI — "
-                                 f"add integrity + crossorigin where appropriate, pin trusted resources, and review dependencies (not fixable by WAF/CDN alone)"))
+                                 f"add integrity attribute + crossorigin where required, pin trusted versions, review/host critical resources locally, or remove unnecessary third-party scripts."))
             elif first_party_exec and no_sri:
                 findings.append(("INFO", "No Subresource Integrity (first-party)",
                                  f"{len(no_sri)} first-party executable resources lack SRI — consider adding integrity where using versioned/CDN-hosted assets"))
