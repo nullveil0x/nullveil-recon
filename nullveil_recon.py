@@ -11349,19 +11349,31 @@ class WebsiteRecon:
             parts.append(sec("Compliance Coverage",
                              f"<div class='chips'>"
                              f"<span class='chip {'green' if cov>=80 else 'yellow' if cov>=50 else 'red'}'>Coverage: {cov}%</span>"
-                             f"<span class='chip green'>Pass: {cov}</span>"
                              f"<span class='chip red'>Fail: {nf}</span>"
                              f"<span class='chip yellow'>Controls: {tf}</span></div>"
-                             f"<p class='muted'>{_e(comp.get('disclaimer', ''))}</p>", "#3b82f6"))
+                             f"<p class='muted'>{_e(comp.get('disclaimer', 'Evidence-based partial technical mapping only. This is NOT a certification, audit, or gap assessment.'))}</p>", "#3b82f6"))
             fw = comp.get('frameworks', {})
             for fname, fv in fw.items():
                 ctrls = fv.get('controls', [])
                 if ctrls:
-                    parts.append(sec(f"Compliance: {fname}",
-                                     tbl(["Ref", "Title", "Status", "Evidence"],
-                                         [[_e(str(c['ref'])), _e(str(c['title'])[:80]),
-                                           f"<span class='chip {'green' if c['status']=='PASS' else 'red' if c['status']=='FAIL' else 'yellow'}'>{_e(c['status'])}</span>",
-                                           _e(str(c['evidence'])[:120])] for c in ctrls[:40]]), "#3b82f6"))
+                    p = fv.get('pass', 0); fa = fv.get('fail', 0); pr = fv.get('partial', 0); nd = fv.get('needed', 0)
+                    rows = []
+                    for c in ctrls[:60]:
+                        st = c.get('status','')
+                        if st == 'PASS':
+                            stchip = "<span class='chip green'>PASS</span>"
+                        elif st == 'FAIL':
+                            stchip = "<span class='chip red'>FAIL</span>"
+                        elif st == 'PARTIAL':
+                            stchip = "<span class='chip yellow'>PARTIAL</span>"
+                        elif st in ('EVIDENCE REQUIRED', 'NOT ASSESSABLE'):
+                            stchip = "<span class='chip'>EVIDENCE REQUIRED</span>"
+                        else:
+                            stchip = f"<span class='chip'>{_e(st)}</span>"
+                        rows.append([_e(str(c.get('ref',''))), _e(str(c.get('title',''))[:90]), stchip, _e(str(c.get('evidence',''))[:150])])
+                    tbl_html = tbl(["Ref", "Control", "Status", "Evidence"], rows)
+                    summary = f"<div class='chips'><span class='chip green'>PASS: {p}</span> <span class='chip yellow'>PARTIAL: {pr}</span> <span class='chip red'>FAIL: {fa}</span> <span class='chip'>EVIDENCE REQUIRED: {nd}</span></div>"
+                    parts.append(sec(f"Compliance: {fname} (Technical Control Mapping)", summary + tbl_html, "#3b82f6"))
         # Attack Graph
         ag = d.get('attack_graph', {})
         if ag:
