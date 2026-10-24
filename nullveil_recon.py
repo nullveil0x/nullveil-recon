@@ -6290,6 +6290,40 @@ class WebsiteRecon:
                 return cat
         return "generic"
 
+
+    # -------------------------- Finding Lifecycle / Confidence (W/X)
+    FINDING_LIFECYCLE = ["DISCOVERED", "CANDIDATE", "OBSERVED", "VALIDATED", "VERIFIED", "REJECTED", "RESOLVED", "PERSISTENT"]
+    CONFIDENCE_LEVELS = ["LOW", "MEDIUM", "HIGH", "VERIFIED"]
+
+    def _apply_finding_lifecycle(self):
+        try:
+            fi = self.results.get('finding_index') or {}
+            roots = self.results.get('root_findings') or {}
+            out = []
+            for f in fi.get('findings', []):
+                sev = f.get('severity','INFO')
+                det = str(f.get('detail','')).lower()
+                chk = str(f.get('check','')).lower()
+                if sev in ('CRITICAL','HIGH'):
+                    conf = 'HIGH'
+                elif sev == 'MEDIUM':
+                    conf = 'MEDIUM'
+                else:
+                    conf = 'LOW'
+                if any(x in det or x in chk for x in ['verified','confirmed','reproduced']):
+                    conf = 'VERIFIED'
+                if any(x in det or x in chk for x in ['informational','banner','version only']):
+                    conf = 'LOW'
+                lifecycle = 'OBSERVED'
+                if conf == 'VERIFIED':
+                    lifecycle = 'VERIFIED'
+                elif conf == 'HIGH' and sev in ('CRITICAL','HIGH'):
+                    lifecycle = 'VALIDATED'
+                out.append({**f, 'lifecycle': lifecycle, 'confidence': conf, 'root_finding_id': roots.get(f.get('fingerprint'))})
+            self.results['finding_lifecycle'] = {'findings': out, 'count': len(out)}
+        except Exception:
+            pass
+
     async def cvss_score_findings(self):
         """Module 45 — CVSS 4.0 / 3.1 + CWE risk scoring.
 
@@ -6350,6 +6384,10 @@ class WebsiteRecon:
             "method": ("Heuristic CVSS 4.0 macro-vector + CVSS 3.1 base score + CWE mapping. "
                        "Not an authoritative NVD assessment — use for prioritisation only."),
         }
+        try:
+            self._apply_finding_lifecycle()
+        except Exception:
+            pass
 
     # ==================================================== MITRE ATT&CK Mapping (46)
     # Finding category → ATT&CK technique(s). Read-only mapping for defensive use.
