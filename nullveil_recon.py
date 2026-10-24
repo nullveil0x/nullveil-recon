@@ -7732,6 +7732,18 @@ class WebsiteRecon:
         return result
 
     # ======================================================== Finding helpers
+    def _finding_fingerprint(self, sev, chk, det, src=""):
+        """Stable fingerprint for cross-module deduplication & root-linking."""
+        try:
+            s = f"{str(sev or '').upper()}|{str(chk or '').lower().strip()}|{str(det or '').lower()}"
+            s = re.sub(r"https?://[^\s)]+", "URL", s)
+            s = re.sub(r"/[a-zA-Z0-9._\-/]{2,}", "/PATH", s)
+            s = re.sub(r"\b\d{1,6}\b", "N", s)
+            s = re.sub(r"\s+", " ", s).strip()[:500]
+            return hashlib.sha256(s.encode('utf-8', errors='ignore')).hexdigest()[:16]
+        except Exception:
+            return hashlib.sha256(f"{sev}|{chk}|{det}".encode('utf-8', errors='ignore')).hexdigest()[:16]
+
     def _collect_findings(self):
         """Flatten every finding across all modules into one normalised list.
 
@@ -7740,12 +7752,20 @@ class WebsiteRecon:
         modules so they all reason over the same evidence set."""
         F = []
         r = self.results
+        _fp_map = {}
 
         def add(sev, chk, det, src):
             det = str(det or "")
             # keep to a single line and a sane length for every consumer
             det = re.sub(r"\s+", " ", det).strip()[:400]
-            F.append((str(sev or "INFO").upper(), str(chk or ""), det, src))
+            sev_u = str(sev or "INFO").upper()
+            chk_s = str(chk or "")
+            fp = self._finding_fingerprint(sev_u, chk_s, det, src)
+            if fp not in _fp_map:
+                _fp_map[fp] = f"NVF-{fp.upper()}"
+            fid = _fp_map[fp]
+            # keep backward compatible 4-tuple but attach metadata
+            F.append((sev_u, chk_s, det, src, fid, fp))
 
         # generic (sev, check, detail) triples used across modules
         # (email_findings uses (sev, message) 2-tuples, so handle both shapes)
@@ -7799,8 +7819,28 @@ class WebsiteRecon:
         for s, c, d in (r.get("graph", {}) or {}).get("chains", [])[:0]:
             pass
         F.sort(key=lambda t: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2,
-                              "LOW": 3, "INFO": 4}.get(t[0], 5))
-        return F
+                              "LOW": 3, "INFO": 4}.get(t[0], 5) if isinstance(t,(list,tuple)) and t else 5)
+        try:
+            self.results['finding_index'] = {
+                "count": len(F),
+                "findings": [{"finding_id": f[4], "fingerprint": f[5], "severity": f[0],
+                              "check": f[1], "detail": f[2], "source": f[3]}
+                             for f in F if isinstance(f,(list,tuple)) and len(f)>=6]
+            }
+            roots={}
+            for f in F:
+                if isinstance(f,(list,tuple)) and len(f)>=6:
+                    roots[f[5]]=roots.get(f[5],f[4])
+            self.results['root_findings']=roots
+        except Exception:
+            pass
+        out=[]
+        for f in F:
+            if isinstance(f,(list,tuple)) and len(f)>=6:
+                out.append((f[0],f[1],f[2],f[3]))
+            elif isinstance(f,(list,tuple)):
+                out.append(f)
+        return out
 
     async def _verify_findings_pass(self):
         """Deep-accuracy pass (--verify).
@@ -8316,8 +8356,14 @@ class WebsiteRecon:
                 elif isinstance(f, (list, tuple)) and len(f) == 2:
                     add(f[0], src, f[1], src)
         F.sort(key=lambda t: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2,
-                              "LOW": 3, "INFO": 4}.get(t[0], 5))
-        return F
+                              "LOW": 3, "INFO": 4}.get(t[0], 5) if isinstance(t,(list,tuple)) and t else 5)
+        out=[]
+        for f in F:
+            if isinstance(f,(list,tuple)) and len(f)>=6:
+                out.append((f[0],f[1],f[2],f[3]))
+            elif isinstance(f,(list,tuple)):
+                out.append(f)
+        return out
 
     def _exec_metrics(self, report):
         s = report.get("summary", {})
