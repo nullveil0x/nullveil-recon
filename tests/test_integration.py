@@ -42,13 +42,19 @@ def test_http_recon_against_mock(nv, mock_target):
     assert r.results.get("http") is not None or r.scalar_results
 
 
-def test_js_secret_miner_finds_keys(nv, mock_target):
+def test_js_secret_miner_finds_keys_and_redacts(nv, mock_target):
     from tests.mock_target import _FAKE
     r = asyncio.run(_run(nv, mock_target, "js_secret_miner"))
     # The mock JS bundle is fetched from the page's <script src>.
     data = r.results.get("js_secret") or {}
     blob = str(data)
-    assert any(secret in blob for secret in _FAKE.values()), blob[:400]
+    assert data.get("secret_count", 0) >= 1, blob[:400]
+    # detection succeeded, but raw credential values must never be retained
+    assert not any(secret in blob for secret in _FAKE.values()), blob[:400]
+    assert "…" in blob
+    # masked JS secrets feed the same cross-module counter used by the report;
+    # duplicate occurrences of one credential collapse to one row
+    assert 1 <= len(r.results.get("secrets") or []) <= data.get("secret_count", 1)
 
 
 def test_cloud_storage_enum_no_crash(nv, mock_target):

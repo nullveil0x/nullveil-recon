@@ -77,7 +77,8 @@ import sys
 import argparse
 import base64
 from datetime import datetime
-from urllib.parse import urlparse, urljoin, parse_qs, unquote, quote
+from urllib.parse import (urlparse, urljoin, urlsplit, urlunsplit, parse_qs,
+                         parse_qsl, urlencode, unquote, quote)
 from collections import defaultdict, deque
 import ipaddress
 import os
@@ -1425,6 +1426,57 @@ def _wrap(text, width):
     return lines or [""]
 
 
+_SENSITIVE_QUERY_RE = re.compile(
+    r"(?i)(token|secret|passw|api[_ -]?key|access[_ -]?key|auth|session|"
+    r"sig|signature|credential|jwt|bearer)")
+
+
+def _redact_url(value):
+    """Mask credential-bearing URL parts (query values/userinfo) for reports.
+
+    Endpoint paths stay usable; only the value of a sensitive query parameter
+    is replaced. Raw values remain available only inside the live scan object.
+    """
+    s = str(value or "")
+    if not s:
+        return s
+    try:
+        parts = urlsplit(s)
+        q = parse_qsl(parts.query, keep_blank_values=True)
+        if q:
+            q = [(k, "REDACTED" if _SENSITIVE_QUERY_RE.search(k) else v)
+                 for k, v in q]
+            parts = parts._replace(query=urlencode(q, doseq=True))
+        netloc = parts.netloc
+        if "@" in netloc:
+            userinfo, host = netloc.rsplit("@", 1)
+            if ":" in userinfo:
+                userinfo = userinfo.split(":", 1)[0] + ":REDACTED"
+            netloc = userinfo + "@" + host
+        return urlunsplit(parts._replace(netloc=netloc))
+    except Exception:
+        return s
+
+
+def _redact_secret(value):
+    """Mask a secret-looking value before it reaches logs/PDF/HTML/JSON.
+
+    Only a short prefix/suffix plus the original length are retained, so the
+    report can prove *that* a pattern was found without leaking the credential.
+    Already-masked values are returned unchanged (idempotent).
+    """
+    s = str(value or "")
+    if not s:
+        return s
+    if "…" in s:
+        return s  # already masked; preserve its descriptive context
+    m = re.match(r'^([A-Za-z0-9 _\-/.]{1,40}:\s*)(.+)$', s)
+    label, secret = (m.group(1), m.group(2)) if m else ("", s)
+    if len(secret) <= 8:
+        return f"{label}… (len {len(secret)})"
+    return f"{label}{secret[:4]}…{secret[-3:]} (len {len(secret)})"
+
+
 def _risk_meter(secrets, missing_headers, flagged_paths):
     """Simple 0-100 exposure score based on findings."""
     score = min(100, len(secrets) * 15 + missing_headers * 4 + len(flagged_paths) * 6)
@@ -1820,6 +1872,12 @@ class WebsiteRecon:
             self._compute_diff(report)
         except Exception as e:
             self.results['errors'].append(f"diff: {e!r}")
+        # refresh the report so the change set (and any canonical counters it
+        # affects) is embedded in JSON/HTML/PDF and history, not just the CLI.
+        try:
+            report = self.export_dict()
+        except Exception as e:
+            self.results['errors'].append(f"report refresh: {e!r}")
 
         hid = self._history_save(report)
         if hid and not getattr(self, "quiet", False):
@@ -2084,7 +2142,8 @@ class WebsiteRecon:
                     continue
                 for m in list(matches)[:3]:
                     snippet = m if isinstance(m, str) else str(m)
-                    self.results['secrets'].append(f"{name}: {snippet[:120]}")
+                    # never persist a raw credential in scan results
+                    self.results['secrets'].append(_redact_secret(f"{name}: {snippet}"))
 
             # Exposed JS source maps / bundles (deep)
             if self.deep:
@@ -3646,16 +3705,19 @@ class WebsiteRecon:
             elif res is None:
                 matrix.append((name, "no", "-", "-", "not negotiated"))
                 if name in ("TLS 1.0", "TLS 1.1"):
-                    findings.append(("INFO", f"{name} disabled", f"{name} not offered ✅ (deprecated)"))
+                    findings.append(("INFO", f"{name} not offered",
+                                     f"Status: PASS — {name} is not offered (deprecated protocol "
+                                     f"safely disabled; CVSS N/A)"))
             else:
                 cipher, bits, nego = res
                 matrix.append((name, "yes", cipher, str(bits), nego))
                 if name == "TLS 1.0":
-                    findings.append(("INFO", "TLS 1.0 enabled",
-                                     "TLS 1.0 accepted — BEAST/POODLE-class risks (PCI DSS: disable)"))
+                    findings.append(("HIGH", "TLS 1.0 enabled",
+                                     "TLS 1.0 handshake accepted — BEAST/POODLE-class exposure; "
+                                     "disable TLS 1.0 (CWE-326)"))
                 elif name == "TLS 1.1":
-                    findings.append(("INFO", "TLS 1.1 enabled",
-                                     "TLS 1.1 accepted — deprecated (RFC 8996), disable it"))
+                    findings.append(("HIGH", "TLS 1.1 enabled",
+                                     "TLS 1.1 handshake accepted — deprecated (RFC 8996); disable it (CWE-326)"))
                 if WEAK_HARD_RE.search(cipher or ""):
                     findings.append(("HIGH", "Weak cipher", f"{name} negotiates broken-class cipher: {cipher} ({bits}-bit)"))
                 elif WEAK_LEGACY_RE.search(cipher or ""):
@@ -4316,10 +4378,13 @@ class WebsiteRecon:
                                     "status": "listed" if pc else "clean",
                                     "detail": f"{pc} pulse(s)" + (": " + "; ".join(pulse_names) if pulse_names else "")})
                     if pc:
-                        sev = "HIGH" if pc >= 5 else "MEDIUM"
-                        findings.append((sev, "OTX pulse match",
-                                         f"{indicator} appears in {pc} AlienVault threat pulse(s)"
-                                         + (f" — {', '.join(pulse_names)}" if pulse_names else "")))
+                        # External pulse match ≠ target compromised. Treated as
+                        # low-confidence, evidence-required intelligence only.
+                        findings.append(("LOW", "Threat Intelligence Match",
+                                         f"{indicator} appears in {pc} AlienVault OTX pulse(s)"
+                                         + (f" — {', '.join(pulse_names)}" if pulse_names else "")
+                                         + " · Status: REQUIRES_VALIDATION · confidence: MEDIUM · "
+                                           "external third-party match, not evidence of compromise"))
             except Exception:
                 continue
         if not sources:
@@ -4510,9 +4575,10 @@ class WebsiteRecon:
             if isinstance(f, (list, tuple)) and len(f) == 3 and f[1] == "Active phishing":
                 findings.append(f)      # (severity, check, detail) — same shape as ours
         if not key and not findings:
-            findings.append(("INFO", "Monitoring not active",
-                             "Breach/credential monitoring needs a free HIBP_API_KEY — "
-                             "dark-web marketplace scraping is intentionally not performed"))
+            findings.append(("INFO", "Breach Monitoring Not Configured",
+                             "Status: NOT_CONFIGURED — breach/credential monitoring needs a free "
+                             "HIBP_API_KEY; no breach or leaked-secret claim is made (CVSS N/A). "
+                             "Dark-web marketplace scraping is intentionally not performed"))
 
         self.results['breach'] = {"key_present": bool(key), "provider": "Have I Been Pwned",
                                   "checks": checks, "breaches": breaches,
@@ -4688,7 +4754,7 @@ class WebsiteRecon:
              lambda e: (NO, "weak/legacy transport crypto") if (e['tls10'] or e['tls11'] or e['weak_crypto']) else
              (YES, "TLS 1.2+ enforced in tested handshakes") if e['tls_run'] else (NEED, "run -a tls")),
             ("SOC 2 TSC", "P4.2", "Disposal of data / sensitive data exposure",
-             lambda e: (NO, f"{e['secrets_found']} secret/leak indicator(s) in public content") if e['secrets_found'] else
+             lambda e: (PART, f"{e['secrets_found']} secret pattern indicator(s) in public content — validate before treating as live") if e['secrets_found'] else
              (YES, "no secret patterns in public content") if e['secrets_run'] else (NEED, "run -a content")),
         ]
 
@@ -4709,14 +4775,25 @@ class WebsiteRecon:
             else:
                 frameworks[fw]["needed"] += 1
         total_c = sum(len(v["controls"]) for v in frameworks.values())
-        assessable = sum(v["pass"] + v["fail"] + v["partial"] for v in frameworks.values())
+        passes = sum(v["pass"] for v in frameworks.values())
         fails = sum(v["fail"] for v in frameworks.values())
+        partials = sum(v["partial"] for v in frameworks.values())
+        needed = sum(v["needed"] for v in frameworks.values())
+        assessable = passes + fails + partials
+        # Coverage / assessment completeness and pass rate are DIFFERENT
+        # metrics and are labelled as such everywhere they are shown.
         coverage = round(100 * assessable / total_c) if total_c else 0
+        pass_rate = round(100 * passes / assessable) if assessable else 0
         self.results['compliance'] = {
             "frameworks": {k: dict(v) for k, v in frameworks.items()},
             "coverage_pct": coverage,
+            "assessment_completeness_pct": coverage,
+            "pass_rate_pct": pass_rate,
             "total_controls": total_c,
+            "total_pass": passes,
+            "total_partial": partials,
             "total_fail": fails,
+            "evidence_required": needed,
             "disclaimer": ("Evidence-based partial technical mapping only. This is NOT a certification, "
                            "audit, or gap assessment — most controls require organizational evidence "
                            "(policies, contracts, logs, personnel). Use as input to a real audit program."),
@@ -5552,10 +5629,18 @@ class WebsiteRecon:
                     if key in secret_seen:
                         continue
                     secret_seen.add(key)
+                    # A matched pattern is a *candidate* credential, not proof
+                    # the key is live. Cap pattern-only secrets at HIGH and
+                    # require validation instead of auto-CRITICAL.
+                    if str(sev).upper() == "CRITICAL":
+                        sev = "HIGH"
                     masked = (raw[:6] + "…" + raw[-4:]) if len(raw) > 14 else raw[:4] + "…"
+                    ctx = re.sub(r"\s+", " ", text[max(0, m.start() - 30):m.end() + 30])[:160]
+                    # never retain the raw credential in the stored context
+                    ctx = ctx.replace(raw, masked)
                     secrets.append({"severity": sev, "type": name, "source": src,
                                     "masked": masked, "length": len(raw),
-                                    "context": re.sub(r"\s+", " ", text[max(0, m.start() - 30):m.end() + 30])[:160]})
+                                    "context": ctx})
             # dangerous sinks
             for name, rx, sev in self.JS_SINK_RULES:
                 for _ in re.finditer(rx, text):
@@ -5620,11 +5705,25 @@ class WebsiteRecon:
         for s in secrets:
             findings.append({"severity": s["severity"],
                              "check": f"JS secret — {s['type']}",
-                             "detail": f"{s['masked']} ({s['length']} chars) in {s['source']}",
+                             "detail": f"{s['masked']} ({s['length']} chars) in {s['source']} "
+                                       f"— pattern match, not proof the key is live; rotate if active",
                              "evidence": s.get("context", "")})
         for s in sinks:
             findings.append({"severity": s["severity"], "check": f"JS sink — {s['type']}",
                              "detail": s["source"], "evidence": ""})
+        # Keep one masked, cross-module secret list so the "secret patterns"
+        # counter and the findings table never disagree. The same credential
+        # found in app.js and its source map is one root issue, not two.
+        seen_secret_display = set()
+        for s in secrets:
+            skey = (s["type"], s.get("masked", ""), s.get("length", 0))
+            if skey in seen_secret_display:
+                continue
+            seen_secret_display.add(skey)
+            entry = _redact_secret(
+                f"JS secret ({s['type']}) in {s['source']}: {s['masked']}")
+            if entry not in self.results['secrets']:
+                self.results['secrets'].append(entry)
 
         endpoints = sorted(endpoints)
         self.results['js_secret'] = {
@@ -6292,7 +6391,8 @@ class WebsiteRecon:
 
 
     # -------------------------- Finding Lifecycle / Confidence (W/X)
-    FINDING_LIFECYCLE = ["DISCOVERED", "CANDIDATE", "OBSERVED", "VALIDATED", "VERIFIED", "REJECTED", "RESOLVED", "PERSISTENT"]
+    FINDING_LIFECYCLE = ["DISCOVERED", "CANDIDATE", "OBSERVED", "REQUIRES_VALIDATION",
+                         "VALIDATED", "VERIFIED", "REJECTED", "RESOLVED", "PERSISTENT"]
     CONFIDENCE_LEVELS = ["LOW", "MEDIUM", "HIGH", "VERIFIED"]
 
     def _apply_finding_lifecycle(self):
@@ -6310,15 +6410,33 @@ class WebsiteRecon:
                     conf = 'MEDIUM'
                 else:
                     conf = 'LOW'
-                if any(x in det or x in chk for x in ['verified','confirmed','reproduced']):
+                text = f"{chk} {det}"
+                if any(x in text for x in ['confirmed', 'reproduced', 'proof-of-concept executed',
+                                            'exploit successful']):
                     conf = 'VERIFIED'
-                if any(x in det or x in chk for x in ['informational','banner','version only']):
+                if any(x in text for x in ['informational', 'banner', 'version only']):
                     conf = 'LOW'
-                lifecycle = 'OBSERVED'
+                # Status is evidence-based, never inferred from severity. A
+                # HIGH finding that was merely observed is OBSERVED, not
+                # VALIDATED/VERIFIED.
                 if conf == 'VERIFIED':
                     lifecycle = 'VERIFIED'
-                elif conf == 'HIGH' and sev in ('CRITICAL','HIGH'):
+                elif any(x in text for x in ['requires_validation', 'requires validation']):
+                    lifecycle = 'REQUIRES_VALIDATION'
+                elif any(x in text for x in ['not configured', 'not_configured', 'no api key',
+                                              'missing api key', 'monitoring not configured']):
+                    lifecycle = 'NOT_CONFIGURED'
+                elif any(x in text for x in ['not proven', 'not_proven', 'not detected',
+                                              'not_detected', 'cannot be proven']):
+                    lifecycle = 'NOT_PROVEN'
+                elif any(x in text for x in ['timed out', 'timeout']):
+                    lifecycle = 'TIMEOUT'
+                elif any(x in text for x in ['error', 'failed to']):
+                    lifecycle = 'ERROR'
+                elif any(x in text for x in ['validated', 'validation']):
                     lifecycle = 'VALIDATED'
+                else:
+                    lifecycle = 'OBSERVED'
                 out.append({**f, 'lifecycle': lifecycle, 'confidence': conf, 'root_finding_id': roots.get(f.get('fingerprint'))})
             self.results['finding_lifecycle'] = {'findings': out, 'count': len(out)}
         except Exception:
@@ -6335,8 +6453,27 @@ class WebsiteRecon:
         live = self._collect_findings()
         if not live:
             live = self._collect_findings_from_report(self.export_dict())
-        entries, seen = [], set()
+        entries, seen, skipped = [], set(), []
         for sev, check, detail, src in live:
+            sev_u = str(sev or "").upper()
+            # CVSS is only meaningful for an actual, evidence-backed security
+            # issue. Info/PASS/NOT_CONFIGURED/NOT_PROVEN/OBSERVED/metadata rows
+            # get CVSS = N/A and never enter the risk register.
+            if sev_u not in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+                skipped.append({"check": check, "source_severity": sev_u,
+                                "reason": "informational"})
+                continue
+            # Pattern-only secret detection is not a confirmed live credential;
+            # CVSS stays N/A until the key is validated/rotated.
+            if (str(check).lower().startswith("js secret")
+                    or "pattern match, not proof" in str(detail).lower()):
+                skipped.append({"check": check, "source_severity": sev_u,
+                                "reason": "secret pattern only — validate before scoring"})
+                continue
+            if self._is_non_risk_text(check, detail):
+                skipped.append({"check": check, "source_severity": sev_u,
+                                "reason": "not an evidenced vulnerability"})
+                continue
             key = (check, detail[:80])
             if key in seen:
                 continue
@@ -6346,18 +6483,21 @@ class WebsiteRecon:
                 cat, self.CVSS_PROFILES["generic"])
             s4 = self._cvss4_score(macro)
             s31 = self._cvss31_score(vec31)
-            # combined risk = max of the two standards, kept honest vs the base sev
+            # combined risk = max of the two standards
             score = max(s4, s31)
             band = ("CRITICAL" if score >= 9.0 else "HIGH" if score >= 7.0
                     else "MEDIUM" if score >= 4.0 else "LOW")
-            # the source severity stays authoritative-ish; flag large deltas
+            # CVSS never overwrites the evidence-based source severity. The
+            # CVSS band is exposed separately as metadata, and divergence is
+            # flagged for reviewer attention instead of auto-escalating.
             delta = None
             base_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
             band_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-            if base_rank.get(sev, 0) != band_rank.get(band, 0):
-                delta = f"{sev}→{band}"
+            if base_rank.get(sev_u, 0) != band_rank.get(band, 0):
+                delta = f"{sev_u}→{band}"
             entries.append({
-                "severity": band, "source_severity": sev, "check": check,
+                "severity": sev_u, "cvss_severity": band,
+                "source_severity": sev_u, "check": check,
                 "source": src, "detail": detail[:200],
                 "cvss4_vector": f"CVSS:4.0/{macro}",
                 "cvss4_score": s4, "cvss31_vector": vec31, "cvss31_score": s31,
@@ -6398,6 +6538,7 @@ class WebsiteRecon:
             "distribution": dist,
             "top": top,
             "register": entries[:400],
+            "skipped": skipped[:200],
             "findings": findings,
             "method": ("Heuristic CVSS 4.0 macro-vector + CVSS 3.1 base score + CWE mapping. "
                        "Not an authoritative NVD assessment — use for prioritisation only."),
@@ -7079,7 +7220,17 @@ class WebsiteRecon:
         # (module 49 runs before the post-scan diff engine, so we cannot rely on
         #  self.results['diff'] here — compute an honest delta from the summaries.)
         def _risk(report_like):
-            sm = ((report_like or {}).get("report", report_like) or {}).get("summary", {}) or {}
+            rep = (report_like or {})
+            if isinstance(rep.get("report"), dict):
+                rep = rep["report"]
+            rk = (rep or {}).get("risk") or {}
+            if isinstance(rk, dict) and rk.get("score") is not None:
+                try:
+                    return int(rk.get("score") or 0)
+                except Exception:
+                    pass
+            sm = (rep or {}).get("summary", {}) or {}
+            # legacy fallback for pre-canonical history entries
             return (int(sm.get("cve_issues", 0) or 0) * 6
                     + int(sm.get("secrets", 0) or 0) * 8
                     + int(sm.get("takeover_risks", 0) or 0) * 10
@@ -7089,17 +7240,18 @@ class WebsiteRecon:
         prev_score = _risk(prev)
         cur_score = _risk(current)
         delta = cur_score - prev_score
-        SEV = {"ports": "HIGH", "api_endpoints": "HIGH", "subdomains": "MEDIUM",
-              "paths": "MEDIUM", "users": "LOW", "cookies": "LOW", "js_files": "LOW",
-              "tech_stack": "INFO"}
+        # Newly observed assets are informational drift, not vulnerabilities.
+        SEV = {"ports": "INFO", "api_endpoints": "INFO", "subdomains": "INFO",
+               "paths": "INFO", "users": "INFO", "cookies": "INFO", "js_files": "INFO",
+               "tech_stack": "INFO"}
         findings = []
         for k, items in added.items():
             if not items:
                 continue
             findings.append({
                 "severity": SEV.get(k, "INFO"),
-                "check": f"watch: new {k.rstrip('s')}",
-                "detail": f"{len(items)} new {k}: {', '.join(items[:6])}" + (" …" if len(items) > 6 else ""),
+                "check": f"watch: observed new {k.rstrip('s')}",
+                "detail": f"Status: OBSERVED — {len(items)} new {k}: {', '.join(items[:6])}" + (" …" if len(items) > 6 else ""),
                 "evidence": f"baseline {prev.get('when', '')[:19]}",
             })
         for k, items in removed.items():
@@ -7806,16 +7958,22 @@ class WebsiteRecon:
 
     # ======================================================== Finding helpers
     def _finding_fingerprint(self, sev, chk, det, src=""):
-        """Stable fingerprint for cross-module deduplication & root-linking."""
+        """Stable root fingerprint for cross-module deduplication & root-linking.
+
+        The fingerprint deliberately excludes severity/source: severity is a
+        derived attribute, not part of a finding's identity. If the same root
+        cause is observed by two modules (or re-observed with a different
+        severity) it must collapse into one root finding.
+        """
         try:
-            s = f"{str(sev or '').upper()}|{str(chk or '').lower().strip()}|{str(det or '').lower()}"
+            s = f"{str(chk or '').lower().strip()}|{str(det or '').lower()}"
             s = re.sub(r"https?://[^\s)]+", "URL", s)
             s = re.sub(r"/[a-zA-Z0-9._\-/]{2,}", "/PATH", s)
             s = re.sub(r"\b\d{1,6}\b", "N", s)
             s = re.sub(r"\s+", " ", s).strip()[:500]
             return hashlib.sha256(s.encode('utf-8', errors='ignore')).hexdigest()[:16]
         except Exception:
-            return hashlib.sha256(f"{sev}|{chk}|{det}".encode('utf-8', errors='ignore')).hexdigest()[:16]
+            return hashlib.sha256(f"{chk}|{det}".encode('utf-8', errors='ignore')).hexdigest()[:16]
 
     def _collect_findings(self):
         """Flatten every finding across all modules into one normalised list.
@@ -7825,7 +7983,8 @@ class WebsiteRecon:
         modules so they all reason over the same evidence set."""
         F = []
         r = self.results
-        _fp_map = {}
+        _fp_index = {}
+        _sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
         def add(sev, chk, det, src):
             det = str(det or "")
@@ -7834,9 +7993,25 @@ class WebsiteRecon:
             sev_u = str(sev or "INFO").upper()
             chk_s = str(chk or "")
             fp = self._finding_fingerprint(sev_u, chk_s, det, src)
-            if fp not in _fp_map:
-                _fp_map[fp] = f"NVF-{fp.upper()}"
-            fid = _fp_map[fp]
+            fid = f"NVF-{fp.upper()}"
+            # Merge into the existing root finding instead of creating a
+            # duplicate row: combine evidence + source, keep the highest
+            # severity observed for that root cause.
+            if fp in _fp_index:
+                i = _fp_index[fp]
+                old = F[i]
+                merged_sev = old[0]
+                if _sev_rank.get(sev_u, 9) < _sev_rank.get(old[0], 9):
+                    merged_sev = sev_u
+                merged_det = old[2]
+                if det and det.lower() not in old[2].lower():
+                    merged_det = (old[2] + " | " + det)[:400] if old[2] else det
+                merged_src = old[3]
+                if src and src not in str(old[3]).split(','):
+                    merged_src = (str(old[3]) + "," + str(src)).strip(',') if old[3] else str(src)
+                F[i] = (merged_sev, old[1], merged_det, merged_src, old[4], fp)
+                return
+            _fp_index[fp] = len(F)
             # keep backward compatible 4-tuple but attach metadata
             F.append((sev_u, chk_s, det, src, fid, fp))
 
@@ -7862,10 +8037,10 @@ class WebsiteRecon:
         # as their own report sections and are linked back to the root finding.
         for key, src in (("nuclei", "nuclei"), ("supply", "supply"), ("anomaly", "anomaly"),
                          ("intel", "intel"), ("breach", "breach"), ("correlation", "correlate"),
-                         ("compliance", "comp"), ("js_secret", "jssecret"),
+                         ("js_secret", "jssecret"),
                          ("wayback", "wayback"), ("param", "param"),
                          ("graphql", "gql"), ("cloud", "cloud"),
-                         ("cve_intel", "cveintel"), ("takeover_v3", "takeover"),
+                         ("takeover_v3", "takeover"),
                          ("watch", "watch")):
             blob = r.get(key) or {}
             for f in (blob.get("findings") or []) if isinstance(blob, dict) else []:
@@ -7914,6 +8089,89 @@ class WebsiteRecon:
             elif isinstance(f,(list,tuple)):
                 out.append(f)
         return out
+
+    # Derived / informational states that must never create exposure or CVSS.
+    NON_RISK_MARKERS = (
+        "not configured", "not_configured", "not proven", "not_proven",
+        "not detected", "not_detected", "not offered", "not_offered",
+        "informational", "information only", "metadata only",
+        "requires_validation", "requires validation", "not testable", "not_testable",
+        "status: pass", "status: passed", "pass —", "pass -", "pass (",
+        "no issues", "no finding", "timed out", "request timeout",
+        "connection timeout", "error contacting", "scan error",
+    )
+    CONFIG_GAP_MARKERS = (
+        "configuration gap", "missing spf", "no spf", "missing dmarc", "no dmarc",
+        "missing dkim", "dkim not detected", "mta-sts", "security header",
+        "hsts missing", "csp missing", "x-content-type", "referrer-policy",
+        "permissions-policy", "missing header",
+    )
+
+    @classmethod
+    def _is_config_gap_text(cls, check, detail):
+        text = f"{check} {detail}".lower()
+        return any(m in text for m in cls.CONFIG_GAP_MARKERS)
+
+    @classmethod
+    def _is_non_risk_text(cls, check, detail):
+        text = f"{check} {detail}".lower()
+        return any(m in text for m in cls.NON_RISK_MARKERS)
+
+    def calculate_risk_score(self, findings=None):
+        """THE canonical 0-100 exposure risk score.
+
+        Derived only from deduplicated root findings. Informational, PASS,
+        NOT_CONFIGURED, NOT_PROVEN, OBSERVED and metadata rows are ignored;
+        configuration gaps are de-weighted and verified findings carry a
+        small confidence bonus. Every output (PDF, dashboard, JSON, HTML)
+        must consume this single value.
+        """
+        if findings is None:
+            try:
+                findings = self._dedupe_findings(self._collect_findings())
+            except Exception:
+                findings = []
+        weights = {"CRITICAL": 18.0, "HIGH": 8.0, "MEDIUM": 3.0, "LOW": 1.0}
+        # verified lifecycle entries, if already computed
+        verified = set()
+        try:
+            lc = (self.results.get('finding_lifecycle') or {}).get('findings') or []
+            for vf in lc:
+                if str(vf.get('lifecycle', '')).upper() == 'VERIFIED':
+                    verified.add((str(vf.get('check', '')), str(vf.get('detail', ''))[:80]))
+        except Exception:
+            pass
+        score = 0.0
+        seen = set()
+        for f in findings or []:
+            if not isinstance(f, (list, tuple)) or len(f) < 3:
+                continue
+            sev = str(f[0] or '').upper()
+            if sev not in weights:
+                continue
+            chk, det = str(f[1] or ''), str(f[2] or '')
+            key = (chk.lower().strip(), re.sub(r'\s+', ' ', det.lower())[:160])
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._is_non_risk_text(chk, det):
+                continue
+            w = weights[sev]
+            if self._is_config_gap_text(chk, det):
+                w *= 0.4
+            try:
+                if (chk, det[:80]) in verified or any(
+                        vc == chk and det.startswith(vd) for vc, vd in verified):
+                    w *= 1.2
+            except Exception:
+                pass
+            score += w
+        score = int(round(min(100.0, max(0.0, score))))
+        verdict = ("CRITICAL EXPOSURE" if score >= 80 else
+                   "HIGH EXPOSURE" if score >= 50 else
+                   "MODERATE EXPOSURE" if score >= 20 else
+                   "LOW EXPOSURE" if score > 0 else "NO KNOWN EXPOSURE")
+        return score, verdict
 
     async def _verify_findings_pass(self):
         """Deep-accuracy pass (--verify).
@@ -8095,8 +8353,8 @@ class WebsiteRecon:
          "; MTA-STS / TLS-RPT (optional but recommended)\n_mta-sts.yourdomain.com.  TXT  \"v=STSv1; id=20260101T000000\"\n_smtp._tls.yourdomain.com. TXT \"v=TLSRPTv1; rua=mailto:tlsrpt@yourdomain.com\"\n```\n"
          "* Run with `p=none` + `rua` for a week, read the aggregate reports, then tighten to `p=quarantine` → `p=reject`.\n"
          "* Add `include:` only for providers that actually send mail; one bad `include` can blow the 10-lookup SPF limit."),
-        (r"(?i)(secret|api[_ -]?key|token|credential|leak|\.env|private key)",
-         "Rotate leaked secrets and remove them from artefacts",
+        (r"(?i)(js secret|exposed secret|secret pattern|api[_ -]?key|access key|\.env|private key|stripe|sendgrid|slack token|openai key)",
+         "Rotate exposed secret candidates and remove them from artefacts",
          "1. **Rotate now** — treat any credential exposed to an unauthenticated client as compromised.\n"
          "2. Move secrets to a secret manager (Vault / AWS Secrets Manager / SSM), never in JS or repos.\n"
          "3. Purge from source history (`git filter-repo`) and invalidate old tokens.\n"
@@ -8126,7 +8384,14 @@ class WebsiteRecon:
          "Add rate-limiting / anti-automation",
          "```nginx\nlimit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;\nlocation /api/ { limit_req zone=api burst=20 nodelay; }\n```\n"
          "* Cloudflare: **Security → WAF → Rate limiting rules** per path.\n* Add generic error messages + account lockout/CAPTCHA on auth."),
-        (r"(?i)(waf|cdn|cloudflare)",
+        (r"(?i)(subresource integrity|\bsri\b|integrity attribute|integrity=\"sha)",
+         "Add Subresource Integrity (SRI) to third-party executable assets",
+         "* Add a cryptographic `integrity` hash (and `crossorigin=\"anonymous\"` where required) to every\n"
+         "  external `<script>` / `<link rel=\"stylesheet\">`; browsers then refuse tampered files.\n"
+         "* Pin exact trusted versions and review them on update; prefer self-hosting critical assets.\n"
+         "* Remove third-party scripts that are not strictly necessary.\n"
+         "* This is an application/HTML hardening fix — a WAF or CDN is not a substitute for SRI."),
+        (r"(?i)(waf|web application firewall)",
          "Front the edge with a WAF/CDN",
          "Put the origin behind Cloudflare/AWS WAF: enable managed + OWASP rule sets, "
          "bot management, and hide the origin IP. Lock the origin firewall to the WAF IP ranges only."),
@@ -8231,11 +8496,20 @@ class WebsiteRecon:
                          "cmd": f"for ep in heapdump env beans mappings; do "
                                 f"curl -sSI {base}/actuator/$ep | head -1; done"})
         if re.search(r"(?i)\bport\b|open port|listening", c):
-            m = re.search(r"(?:port[:\s#]*)(\d{1,5})", detail, re.I) or re.search(r"\b(\d{2,5})\b", detail)
+            # Only generate a connection PoC for a port that was actually found
+            # open in THIS scan. Never infer a port number from unrelated
+            # digits/IDs (avoids "confirm TCP port 76" on a scan with 0 ports).
+            try:
+                open_ports = set(_norm_ports(self.results.get('ports', [])))
+            except Exception:
+                open_ports = set()
+            m = re.search(r"(?:port[:\s#]*)(\d{1,5})", detail, re.I)
             if m:
-                cmds.append({"desc": f"Confirm TCP port {m.group(1)} is open (connect only)",
-                             "cmd": f"curl -sS --connect-timeout 3 telnet://{host}:{m.group(1)} </dev/null || "
-                                    f"nc -z -w3 {host} {m.group(1)} && echo open"})
+                pnum = int(m.group(1))
+                if pnum in open_ports:
+                    cmds.append({"desc": f"Confirm TCP port {pnum} is open (connect only)",
+                                 "cmd": f"curl -sS --connect-timeout 3 telnet://{host}:{pnum} </dev/null || "
+                                        f"nc -z -w3 {host} {pnum} && echo open"})
         if re.search(r"(?i)path|admin|swagger|api|endpoint|directory|expos", c):
             m = re.search(r"(/[A-Za-z0-9_\-./?=&%]+)", detail)
             p = m.group(1) if m else "/"
@@ -8295,7 +8569,10 @@ class WebsiteRecon:
 
     # ======================================================== Webhook Notify (37)
     def _alert_severity_counts(self, report):
-        """Count severities across the whole report (for alert severity)."""
+        """Count severities from the canonical root dataset when present."""
+        if isinstance(report.get("severity_counts"), dict):
+            return {k: int(report["severity_counts"].get(k, 0) or 0)
+                    for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
         F = self._collect_findings_from_report(report)
         return {k: len([f for f in F if f[0] == k])
                 for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
@@ -8317,7 +8594,7 @@ class WebsiteRecon:
             "",
             f"• Severity: 🔴 {crit} critical · 🟠 {high} high · 🟡 {sev['MEDIUM']} medium · 🔵 {sev['LOW']} low",
             f"• Subdomains: {s.get('subdomains', 0)}  • Open ports: {s.get('open_ports', 0)}",
-            f"• Secrets: {s.get('secrets', 0)}  • API endpoints: {s.get('api_endpoints', 0)}",
+            f"• Secret patterns: {s.get('secrets', 0)}  • API endpoints: {s.get('api_endpoints', 0)}",
             f"• CVE issues: {s.get('cve_issues', 0)}  • Admin-API: {s.get('admin_api_findings', 0)}",
             f"• New since last scan: {s.get('diff_new_assets', 0)} (score {s.get('diff_score', 0)}/100)",
         ]
@@ -8434,12 +8711,14 @@ class WebsiteRecon:
                          ("breach", "breach"), ("scan_diff", "diff"),
                          ("admin_api", "auth"), ("burp_caido", "burp"),
                          ("nuclei", "nuclei"), ("threat_intel", "intel"),
-                         ("correlation", "correlate"), ("compliance", "comp"),
+                         ("correlation", "correlate"),
                          ("anomaly", "anomaly"), ("js_secret", "jssecret"),
                          ("wayback", "wayback"), ("params", "param"),
                          ("graphql", "gql"), ("cloud_storage", "cloud"),
-                         ("cvss", "cvss"), ("mitre_attack", "attack"),
-                         ("cve_intel", "cveintel"), ("takeover_v3", "takeover"),
+                         # derived/enrichment sections are intentionally NOT
+                         # re-collected as findings: CVSS, ATT&CK, PoC and
+                         # remediation are child metadata of a root finding.
+                         ("takeover_v3", "takeover"),
                          ("watch", "watch")):
             blob = r.get(key)
             if not isinstance(blob, dict):
@@ -8466,7 +8745,16 @@ class WebsiteRecon:
         s = report.get("summary", {})
         live = self._collect_findings() if getattr(self, "results", None) else []
         if not live:
-            live = self._collect_findings_from_report(report)
+            # Prefer the canonical root-finding array embedded in the report
+            # (dashboard/PDF-from-history path) over re-deriving from module
+            # sections, which can re-introduce duplicates or metadata.
+            canon = report.get("findings") or \
+                (report.get("finding_lifecycle") or {}).get("findings") or []
+            if canon:
+                live = [(f.get("severity"), f.get("check"), f.get("detail"), f.get("source"))
+                        for f in canon if isinstance(f, dict)]
+            if not live:
+                live = self._collect_findings_from_report(report)
         F = self._dedupe_findings(live)
         # Zero-noise policy: executive shows only actionable findings
         actionable = []
@@ -8484,43 +8772,45 @@ class WebsiteRecon:
             except Exception:
                 continue
         F_exec = actionable if actionable else [f for f in F if f[0] != "INFO"]
-        # Prefer verified findings for scoring weight
-        lc = (report.get('finding_lifecycle') or (getattr(self,'results',{}) or {}).get('finding_lifecycle') if hasattr(self,'results') else {}) or {}
-        verified = set()
-        for vf in (lc.get('findings') or []):
-            if str(vf.get('lifecycle','')).upper() == 'VERIFIED':
-                verified.add((vf.get('check'), str(vf.get('detail',''))[:80]))
-        sev_count = {k: len([f for f in F_exec if f[0] == k])
-                     for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
-        crit, high, med = sev_count["CRITICAL"], sev_count["HIGH"], sev_count["MEDIUM"]
-        vcrit = sum(1 for f in F_exec if f[0]=='CRITICAL' and (f[1], str(f[2])[:80]) in verified)
-        vhigh = sum(1 for f in F_exec if f[0]=='HIGH' and (f[1], str(f[2])[:80]) in verified)
-        # Contextual scoring - configuration gaps don't auto-max out score
-        config_gap = 0
-        for f in F_exec:
-            chk = str(f[1] or "").lower(); det = str(f[2] or "").lower()
-            if any(x in chk or x in det for x in ['missing spf','missing dmarc','missing dkim','security header','hsts missing','csp missing','x-content-type','referrer-policy','permissions-policy']):
-                if f[0] in ('CRITICAL','HIGH'):
-                    config_gap += 1
-        score = crit * 16 + high * 7 + med * 2 + vcrit * 4 + vhigh * 2 + (s.get("secrets", 0) or 0) * 3 + (s.get("takeover_risks", 0) or 0) * 8
-        # Reduce weight of pure config gaps
-        if config_gap and crit == 0 and high <= 2:
-            score = int(score * 0.7)
-        score = min(95, max(0, score))
-        verdict = ("CRITICAL EXPOSURE" if score >= 80 else "HIGH EXPOSURE" if score >= 50 else "MODERATE EXPOSURE" if score >= 20 else "LOW RISK")
+        # ONE canonical score — computed once in export_dict(), reused by the
+        # PDF, dashboard, HTML and JSON. Only recompute as a fallback when
+        # rendering a legacy report that predates the canonical field.
+        rk = report.get("risk") or {}
+        if rk.get("score") is not None:
+            score = int(rk.get("score") or 0)
+            verdict = str(rk.get("verdict") or "")
+            if not verdict:
+                verdict = ("CRITICAL EXPOSURE" if score >= 80 else
+                           "HIGH EXPOSURE" if score >= 50 else
+                           "MODERATE EXPOSURE" if score >= 20 else
+                           "LOW EXPOSURE" if score > 0 else "NO KNOWN EXPOSURE")
+        else:
+            score, verdict = self.calculate_risk_score(F_exec)
+        # Severity counts must come from the canonical root dataset (when the
+        # report carries it), not from the filtered executive view.
+        if isinstance(report.get("severity_counts"), dict):
+            sev_count = {k: int(report["severity_counts"].get(k, 0) or 0)
+                         for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+        else:
+            sev_count = {k: len([f for f in F if f[0] == k])
+                         for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
         comp = report.get("compliance", {}) or {}
         return {
             "score": score, "verdict": verdict, "sev": sev_count,
             "findings": F_exec,
             "top_risks": [f for f in F_exec if f[0] in ("CRITICAL", "HIGH")][:12],
             "compliance": {"coverage_pct": comp.get("coverage_pct", 0),
+                           "pass_rate_pct": comp.get("pass_rate_pct", 0),
+                           "assessment_completeness_pct": comp.get("assessment_completeness_pct",
+                                                                   comp.get("coverage_pct", 0)),
+                           "evidence_required": comp.get("evidence_required", 0),
                            "total_fail": comp.get("total_fail", 0),
                            "total_controls": comp.get("total_controls", 0),
                            "frameworks": comp.get("frameworks", {}),
                            "disclaimer": comp.get("disclaimer", "Indicative Technical Control Mapping — not a certification/compliance attestation")},
             "kpis": {
                 "subdomains": s.get("subdomains", 0), "open_ports": s.get("open_ports", 0),
-                "secrets": s.get("secrets", 0), "api_endpoints": s.get("api_endpoints", 0),
+                "secret_patterns": s.get("secrets", 0), "api_endpoints": s.get("api_endpoints", 0),
                 "cve_issues": s.get("cve_issues", 0), "takeover_risks": s.get("takeover_risks", 0),
                 "admin_api_findings": s.get("admin_api_findings", 0),
                 "new_since_last_scan": s.get("diff_new_assets", 0),
@@ -8533,21 +8823,105 @@ class WebsiteRecon:
         m = self._exec_metrics(report)
         tgt = _e(str(report.get("target", "")))
         when = _e(str(report.get("started", ""))[:19].replace("T", " "))
-        col = "#ef4444" if m["score"] >= 70 else "#f97316" if m["score"] >= 40 else "#eab308" if m["score"] >= 15 else "#22c55e"
-        kr = "".join(f"<div class='kpi'><div class='kv'>{_e(str(v))}</div><div class='kl'>{_e(k)}</div></div>"
+        col = "#ef4444" if m["score"] >= 80 else "#f97316" if m["score"] >= 50 else "#eab308" if m["score"] >= 20 else "#22c55e"
+        kr = "".join(f"<div class='kpi'><div class='kv'>{_e(str(v))}</div>"
+                     f"<div class='kl'>{_e(str(k).replace('_', ' ').upper())}</div></div>"
                      for k, v in m["kpis"].items())
-        risks = "".join(
-            f"<tr><td><span class='chip' style='background:{'#ef4444' if s=='CRITICAL' else '#f97316'}'>{_e(s)}</span></td>"
-            f"<td><b>{_e(c)}</b><div class='det'>{_e(d)}</div></td></tr>"
-            for s, c, d, _src in m["top_risks"]) or "<tr><td colspan='2'>No high-severity findings 🎉</td></tr>"
-        prio = "".join(
-            f"<li><b>{_e(p['title'])}</b> <span class='chip b'>{_e(p['severity'])}</span>"
-            f"<div class='det'>{_e(p['check'])} — {_e(p['finding'][:160])}</div></li>"
-            for p in (((getattr(self, "results", None) or {}).get('patch', {}) or {}).get('patches', [])[:10]))
+        # Root-finding metadata (CVSS/CWE/lifecycle/confidence) is rendered as
+        # CHILD columns of one root finding — never as separate finding rows.
+        cvss_map = {}
+        for e in ((report.get('cvss') or {}).get('register') or []):
+            try:
+                cvss_map[(str(e.get('check', '')), str(e.get('detail', ''))[:80])] = e
+                if e.get('fingerprint'):
+                    cvss_map[e['fingerprint']] = e
+            except Exception:
+                continue
+        life_map = {}
+        for lf in ((report.get('finding_lifecycle') or {}).get('findings') or []):
+            try:
+                life_map[(str(lf.get('check', '')), str(lf.get('detail', ''))[:80])] = lf
+            except Exception:
+                continue
+        patch_src = ((getattr(self, "results", None) or {}).get('patch') or
+                     report.get('remediation') or {})
+        # Remediation is child metadata of the root finding, not a second
+        # finding list. Match patches back to their root by check name.
+        remed_map = {}
+        for p in (patch_src.get('patches', []) or []):
+            try:
+                remed_map[str(p.get('check', ''))] = p
+            except Exception:
+                continue
+        risk_rows = []
+        for s, c, d, _src in m["top_risks"]:
+            e = cvss_map.get((str(c), str(d)[:80])) or {}
+            lf = life_map.get((str(c), str(d)[:80])) or {}
+            cvss_txt = (f"{e.get('score')} · {_e(str(e.get('cwe') or 'N/A'))}"
+                        if e.get('score') is not None else "N/A")
+            state = (f"{_e(str(lf.get('lifecycle', 'OBSERVED')))} / "
+                     f"{_e(str(lf.get('confidence', 'LOW')))}") if lf else "DISCOVERED / LOW"
+            chip = "#ef4444" if s == "CRITICAL" else "#f97316" if s == "HIGH" else "#eab308"
+            fix = remed_map.get(str(c)) or {}
+            fix_txt = (f"<div class='det'><b>Remediation:</b> "
+                       f"{_e(str(fix.get('title') or ''))}</div>") if fix else ""
+            risk_rows.append(
+                f"<tr><td><span class='chip' style='background:{chip}'>{_e(s)}</span></td>"
+                f"<td><b>{_e(c)}</b><div class='det'>{_e(d)}</div>{fix_txt}</td>"
+                f"<td>{cvss_txt}</td><td>{state}</td></tr>")
+        risks = "".join(risk_rows) or "<tr><td colspan='4'>No high-severity findings 🎉</td></tr>"
         comp = m["compliance"]
-        fw = "".join(f"<tr><td>{_e(k)}</td><td>{_e(str(v))}</td></tr>"
+
+        def _fw_block(name, v):
+            p = int(v.get('pass', 0) or 0)
+            fa = int(v.get('fail', 0) or 0)
+            pr = int(v.get('partial', 0) or 0)
+            nd = int(v.get('needed', 0) or 0)
+            total = p + fa + pr + nd
+            assessed = p + fa + pr
+            passr = round(100 * p / assessed) if assessed else 0
+            ctrls = v.get('controls') or []
+            body = "".join(
+                f"<tr><td>{_e(str(c.get('ref', '')))}</td>"
+                f"<td>{_e(str(c.get('title', ''))[:110])}</td>"
+                f"<td><span class='chip st-{_e(str(c.get('status', '')).lower().replace(' ', '-'))}'>"
+                f"{_e(str(c.get('status', '')))}</span></td>"
+                f"<td>{_e(str(c.get('evidence', ''))[:180])}</td></tr>"
+                for c in ctrls)
+            return (
+                f"<h3>{_e(name)}</h3>"
+                f"<div class='comp-sum'>"
+                f"<span><b>{p}</b>PASS</span>"
+                f"<span><b>{pr}</b>PARTIAL</span>"
+                f"<span><b>{fa}</b>FAIL</span>"
+                f"<span><b>{nd}</b>EVIDENCE REQUIRED</span>"
+                f"<span><b>{total}</b>TOTAL CONTROLS</span>"
+                f"<span><b>{passr}%</b>PASS RATE</span>"
+                f"<span><b>{round(100 * assessed / total) if total else 0}%</b>ASSESSMENT COMPLETENESS</span>"
+                f"</div>"
+                + (f"<table class='comp controls'><thead><tr><th>Control</th><th>Title</th>"
+                   f"<th>Status</th><th>Evidence</th></tr></thead><tbody>{body}</tbody></table>"
+                   if body else ""))
+
+        fw = "".join(_fw_block(k, v)
                      for k, v in (comp.get("frameworks") or {}).items()) or \
-             "<tr><td colspan='2'>Compliance module not run (−a comp)</td></tr>"
+             "<p>No framework breakdown available.</p>"
+        if int(comp.get("total_controls", 0) or 0) > 0:
+            comp_block = (
+                "<p class=\"det\">Evidence-based technical control mapping observed during "
+                "this assessment — not a certification or audit attestation. Coverage / "
+                "assessment completeness measures how many controls could be assessed, "
+                "while PASS RATE measures how many assessed controls passed.</p>"
+                "<table><tbody>"
+                f"<tr><td>Assessment completeness (coverage)</td><td><b>{_e(str(comp.get('coverage_pct', 0)))}%</b> of controls assessable</td></tr>"
+                f"<tr><td>Pass rate (assessed controls only)</td><td><b>{_e(str(comp.get('pass_rate_pct', 0)))}%</b></td></tr>"
+                f"<tr><td>Evidence required / not assessable</td><td><b>{_e(str(comp.get('evidence_required', 0)))}</b></td></tr>"
+                f"<tr><td>Total controls</td><td>{_e(str(comp.get('total_controls', 0)))} · {_e(str(comp.get('total_fail', 0)))} failing</td></tr>"
+                f"</tbody></table>{fw}"
+            )
+        else:
+            comp_block = ("<p class='det'>Compliance module not run — no control status is "
+                          "claimed. Re-run with <b>-a 23</b> to include compliance mapping.</p>")
         return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NULLVEIL Executive Report — {tgt}</title>
@@ -8565,25 +8939,45 @@ class WebsiteRecon:
  .kpis{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px}}
  .kpi{{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;text-align:center}}
  .kv{{font-size:24px;font-weight:800}} .kl{{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}}
- table{{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}}
- th,td{{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top;font-size:14px}}
+ table{{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden;table-layout:fixed}}
+ th,td{{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top;font-size:14px;
+        word-break:break-word;overflow-wrap:anywhere}}
+ table.comp td,table.comp th{{font-size:13px;padding:7px 9px}}
+ table.controls tr:hover td{{background:#f9fafb}}
+ table.controls th:nth-child(1),table.controls td:nth-child(1){{width:12%}}
+ table.controls th:nth-child(2),table.controls td:nth-child(2){{width:40%}}
+ table.controls th:nth-child(3),table.controls td:nth-child(3){{width:18%}}
+ table.controls th:nth-child(4),table.controls td:nth-child(4){{width:30%}}
+ table.risks{{table-layout:fixed}}
+ table.risks th:nth-child(1),table.risks td:nth-child(1){{width:14%;white-space:nowrap}}
+ table.risks th:nth-child(2),table.risks td:nth-child(2){{width:52%}}
+ table.risks th:nth-child(3),table.risks td:nth-child(3){{width:14%}}
+ table.risks th:nth-child(4),table.risks td:nth-child(4){{width:20%}}
+ .comp-sum{{display:flex;flex-wrap:wrap;gap:6px 18px;background:#fff;border:1px solid var(--line);
+            border-radius:10px;padding:10px 12px;margin:8px 0}}
+ .comp-sum span{{font-size:11px;color:var(--mut);white-space:nowrap}}
+ .comp-sum b{{font-size:14px;color:#111827;margin-right:5px}}
  .chip{{color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}} .chip.b{{background:#6b7280}}
+ .chip.st-pass{{background:#16a34a}} .chip.st-partial{{background:#d97706}}
+ .chip.st-fail{{background:#dc2626}} .chip.st-evidence-required, .chip.st-not-assessable{{background:#6b7280}}
+ h3{{font-size:15px;margin:20px 0 8px}}
  .det{{color:var(--mut);font-size:12px}} ul{{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 18px 14px 34px}}
  li{{margin:8px 0}} footer{{color:var(--mut);font-size:12px;margin-top:30px;border-top:1px solid var(--line);padding-top:12px}}
- @media print{{body{{background:#fff}} .wrap{{padding:0}}}}
+ @media print{{body{{background:#fff}} .wrap{{padding:0}} h2{{break-after:avoid}} table{{break-inside:auto}} tr{{break-inside:avoid}}}}
+ @page{{size:A4;margin:14mm 10mm 16mm 10mm;
+        @bottom-center{{content:"NULLVEIL — page " counter(page) " of " counter(pages);
+                        font-size:10px;color:#6b7280}}}}
 </style></head><body><div class="wrap">
 <header><h1>Executive Security Report</h1>
 <div class="sub">Target <b>{tgt}</b> · {when} · NULLVEIL Recon v{_e(str(report.get('version','')))}</div></header>
-<div class="meter"><div class="score">{m['score']}/100</div><div class="verdict">{_e(m['verdict'])}</div>
+<div class="meter"><div style="font-size:11px;letter-spacing:1px;color:var(--mut);text-transform:uppercase">Exposure Risk</div>
+<div class="score">{m['score']}/100</div><div class="verdict">{_e(m['verdict'])}</div>
 <div class="track"><i></i></div>
 <p style="margin:14px 0 0;color:var(--mut)">Severity mix — CRITICAL {m['sev']['CRITICAL']} · HIGH {m['sev']['HIGH']} · MEDIUM {m['sev']['MEDIUM']} · LOW {m['sev']['LOW']} · INFO {m['sev']['INFO']}</p></div>
 <div class="kpis">{kr}</div>
-<h2>Top Risks</h2><table><tbody>{risks}</tbody></table>
+<h2>Top Risks</h2><table class='risks'><thead><tr><th>Severity</th><th>Root finding</th><th>CVSS · CWE</th><th>Lifecycle / Confidence</th></tr></thead><tbody>{risks}</tbody></table>
 <h2>Compliance Snapshot</h2>
-<table><tbody><tr><th>Framework / metric</th><th>Value</th></tr>
-<tr><td>Overall coverage</td><td>{_e(str(comp.get('coverage_pct', 0)))}% ({_e(str(comp.get('total_fail', 0)))} failing controls of {_e(str(comp.get('total_controls', 0)))})</td></tr>
-{fw}</tbody></table>
-<h2>Prioritised Remediation</h2><ul>{prio or '<li>No remediation items generated.</li>'}</ul>
+{comp_block}
 <footer>Generated by NULLVEIL Recon · Owner NULLVEIL · Engine DeepHat · Evidence-based, read-only assessment — not a certification. Use only on authorized targets.</footer>
 </div></body></html>"""
 
@@ -9489,12 +9883,13 @@ class WebsiteRecon:
             return out
 
         api = r.get("api", {}) or {}
-        canon = _canon_api(r)
-        if not canon and hasattr(self, '_canonical_endpoints'):
-            try:
-                canon = self._canonical_endpoints()
-            except Exception:
-                canon = []
+        # Prefer the canonical endpoint inventory embedded in the report so
+        # change detection, counters and the dashboard all speak the same
+        # normalised vocabulary.
+        canon = {str(ep.get("path")) for ep in (r.get("endpoint_inventory") or [])
+                 if isinstance(ep, dict) and ep.get("path")}
+        if not canon:
+            canon = set(_canon_api(r))
         return {
             "subdomains": {str(x).lower() for x in (r.get("subdomains") or []) if x},
             "ports": _ports(r.get("open_ports")),
@@ -9540,16 +9935,18 @@ class WebsiteRecon:
         added = {k: sorted(cur[k] - old[k]) for k in cur}
         removed = {k: sorted(old[k] - cur[k]) for k in old}
 
-        # severity mapping for newly-appeared assets
+        # Change detection describes drift, not vulnerabilities. Newly observed
+        # assets are informational until independently validated (requirement:
+        # a new port/endpoint/subdomain is not inherently a security finding).
         SEV = {
-            "subdomains": ("MEDIUM", "new subdomain appeared"),
-            "ports": ("HIGH", "new open port"),
-            "paths": ("MEDIUM", "new reachable path"),
-            "api_endpoints": ("HIGH", "new API endpoint"),
-            "cookies": ("LOW", "new cookie observed"),
-            "js_files": ("LOW", "new JS bundle"),
+            "subdomains": ("INFO", "new subdomain observed"),
+            "ports": ("INFO", "new open port observed (validate service exposure separately)"),
+            "paths": ("INFO", "new reachable path observed"),
+            "api_endpoints": ("INFO", "new API endpoint observed"),
+            "cookies": ("INFO", "new cookie observed"),
+            "js_files": ("INFO", "new JS bundle observed"),
             "tech_stack": ("INFO", "new technology fingerprinted"),
-            "users": ("LOW", "new user/author exposed"),
+            "users": ("INFO", "new user/author observed"),
         }
         findings = []
         for key, items in added.items():
@@ -9557,8 +9954,8 @@ class WebsiteRecon:
                 continue
             sev, desc = SEV.get(key, ("INFO", "new " + key))
             findings.append({
-                "severity": sev, "check": f"new-{key.rstrip('s')}",
-                "detail": f"{len(items)} {desc}(s): {', '.join(items[:8])}"
+                "severity": sev, "check": f"observed-new-{key.rstrip('s')}",
+                "detail": f"Status: OBSERVED — {len(items)} {desc}(s): {', '.join(items[:8])}"
                           + (" …" if len(items) > 8 else ""),
                 "items": items,
             })
@@ -9586,8 +9983,8 @@ class WebsiteRecon:
             "findings": findings,
             "status": {"new": sum(len(v) for v in added.values()), "resolved": sum(len(v) for v in removed.values()), "persistent": "N/A", "changed": bool(findings)},
         }
-        # surface notable new assets as first-class findings too
-        if added.get("ports"):
+        # surface observed changes as first-class (informational) findings
+        if findings:
             self.results['diff_findings'] = [
                 (f["severity"], f"change:{f['check']}", f["detail"]) for f in findings]
             for sev, chk, det in self.results['diff_findings']:
@@ -9722,11 +10119,13 @@ class WebsiteRecon:
                      "curl -s -H \"hibp-api-key: $HIBP_API_KEY\" "
                      f"'https://haveibeenpwned.com/api/v3/breaches?domain={self.domain}' | head -c 600"],
                     "non-empty JSON array confirms breach record association.")
-        # secrets
-        for kind, where, where2 in self.results.get('secrets', [])[:15]:
-            sec(f"Exposed secret pattern ({kind})", "HIGH", "secret", f"{where} {where2}".strip()[:160],
-                [f"curl -s {o}/ | grep -ioE '.{{0,30}}({re.escape(str(kind))[:18]}).{{0,20}}' | head"],
-                "value must disappear from public responses after rotation + removal.")
+        # secrets (masked — never emit the value itself)
+        for sec_item in self.results.get('secrets', [])[:15]:
+            label = str(sec_item).split(':', 1)[0].strip() or "secret-pattern"
+            sec(f"Secret pattern observed ({label})", "HIGH", "secret",
+                _redact_secret(sec_item)[:160],
+                [f"curl -s {o}/ | grep -ioE '.{{0,30}}({re.escape(label)[:18]}).{{0,20}}' | head"],
+                "the masked value must disappear from public responses after rotation + removal.")
 
         if not sections:
             lines.append("_No findings to reproduce — scan produced no issues in scope._")
@@ -9764,17 +10163,25 @@ class WebsiteRecon:
         console.print(Panel(header_body, title="[bold magenta]◈ RECON REPORT ◈[/]",
                             border_style="magenta", box=rbox.DOUBLE_EDGE))
 
-        # --- Risk meter ---
-        score, level, color, verdict, bar = _risk_meter(
-            set(self.results['secrets']),
-            len([h for h in self.results['missing_security_headers'] if h != 'content-encoding']),
-            [p for p in self.results['paths'] if isinstance(p, dict) and p.get('flagged')],
-        )
+        # --- Exposure risk meter (canonical score used by PDF/HTML/JSON) ---
+        try:
+            score, verdict = self.calculate_risk_score()
+        except Exception:
+            score, _level, color, verdict, bar = _risk_meter(
+                set(self.results['secrets']),
+                len([h for h in self.results['missing_security_headers'] if h != 'content-encoding']),
+                [p for p in self.results['paths'] if isinstance(p, dict) and p.get('flagged')],
+            )
+        level = ("CRITICAL" if score >= 80 else "HIGH" if score >= 50 else
+                 "MEDIUM" if score >= 20 else "LOW")
+        color = "red" if score >= 50 else "yellow" if score >= 20 else "green"
+        filled = max(0, min(20, score // 5))
+        bar = f"[{color}]{'█' * filled}[/][dim]{'░' * (20 - filled)}[/]"
         risk_body = Group(
             Text.from_markup(f"{bar}  [bold {color}]{score}/100 — {verdict}[/]"),
             Align.center(Text.from_markup(
-                f"[dim]Risk Level:[/] [bold {color}]{level}[/]   "
-                f"[dim]Secrets:[/] [white]{len(set(self.results['secrets']))}[/]   "
+                f"[dim]Exposure Risk:[/] [bold {color}]{level}[/]   "
+                f"[dim]Secret patterns:[/] [white]{len(set(self.results['secrets']))}[/]   "
                 f"[dim]Flagged Paths:[/] [white]{len([p for p in self.results['paths'] if isinstance(p, dict) and p.get('flagged')])}[/]   "
                 f"[dim]Missing Headers:[/] [white]{len([h for h in self.results['missing_security_headers'] if h != 'content-encoding'])}[/]"
             )),
@@ -10162,7 +10569,7 @@ class WebsiteRecon:
         if self.results.get('api_endpoints_found'):
             apis = self.results['api_endpoints_found']
             shown = apis[:60]
-            body = "\n".join(f"  [dim]•[/] [white]{a}[/]" for a in shown)
+            body = "\n".join(f"  [dim]•[/] [white]{_redact_url(a)}[/]" for a in shown)
             more = f"\n  [dim]... and {len(apis) - len(shown)} more (see JSON report)[/]" if len(apis) > len(shown) else ""
             console.print(Panel(body + more, title=f"[bold cyan]◈ API PATHS FOUND IN SOURCE ({len(apis)}) ◈[/]",
                                 border_style="cyan", box=rbox.ROUNDED))
@@ -10216,10 +10623,11 @@ class WebsiteRecon:
         if self.results['phones']:
             self._simple_table("◈ PHONE NUMBERS (heuristic) ◈", self.results['phones'][:30], style="bright_yellow")
 
-        # --- Secrets ---
+        # --- Secrets (masked; raw values are never printed) ---
         if self.results['secrets']:
-            body = "\n".join(f"  [bold red]◤[/] [white]{s}[/]" for s in sorted(set(self.results['secrets'])))
-            console.print(Panel(body, title="[bold red on red] ◈ ⚠ SECRETS / API KEYS LEAKED ◈ [/]",
+            body = "\n".join(f"  [bold red]◤[/] [white]{_redact_secret(s)}[/]"
+                             for s in sorted(set(self.results['secrets'])))
+            console.print(Panel(body, title="[bold red on red] ◈ ⚠ SECRET PATTERNS (MASKED) ◈ [/]",
                                 border_style="red", box=rbox.DOUBLE_EDGE))
 
         # --- Comments ---
@@ -10756,38 +11164,118 @@ class WebsiteRecon:
         console.print(t)
 
     # ---------------------------------------------------------- Export
-    def _canonical_endpoints(self):
-        """Single source of truth for all API/endpoints."""
-        out = []
-        seen = set()
-        try:
-            for ep in self.results.get('api_endpoints', []) or []:
-                if isinstance(ep, dict):
-                    p = ep.get('path') or ep.get('url') or ''
-                else:
-                    p = str(ep)
-                if not p or p in seen:
+    @staticmethod
+    def _normalise_endpoint(ep, default_host=""):
+        """Canonicalise one endpoint into ``(METHOD, HOST, PATH)``.
+
+        ``/api``, ``/api/`` and ``/api?x=1`` all normalise to ``/api``;
+        numeric path segments collapse to ``{id}``; the scheme/query/fragment
+        are dropped and the host keeps a non-default port. This is the only
+        place endpoint identity is defined.
+        """
+        if isinstance(ep, dict):
+            method = str(ep.get('method') or ep.get('verb') or 'GET').upper()
+            host = str(ep.get('host') or ep.get('domain') or default_host or '').lower()
+            raw = str(ep.get('url') or ep.get('path') or ep.get('endpoint') or '')
+        else:
+            method, host, raw = 'GET', str(default_host or '').lower(), str(ep or '')
+        raw = raw.strip()
+        if not raw:
+            return None
+        if raw.startswith(('http://', 'https://')):
+            u = urlparse(raw)
+            host = (u.hostname or host or '').lower()
+            try:
+                port = u.port
+            except ValueError:
+                port = None
+            scheme = (u.scheme or '').lower()
+            if port and port not in (80, 443):
+                host = f"{host}:{port}"
+            elif port == 80 and scheme == 'https':
+                host = f"{host}:{port}"
+            elif port == 443 and scheme == 'http':
+                host = f"{host}:{port}"
+            path = u.path or '/'
+        else:
+            path = raw
+        # strip query/fragment, collapse duplicate slashes, drop trailing slash
+        path = path.split('#', 1)[0].split('?', 1)[0]
+        path = re.sub(r'/+', '/', path or '/')
+        if len(path) > 1:
+            path = path.rstrip('/')
+        if not path.startswith('/'):
+            path = '/' + path
+        # normalise dynamic segments so /api/user/1 and /api/user/2 collide
+        path = re.sub(r'(?<=/)\d+(?=/|$)', '{id}', path)
+        path = re.sub(r'(?<=/)[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}(?=/|$)', '{id}', path)
+        return method.upper(), (host or str(default_host or '').lower()), path
+
+    def _endpoint_inventory(self):
+        """Canonical, normalised, de-duplicated endpoint inventory.
+
+        Returns a list of ``{method, host, path, source, confidence}`` records.
+        ``API_ENDPOINTS`` is always ``len(self._endpoint_inventory())``.
+        """
+        out, seen = [], set()
+        default_host = (getattr(self, 'netloc', '') or '').lower()
+        for key, src in (('api_endpoints', 'api'),
+                         ('api_endpoints_found', 'api-source'),
+                         ('endpoints', 'endpoint'),
+                         ('api_pool', 'pool')):
+            for ep in (self.results.get(key) or []):
+                try:
+                    norm = self._normalise_endpoint(ep, default_host)
+                except Exception:
                     continue
-                out.append(p)
-                seen.add(p)
-            for ep in self.results.get('api_endpoints_found', []) or []:
-                if isinstance(ep, dict):
-                    p = ep.get('path') or ep.get('url') or ''
-                else:
-                    p = str(ep)
-                if p and p not in seen:
-                    out.append(p)
-                    seen.add(p)
-            for ep in self.results.get('endpoints', []) or []:
-                if isinstance(ep, dict):
-                    p = ep.get('path') or ep.get('url') or ep.get('endpoint') or ''
-                else:
-                    p = str(ep)
-                if p and p not in seen:
-                    out.append(p)
-                    seen.add(p)
+                if not norm:
+                    continue
+                method, host, path = norm
+                ck = (method, host, path)
+                if ck in seen:
+                    continue
+                seen.add(ck)
+                out.append({
+                    "method": method,
+                    "host": host or default_host,
+                    "path": path,
+                    "source": ((ep.get('source') if isinstance(ep, dict) else '') or src),
+                    "confidence": "HIGH" if src in ('api', 'api-source') else "MEDIUM",
+                })
+        return out
+
+    def _canonical_endpoints(self):
+        """Single source of truth for all API/endpoints (normalised paths)."""
+        try:
+            return [e["path"] for e in self._endpoint_inventory()]
         except Exception:
-            pass
+            return []
+
+    def _canonical_admin_findings(self):
+        """Canonical admin/API security findings (root findings only).
+
+        Excludes informational/child metadata (CVSS, PoC, remediation,
+        ATT&CK) and de-duplicates by fingerprint. Used for
+        ``ADMIN_API_FINDINGS`` in every output.
+        """
+        out, seen = [], set()
+        for f in (self.results.get('admin_findings') or []):
+            if not isinstance(f, (list, tuple)) or len(f) < 3:
+                continue
+            sev = str(f[0] or '').upper()
+            if sev not in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW'):
+                continue
+            chk, det = str(f[1] or ''), str(f[2] or '')
+            low = f"{chk} {det}".lower()
+            if any(x in low for x in ('cvss', 'poc ', 'remediation', 'attack technique',
+                                      'metadata', 'not configured', 'not_proven',
+                                      'not proven', 'requires_validation')):
+                continue
+            fp = self._finding_fingerprint(sev, chk, det, 'auth')
+            if fp in seen:
+                continue
+            seen.add(fp)
+            out.append((sev, chk, det))
         return out
 
     def export_dict(self):
@@ -10796,6 +11284,40 @@ class WebsiteRecon:
             self._apply_finding_lifecycle()
         except Exception:
             pass
+        # ---- canonical root-finding dataset (single source of truth) ----
+        try:
+            canonical = self._dedupe_findings(self._collect_findings())
+        except Exception:
+            canonical = []
+        try:
+            self._apply_finding_lifecycle()
+        except Exception:
+            pass
+        sev_counts = {k: len([f for f in canonical if f[0] == k])
+                      for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+        try:
+            risk_score, risk_verdict = self.calculate_risk_score(canonical)
+        except Exception:
+            risk_score, risk_verdict = 0, "NO KNOWN EXPOSURE"
+        risk_block = {
+            "score": int(risk_score),
+            "verdict": risk_verdict,
+            "label": "EXPOSURE RISK",
+            "method": "canonical calculate_risk_score(root_findings)",
+        }
+        try:
+            endpoint_inventory = self._endpoint_inventory()
+        except Exception:
+            endpoint_inventory = []
+        try:
+            admin_findings = self._canonical_admin_findings()
+        except Exception:
+            admin_findings = []
+        try:
+            redacted_secrets = sorted({_redact_secret(x)
+                                       for x in (self.results.get('secrets') or [])})
+        except Exception:
+            redacted_secrets = []
         out = {
             "tool": "NULLVEIL Recon",
             "owner": "NULLVEIL",
@@ -10808,7 +11330,19 @@ class WebsiteRecon:
             "finding_index": self.results.get('finding_index', {}),
             "root_findings": self.results.get('root_findings', {}),
             "finding_lifecycle": self.results.get('finding_lifecycle', {}),
+            "risk": risk_block,
+            "severity_counts": sev_counts,
+            "findings_total": len(canonical),
+            "findings": (self.results.get('finding_lifecycle', {}) or {}).get('findings', []),
+            "endpoint_inventory": endpoint_inventory,
             "summary": {
+                "risk_score": int(risk_score),
+                "findings_total": len(canonical),
+                "critical_count": sev_counts["CRITICAL"],
+                "high_count": sev_counts["HIGH"],
+                "medium_count": sev_counts["MEDIUM"],
+                "low_count": sev_counts["LOW"],
+                "info_count": sev_counts["INFO"],
                 "dns_records": len(self.results['dns']),
                 "subdomains": len(set(self.results['subdomains'])),
                 "open_ports": len(self.results['ports']),
@@ -10816,9 +11350,9 @@ class WebsiteRecon:
                 "emails": len(self.results['emails']),
                 "ips": len(self.results['ips']),
                 "users": len(self.results['users']),
-                "secrets": len(set(self.results['secrets'])),
+                "secrets": len(redacted_secrets),
                 "tech_stack": sorted(set(self.results['tech_stack'])),
-                "api_endpoints": len(self._canonical_endpoints()),
+                "api_endpoints": len(endpoint_inventory),
                 "api_documents": len(self.results.get('api_docs', [])),
                 "forms": len(self.results.get('forms', [])),
                 "waf": self.results.get('waf', []),
@@ -10847,7 +11381,7 @@ class WebsiteRecon:
                 "har_entries": self.results.get('burp', {}).get('har_entries', 0),
                 "auth_gated_apis": self.results.get('authscan', {}).get('auth_gated', 0),
                 "role_hidden_apis": len(self.results.get('authscan', {}).get('role_gated', [])),
-                "admin_api_findings": len([f for f in self.results.get('admin_findings', []) if f]),
+                "admin_api_findings": len(admin_findings),
                 "ssrf_bypass_hits": len(self.results.get('ssrf', {}).get('bypass', [])),
                 "ssrf_metadata_hits": len(self.results.get('ssrf', {}).get('metadata', [])),
                 "vuln_verify_xss": len(self.results.get('vuln_verify', {}).get('xss', [])),
@@ -10890,7 +11424,7 @@ class WebsiteRecon:
             "ips": sorted(set(self.results['ips'])),
             "phones": self.results['phones'],
             "users": sorted(set(self.results['users'])),
-            "secrets": sorted(set(self.results['secrets'])),
+            "secrets": redacted_secrets,
             "tech_stack": sorted(set(self.results['tech_stack'])),
             "comments": self.results['comments'],
             "social_links": self.results['social_links'],
@@ -10899,9 +11433,16 @@ class WebsiteRecon:
             "js_files": sorted(set(self.results['js_files'])),
             "api": {
                 "documents": self.results.get('api_docs', []),
-                "live_endpoints": self.results.get('api_endpoints', []),
-                "paths_in_source": self.results.get('api_endpoints_found', []),
-                "forms": self.results.get('forms', []),
+                "live_endpoints": [
+                    dict(e, path=_redact_url(e.get('path', '')))
+                    if isinstance(e, dict) else _redact_url(e)
+                    for e in self.results.get('api_endpoints', [])],
+                "paths_in_source": [
+                    _redact_url(x) for x in self.results.get('api_endpoints_found', [])],
+                "forms": [
+                    dict(f, action=_redact_url(f.get('action', '')))
+                    if isinstance(f, dict) else f
+                    for f in self.results.get('forms', [])],
                 "cookies": self.results.get('cookies', []),
                 "json_ld": sorted(set(self.results.get('jsonld', []))),
                 "metadata": self.results.get('meta', {}),
@@ -10995,8 +11536,15 @@ class WebsiteRecon:
             },
             "compliance": {
                 "coverage_pct": self.results.get('compliance', {}).get('coverage_pct', 0),
+                "assessment_completeness_pct": self.results.get('compliance', {}).get(
+                    'assessment_completeness_pct',
+                    self.results.get('compliance', {}).get('coverage_pct', 0)),
+                "pass_rate_pct": self.results.get('compliance', {}).get('pass_rate_pct', 0),
                 "total_controls": self.results.get('compliance', {}).get('total_controls', 0),
+                "total_pass": self.results.get('compliance', {}).get('total_pass', 0),
+                "total_partial": self.results.get('compliance', {}).get('total_partial', 0),
                 "total_fail": self.results.get('compliance', {}).get('total_fail', 0),
+                "evidence_required": self.results.get('compliance', {}).get('evidence_required', 0),
                 "frameworks": self.results.get('compliance', {}).get('frameworks', {}),
                 "disclaimer": self.results.get('compliance', {}).get('disclaimer', 'Indicative Technical Control Mapping — not a certification/compliance attestation'),
             },
@@ -11081,7 +11629,10 @@ class WebsiteRecon:
                 "findings": [{"severity": s, "check": c, "detail": d}
                              for s, c, d in self.results.get('proxy_findings', [])],
             },
-            "api_pool": self.results.get('api_pool', []),
+            "api_pool": [
+                dict(e, path=_redact_url(e.get('path', '')))
+                if isinstance(e, dict) else e
+                for e in self.results.get('api_pool', [])],
             "auth_setup": self.results.get('auth_setup', {}),
             "authscan": self.results.get('authscan', {}),
             "admin_api": {
@@ -11097,7 +11648,12 @@ class WebsiteRecon:
             "notifications": self.results.get('notify', {}),
             "executive_report": self.results.get('exec', {}),
             "dedupe": self.results.get('dedupe_stats', {}),
-            "js_secret": self.results.get('js_secret', {}),
+            "js_secret": {
+                **(self.results.get('js_secret', {}) or {}),
+                "endpoints": [
+                    _redact_url(x) for x in
+                    ((self.results.get('js_secret', {}) or {}).get('endpoints') or [])],
+            },
             "wayback": self.results.get('wayback', {}),
             "params": self.results.get('param', {}),
             "graphql": self.results.get('graphql', {}),
@@ -11148,10 +11704,20 @@ class WebsiteRecon:
         if isinstance(d, dict) and isinstance(d.get("report"), dict):
             d = d["report"]          # unwrap history entry
         s = d['summary']
-        risk = _risk_meter(d.get('secrets', []),
-                           len(d.get('missing_security_headers', [])),
-                           [p for p in d.get('paths', []) if str(p.get('status')) in ('200', '403')])
-        score, level, color, verdict, _ = risk
+        # Use the canonical exposure-risk score when present (JSON/PDF/HTML all
+        # agree). Legacy exports fall back to the old meter.
+        rk = d.get('risk') or {}
+        if isinstance(rk, dict) and rk.get('score') is not None:
+            score = int(rk.get('score') or 0)
+            verdict = str(rk.get('verdict') or '')
+            level = ("CRITICAL" if score >= 80 else "HIGH" if score >= 50 else
+                     "MODERATE" if score >= 20 else "LOW")
+            color = "red" if score >= 50 else "yellow" if score >= 20 else "green"
+        else:
+            score, level, color, verdict, _ = _risk_meter(
+                d.get('secrets', []),
+                len(d.get('missing_security_headers', [])),
+                [p for p in d.get('paths', []) if str(p.get('status')) in ('200', '403')])
         css_color = {"green": "#22c55e", "yellow": "#eab308", "red": "#ef4444"}[color]
 
         def sec(title, inner, accent="#8b5cf6"):
@@ -11465,14 +12031,18 @@ class WebsiteRecon:
                                  tbl(["Check", "Status", "Detail"], rows), "#ef4444"))
         # Compliance
         comp = d.get('compliance', {})
-        if comp:
+        if comp and int(comp.get('total_controls', 0) or 0) > 0:
             cov = comp.get('coverage_pct', 0)
+            pass_rate = comp.get('pass_rate_pct', 0)
             tf = comp.get('total_controls', 0)
             nf = comp.get('total_fail', 0)
+            need = comp.get('evidence_required', 0)
             parts.append(sec("Compliance Coverage",
                              f"<div class='chips'>"
-                             f"<span class='chip {'green' if cov>=80 else 'yellow' if cov>=50 else 'red'}'>Coverage: {cov}%</span>"
+                             f"<span class='chip {'green' if cov>=80 else 'yellow' if cov>=50 else 'red'}'>Assessment coverage: {cov}%</span>"
+                             f"<span class='chip {'green' if pass_rate>=80 else 'yellow' if pass_rate>=50 else 'red'}'>Pass rate (assessed): {pass_rate}%</span>"
                              f"<span class='chip red'>Fail: {nf}</span>"
+                             f"<span class='chip'>Evidence required: {need}</span>"
                              f"<span class='chip yellow'>Controls: {tf}</span></div>"
                              f"<p class='muted'>{_e(comp.get('disclaimer', 'Evidence-based partial technical mapping only. This is NOT a certification, audit, or gap assessment.'))}</p>", "#3b82f6"))
             fw = comp.get('frameworks', {})
@@ -11773,7 +12343,7 @@ class WebsiteRecon:
     <div class="muted">EXPOSURE LEVEL</div>
     <div class="bar"><div style="width:{score}%"></div></div>
     <div class="score">{score}/100 — {verdict}</div>
-    <div class="muted">Risk: {level} · Secrets: {s.get('secrets',0)} ·
+    <div class="muted">Exposure risk: {level} · Secret patterns: {s.get('secrets',0)} ·
       Missing headers: {len(d.get('missing_security_headers', []))} ·
       Flagged paths: {len([p for p in d.get('paths', []) if str(p.get('status')) in ('200','403')])}</div>
   </div>
@@ -11821,7 +12391,13 @@ class WebsiteRecon:
                     page = await browser.new_page()
                     await page.set_content(html_doc, wait_until="load")
                     await page.pdf(path=pdf_path, format="A4", print_background=True,
-                                   margin={"top": "12mm", "bottom": "12mm",
+                                   display_header_footer=True,
+                                   header_template="<span></span>",
+                                   footer_template=(
+                                       "<div style='font-size:8px;width:100%;text-align:center;color:#6b7280'>"
+                                       "NULLVEIL — page <span class='pageNumber'></span> of "
+                                       "<span class='totalPages'></span></div>"),
+                                   margin={"top": "12mm", "bottom": "16mm",
                                            "left": "10mm", "right": "10mm"})
                 finally:
                     await browser.close()
@@ -11838,7 +12414,12 @@ class WebsiteRecon:
 
     @classmethod
     def pdf_from_dict_file(cls, json_path, pdf_path):
-        """Convert an existing NULLVEIL JSON report into a PDF."""
+        """Convert an existing NULLVEIL JSON report into the branded PDF.
+
+        Uses the same renderer as ``--pdf`` (including canonical risk, counts,
+        compliance tables and page numbers) so a converted report is
+        indistinguishable from a live one.
+        """
         with open(json_path, encoding="utf-8") as fh:
             d = json.load(fh)
         return cls._html_to_pdf(cls._render_html(d), pdf_path)
@@ -11945,9 +12526,18 @@ async function loadScans(){
   if(SCANS.length && !DATA) openScan(SCANS[0].id);
 }
 function findCount(s){ s=s||{}; const keys=['cve_issues','audit_issues','supply_issues','nuclei_issues','anomaly_issues','intel_issues','breach_issues','tls_issues','email_issues','ssrf_bypass_hits'];
+  if(s.findings_total!=null) return {all:s.findings_total,cri:s.critical_count||0,hig:s.high_count||0};
   let cri=0,hig=0,all=0; keys.forEach(k=>{all+=(s[k]||0)}); return {all,cri:s.cve_issues||0,hig:s.supply_issues||0}; }
 
 function findings(d){
+  // Prefer the canonical root-finding dataset embedded by export_dict so the
+  // dashboard severity mix/counters match the PDF/JSON exactly.
+  if(Array.isArray(d.findings)&&d.findings.length){
+    return d.findings.map(f=>({section:(f.source||'root'),sev:(f.severity||'INFO').toUpperCase(),
+      id:f.check||'',detail:f.detail||'',evidence:f.evidence||'',
+      status:f.lifecycle||'',confidence:f.confidence||'',fid:f.finding_id||''}))
+      .sort((a,b)=>SEV_ORDER.indexOf(a.sev)-SEV_ORDER.indexOf(b.sev));
+  }
   const out=[];
   const push=(section,arr,idKey)=>{(arr||[]).forEach(f=>{
     const sev=(f.severity||'INFO').toUpperCase();
@@ -11967,16 +12557,13 @@ function findings(d){
   push('Scan Diff',d.scan_diff&&d.scan_diff.findings);
   push('Admin API',d.admin_api&&d.admin_api.findings);
   push('Email',d.email_security&&d.email_security.findings);
-  push('Remediation',(d.remediation&&d.remediation.patches||[]).map(p=>({severity:p.severity,check:p.title,detail:p.finding})));
-  push('PoC Verify',(d.poc_verification&&d.poc_verification.pocs||[]).map(p=>({severity:p.severity,check:p.check,detail:p.finding})));
+  // Derived/enrichment data (remediation, PoC, CVSS, ATT&CK, CVE intel) are
+  // child metadata of a root finding — never separate findings.
   push('JS Secret',d.js_secret&&d.js_secret.findings);
   push('Historical URL',d.wayback&&d.wayback.findings);
   push('Hidden Param',d.params&&d.params.findings);
   push('GraphQL',d.graphql&&d.graphql.findings);
   push('Cloud Storage',d.cloud_storage&&d.cloud_storage.findings);
-  push('CVSS',d.cvss&&d.cvss.findings);
-  push('ATT&CK',d.mitre_attack&&d.mitre_attack.findings);
-  push('CVE Intel',d.cve_intel&&d.cve_intel.findings);
   push('Takeover v3',d.takeover_v3&&d.takeover_v3.findings);
   push('Watch',d.watch&&d.watch.findings);
   out.sort((a,b)=>SEV_ORDER.indexOf(a.sev)-SEV_ORDER.indexOf(b.sev));
@@ -11992,9 +12579,11 @@ function render(d){
   const s=d.summary||{}, F=findings(d);
   const crit=F.filter(f=>f.sev==='CRITICAL').length, high=F.filter(f=>f.sev==='HIGH').length,
         med=F.filter(f=>f.sev==='MEDIUM').length;
-  let score=Math.min(100, crit*22+high*10+med*4+(s.secrets||0)*12+(s.takeover_risks||0)*25);
-  const verdict = score>=70?'CRITICAL EXPOSURE':score>=40?'HIGH EXPOSURE':score>=15?'MODERATE':'LOW RISK';
-  const color = score>=70?'var(--cri)':score>=40?'var(--hig)':score>=15?'var(--med)':'var(--ok)';
+  // Single canonical score from the report. Fallback only for legacy reports.
+  const rk=d.risk||{};
+  let score=(rk.score!=null)?Number(rk.score):Math.min(100, crit*22+high*10+med*4+(s.secrets||0)*12+(s.takeover_risks||0)*25);
+  const verdict = rk.verdict || (score>=80?'CRITICAL EXPOSURE':score>=50?'HIGH EXPOSURE':score>=20?'MODERATE EXPOSURE':'LOW EXPOSURE');
+  const color = score>=50?'var(--cri)':score>=20?'var(--med)':'var(--ok)';
   const cnt=sev=>F.filter(f=>f.sev===sev).length;
   const maxc=Math.max(1,...SEV_ORDER.map(cnt));
   const shots=(d.screenshots&&d.screenshots.shots)||[];
@@ -12017,11 +12606,11 @@ function render(d){
   </div>
   <div class="kpis">
     ${kpi(crit,'Critical','var(--cri)')}${kpi(high,'High','var(--hig)')}${kpi(med,'Medium','var(--med)')}
-    ${kpi(s.secrets||0,'Secrets leaked','var(--cri)')}${kpi(s.subdomains||0,'Subdomains')}
+    ${kpi(s.secrets||0,'Secret patterns','var(--cri)')}${kpi(s.subdomains||0,'Subdomains')}
     ${kpi(s.open_ports||0,'Open ports')}${kpi(s.takeover_risks||0,'Takeover risks')}
     ${kpi(chains.length,'Attack chains')}${kpi(shots.length,'Screenshots')}
     ${kpi((s.diff_new_assets||0),'New since last scan',(s.diff_score>=40?'var(--hig)':''))}
-    ${kpi((comp.coverage_pct||0)+'%','Compliance')}
+    ${kpi(comp.total_controls?((comp.coverage_pct||0)+'%'):'n/a','Compliance coverage')}
   </div>
   <div class="grid2">
     <div class="panel">
@@ -12040,9 +12629,9 @@ function render(d){
         <div class="mut" style="font-size:11px">${(d.tech_stack||[]).slice(0,14).map(e).join(' · ')}</div>
       </div>
       <h3>Compliance coverage</h3>
-      ${comp.frameworks? Object.entries(comp.frameworks).map(([k,v])=>`<div class="barrow"><span>${e(k)}</span>
-        <div class="track"><i style="width:${(v.coverage_pct||0)}%;background:var(--acc)"></i></div>
-        <span class="mut" style="text-align:right">${v.coverage_pct||0}%</span></div>`).join('') : '<div class="mut">not run</div>'}
+      ${comp.frameworks? Object.entries(comp.frameworks).map(([k,v])=>{const assessed=(v.pass||0)+(v.fail||0)+(v.partial||0);const total=assessed+(v.needed||0);const cov=total?Math.round(100*assessed/total):0;const pass=assessed?Math.round(100*(v.pass||0)/assessed):0;return `<div class="barrow"><span>${e(k)}</span>
+        <div class="track"><i style="width:${cov}%;background:var(--acc)"></i></div>
+        <span class="mut" style="text-align:right">${cov}% assessed · ${pass}% pass</span></div>`}).join('') : '<div class="mut">not run</div>'}
       <h3>Email security</h3>
       <ul><li>SPF: <code>${e((d.email_security&&d.email_security.spf)||'none')}</code></li>
       <li>DMARC: <code>${e((d.email_security&&d.email_security.dmarc)||'none')}</code></li></ul>
@@ -12185,11 +12774,12 @@ function renderFindings(F){
   const q=(document.getElementById('q').value||'').toLowerCase();
   const rows=F.filter(f=>!q||(f.section+f.id+f.detail).toLowerCase().includes(q));
   document.getElementById('ftable').innerHTML=`<div class="panel"><table><thead><tr>
-    <th>Sev</th><th>Section</th><th>Finding</th><th>Detail</th></tr></thead><tbody>${
+    <th>Sev</th><th>Status / confidence</th><th>Section</th><th>Finding</th><th>Detail</th></tr></thead><tbody>${
     rows.slice(0,500).map(f=>`<tr><td><span class="chip ${f.sev}">${e(f.sev)}</span></td>
+      <td class="mut">${e(f.status||'OBSERVED')}<div style="font-size:11px">${e(f.confidence||'')}</div></td>
       <td class="mut">${e(f.section)}</td><td>${e(f.id)}</td>
       <td>${e(f.detail)}${f.evidence?`<div class="mut" style="font-size:11px">${e(f.evidence)}</div>`:''}</td></tr>`).join('')
-    ||'<tr><td colspan="4" class="mut">no findings</td></tr>'}</tbody></table></div>`;
+    ||'<tr><td colspan="5" class="mut">no findings</td></tr>'}</tbody></table></div>`;
 }
 document.getElementById('refresh').onclick=loadScans;
 document.getElementById('dl-pdf').onclick=()=>{
@@ -13272,13 +13862,18 @@ def _scan_target(args, attack_indices, ports, target, out_suffix=""):
 
 
 def _batch_score(report):
-    """Derive the 0-100 exposure score from a finished report dict.
+    """Return the canonical exposure score from a finished report dict.
 
-    Uses the same ``_risk_meter`` the CLI panel uses so the batch index agrees
-    with what the operator saw on screen."""
+    Prefers the single ``risk`` block produced by ``export_dict`` so the batch
+    index, web dashboard, PDF and JSON all agree. Falls back to the legacy
+    meter only for reports produced by older versions."""
     if not isinstance(report, dict):
         return None
     s = report.get("summary", {}) or {}
+    rk = report.get("risk") or {}
+    if isinstance(rk, dict) and rk.get("score") is not None:
+        return {"score": int(rk.get("score") or 0),
+                "verdict": rk.get("verdict") or s.get("risk_verdict") or ""}
     try:
         score, _level, _color, verdict, _bar = _risk_meter(
             report.get("secrets", []) or [],
@@ -13287,7 +13882,7 @@ def _batch_score(report):
         )
         return {"score": score, "verdict": verdict}
     except Exception:
-        return {"score": s.get("exposure_score")}
+        return {"score": s.get("risk_score", s.get("exposure_score"))}
 
 
 if __name__ == "__main__":
