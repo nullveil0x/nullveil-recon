@@ -42,7 +42,11 @@ Record and confirm, in writing:
 - Do **not** enable authenticated scanning unless credentials were provided for
   that purpose.
 - Do **not** point modules at out-of-scope hosts, even indirectly (e.g. via a
-  discovered third-party API).
+  discovered third-party API). The shared HTTP client blocks redirects and
+  browser requests outside the target host/subdomains; use `--allow-host` only
+  for hosts the authorization explicitly covers.
+- Set `--rps` to the rate limit in your authorization (default: 25 req/s;
+  `0` disables the limiter).
 - Keep everything **read-only** — NULLVEIL Recon performs no exploitation by
   design; do not bolt on exploit tooling.
 
