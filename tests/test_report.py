@@ -5,6 +5,8 @@ a broken export silently breaks every downstream integration.
 """
 import json
 
+import pytest
+
 
 def test_export_dict_shape(nv, recon):
     rep = nv.WebsiteRecon.export_dict(recon)
@@ -147,3 +149,97 @@ def test_url_redaction_masks_sensitive_query_and_userinfo(nv):
         "https://user:REDACTED@example.com/x?api_key=REDACTED"
     assert nv._redact_url("https://example.com/a?page=2") == \
         "https://example.com/a?page=2"
+
+
+
+def test_scope_validation_target_and_allowlist(nv):
+    r = nv.WebsiteRecon("https://www.example.com",
+                        allow_hosts=["partner.example.net"])
+    assert r._in_scope_url("https://www.example.com/a")
+    assert r._in_scope_url("https://api.www.example.com/a")
+    assert r._in_scope_url("https://example.com/a")          # www -> apex
+    assert r._in_scope_url("https://partner.example.net/x")  # explicit allowlist
+    assert not r._in_scope_url("https://evil.example/x")
+    assert not r._in_scope_url("https://example.com.evil.test/x")
+    assert r._in_scope_url("https://otx.alienvault.com/api")
+    assert not r._in_scope_url("https://otx.alienvault.com/api", redirect=True)
+
+
+def test_scoped_client_blocks_out_of_scope_redirect(nv):
+    import asyncio
+    import httpx
+
+    r = nv.WebsiteRecon("http://127.0.0.1")
+    seen = []
+
+    def handler(req):
+        seen.append(str(req.url))
+        if req.url.path == "/redir":
+            return httpx.Response(302, headers={"location": "https://evil.example/"},
+                                  request=req)
+        if req.url.path == "/hop":
+            return httpx.Response(302, headers={"location": "/ok"}, request=req)
+        return httpx.Response(200, text="ok", request=req)
+
+    inner = httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                              follow_redirects=True)
+    client = nv.ScopedAsyncClient(inner, r._in_scope_url)
+
+    async def go():
+        with pytest.raises(httpx.ConnectError):
+            await client.get("http://127.0.0.1/redir")
+        ok = await client.get("http://127.0.0.1/hop")
+        assert ok.status_code == 200 and ok.text == "ok"
+        await inner.aclose()
+
+    asyncio.run(go())
+    assert all("evil.example" not in u for u in seen)
+
+
+def test_scoped_client_rate_limits_requests(nv):
+    import asyncio
+    import time
+    import httpx
+
+    r = nv.WebsiteRecon("http://127.0.0.1")
+
+    def handler(req):
+        return httpx.Response(200, text="ok", request=req)
+
+    inner = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = nv.ScopedAsyncClient(inner, r._in_scope_url, rps=20)
+
+    async def go():
+        started = time.monotonic()
+        await asyncio.gather(*[client.get("http://127.0.0.1/") for _ in range(3)])
+        elapsed = time.monotonic() - started
+        await inner.aclose()
+        return elapsed
+
+    assert asyncio.run(go()) >= 0.08
+
+
+def test_scoped_client_redirect_does_not_replay_query_params(nv):
+    import asyncio
+    import httpx
+
+    r = nv.WebsiteRecon("http://127.0.0.1")
+    seen = []
+
+    def handler(req):
+        seen.append(str(req.url))
+        if req.url.path == "/start":
+            return httpx.Response(302, headers={"location": "/next?from=redirect"},
+                                  request=req)
+        return httpx.Response(200, text="ok", request=req)
+
+    inner = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = nv.ScopedAsyncClient(inner, r._in_scope_url)
+
+    async def go():
+        resp = await client.get("http://127.0.0.1/start", params={"token": "secret"})
+        assert resp.status_code == 200
+        await inner.aclose()
+
+    asyncio.run(go())
+    assert seen[-1] == "http://127.0.0.1/next?from=redirect"

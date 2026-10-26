@@ -1477,6 +1477,108 @@ def _redact_secret(value):
     return f"{label}{secret[:4]}…{secret[-3:]} (len {len(secret)})"
 
 
+SCOPE_EXTERNAL_HOSTS = {
+    # Read-only OSINT / enrichment endpoints used by explicit modules.
+    "crt.sh", "web.archive.org", "index.commoncrawl.org",
+    "openphish.com", "sslbl.abuse.ch", "otx.alienvault.com",
+    "haveibeenpwned.com", "api.abuseipdb.com", "services.nvd.nist.gov",
+    "api.first.org", "storage.googleapis.com", "www.cisa.gov",
+    "cloudflare-dns.com",
+}
+
+
+class ScopedAsyncClient:
+    """Thin httpx wrapper that enforces target scope on every hop.
+
+    ``httpx`` follows redirects internally, which means a target can redirect
+    the scanner to an unrelated host. This wrapper disables automatic redirects
+    and follows them manually, validating each URL before the request is sent.
+    Explicitly configured webhook/auth hosts and read-only OSINT services are
+    allowed; arbitrary third-party redirects are refused.
+    """
+
+    def __init__(self, inner, scope_fn, max_redirects=8, rps=0):
+        self._inner = inner
+        self._scope_fn = scope_fn
+        self._max_redirects = max_redirects
+        self._min_interval = (1.0 / float(rps)) if float(rps or 0) > 0 else 0.0
+        self._next_request = 0.0
+        self._rate_lock = None
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def _throttle(self):
+        if self._min_interval <= 0:
+            return
+        if self._rate_lock is None:
+            self._rate_lock = asyncio.Lock()
+        async with self._rate_lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            wait = self._next_request - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = loop.time()
+            self._next_request = max(now, self._next_request) + self._min_interval
+
+    async def request(self, method, url, **kwargs):
+        follow = kwargs.pop("follow_redirects", True)
+        kwargs.pop("allow_redirects", None)
+        current_url = str(url)
+        current_method = str(method).upper()
+        hop = 0
+        while True:
+            await self._throttle()
+            if not self._scope_fn(current_url, redirect=(hop > 0)):
+                raise httpx.ConnectError(
+                    f"out-of-scope request blocked before send: {current_url}")
+            resp = await self._inner.request(
+                current_method, current_url, follow_redirects=False, **kwargs)
+            if not follow or not resp.is_redirect:
+                return resp
+            if hop >= self._max_redirects:
+                raise httpx.TooManyRedirects(
+                    f"too many redirects (>{self._max_redirects})")
+            loc = resp.headers.get("location")
+            if not loc:
+                return resp
+            next_url = urljoin(str(resp.url), loc)
+            if not self._scope_fn(next_url, redirect=True):
+                raise httpx.ConnectError(
+                    f"out-of-scope redirect blocked: {current_url} -> {next_url}")
+            if resp.status_code in (301, 302, 303) and current_method != "HEAD":
+                current_method = "GET"
+                for k in ("content", "data", "json", "files"):
+                    kwargs.pop(k, None)
+            # Redirect Location already carries the query string; replaying the
+            # original params would duplicate it on every hop.
+            kwargs.pop("params", None)
+            current_url = next_url
+            hop += 1
+
+    async def get(self, url, **kwargs):
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url, **kwargs):
+        return await self.request("POST", url, **kwargs)
+
+    async def head(self, url, **kwargs):
+        return await self.request("HEAD", url, **kwargs)
+
+    async def put(self, url, **kwargs):
+        return await self.request("PUT", url, **kwargs)
+
+    async def patch(self, url, **kwargs):
+        return await self.request("PATCH", url, **kwargs)
+
+    async def delete(self, url, **kwargs):
+        return await self.request("DELETE", url, **kwargs)
+
+    async def options(self, url, **kwargs):
+        return await self.request("OPTIONS", url, **kwargs)
+
+
 def _risk_meter(secrets, missing_headers, flagged_paths):
     """Simple 0-100 exposure score based on findings."""
     score = min(100, len(secrets) * 15 + missing_headers * 4 + len(flagged_paths) * 6)
@@ -1492,15 +1594,24 @@ def _risk_meter(secrets, missing_headers, flagged_paths):
 
 
 class WebsiteRecon:
-    def __init__(self, url, deep=False, timeout=10, concurrency=100, ports=None, wordlist=None, proxy=None):
+    def __init__(self, url, deep=False, timeout=10, concurrency=100, ports=None,
+                 wordlist=None, proxy=None, allow_hosts=None, rps=25):
         url = url.strip()
         self.proxy = (proxy or "").strip()
+        self.rps = float(rps or 0)
         self.url = url if url.startswith(('http://', 'https://')) else f'https://{url}'
         self.parsed = urlparse(self.url)
         # Keep non-standard port (e.g. site.com:8080) in netloc
         self.netloc = self.parsed.netloc
-        self.domain = self.parsed.netloc.split(':')[0]
+        self.domain = (self.parsed.hostname or self.parsed.netloc.split(':')[0]).lower().rstrip('.')
         self.base_url = f"{self.parsed.scheme}://{self.netloc}"
+        # Allowlist: target host + subdomains by default; explicit extra hosts
+        # (--allow-host) are permitted exactly as supplied.
+        self.allow_hosts = {
+            str(h).strip().lower().rstrip('.')
+            for h in (allow_hosts or [])
+            if str(h).strip()
+        }
         self.deep = deep
         self.timeout = timeout
         self.concurrency = concurrency
@@ -1548,6 +1659,48 @@ class WebsiteRecon:
         self.ruleset = None    # external --rules plugin set (wired in main)
         self.plugins = None    # external --plugin Python modules (wired in main)
         self.timeline_db = None  # SQLite timeline (--timeline; wired in main)
+
+    def _in_scope_url(self, url, redirect=False):
+        """Return True only for the target host, its subdomains or allowlist.
+
+        External OSINT services are allowed for explicit module calls but not
+        for redirect hops. Configured webhook and login hosts are always
+        allowed because the operator supplied them explicitly.
+        """
+        try:
+            host = (urlsplit(str(url)).hostname or "").lower().rstrip('.')
+        except Exception:
+            return False
+        if not host:
+            return False
+        if host in self.allow_hosts:
+            return True
+        # Explicitly configured outbound endpoints (webhook/auth login).
+        for raw in (getattr(self, "webhooks", {}) or {}).values():
+            try:
+                if raw and (urlsplit(str(raw)).hostname or "").lower().rstrip('.') == host:
+                    return True
+            except Exception:
+                pass
+        try:
+            login_host = (urlsplit(str((getattr(self, "auth_cfg", {}) or {}).get("login_url", ""))).hostname
+                          or "").lower().rstrip('.')
+            if login_host and host == login_host:
+                return True
+        except Exception:
+            pass
+        target = (self.domain or "").lower().rstrip('.')
+        if target:
+            if host == target or host.endswith("." + target):
+                return True
+            # Scanning www.example.com is authorized for example.com too.
+            if target.startswith("www."):
+                root = target[4:]
+                if host == root or host.endswith("." + root):
+                    return True
+        if not redirect and host in SCOPE_EXTERNAL_HOSTS:
+            return True
+        return False
 
     def _build_transport(self, concurrency=None):
         """Create the shared httpx client + concurrency semaphore.
@@ -1608,7 +1761,9 @@ class WebsiteRecon:
             # fallback: plain client (no custom transport)
             kw["http2"] = True
             kw["proxy"] = self.proxy or None
-        self.client = httpx.AsyncClient(**kw)
+        inner = httpx.AsyncClient(**kw)
+        self.client = ScopedAsyncClient(
+            inner, self._in_scope_url, rps=getattr(self, "rps", 25))
         self.sem = None
         try:
             self.sem = asyncio.Semaphore(concurrency)
@@ -5235,6 +5390,22 @@ class WebsiteRecon:
                 ctx = await browser.new_context(
                     viewport={"width": 1366, "height": 900},
                     user_agent="Mozilla/5.0 (X11; Linux x86_64) NULLVEIL-Recon/3.1 (screenshot)")
+                # Browser requests bypass the httpx client. Block every
+                # navigation/subresource outside target scope so a redirect or
+                # injected JS cannot make the headless browser scan a third party.
+                async def _scope_route(route, request):
+                    try:
+                        if (str(request.url).startswith(("data:", "blob:", "about:"))
+                                or self._in_scope_url(request.url, redirect=True)):
+                            await route.continue_()
+                        else:
+                            await route.abort()
+                    except Exception:
+                        try:
+                            await route.abort()
+                        except Exception:
+                            pass
+                await ctx.route("**/*", _scope_route)
                 sem = asyncio.Semaphore(3)   # gentle parallelism
 
                 async def shoot(i, u):
@@ -5245,6 +5416,10 @@ class WebsiteRecon:
                             resp = await page.goto(u, timeout=int(self.timeout * 1000) + 8000,
                                                    wait_until="domcontentloaded")
                             rec["status"] = resp.status if resp else ""
+                            if not self._in_scope_url(page.url, redirect=True):
+                                rec["error"] = "out-of-scope redirect blocked"
+                                await page.close()
+                                return rec
                             await page.wait_for_timeout(600)     # let late JS settle
                             rec["title"] = (await page.title() or "")[:80]
                             fname = f"{i:02d}-" + re.sub(r'[^A-Za-z0-9._-]', '_',
@@ -5287,7 +5462,7 @@ class WebsiteRecon:
             return
 
         cmd = [exe, "-u", self.base_url, "-jsonl", "-silent", "-no-color", "-duc",
-               "-severity", "critical,high,medium",
+               "-dr", "-severity", "critical,high,medium",
                "-timeout", str(max(self.timeout, 8)),
                "-retries", "1",
                "-c", str(min(self.concurrency, 25)),
@@ -5376,7 +5551,7 @@ class WebsiteRecon:
 
         depth = 5 if self.deep else 3
         cmd = [exe, "-u", self.base_url, "-jsonl", "-d", str(depth),
-               "-jc", "-silent", "-timeout", str(max(self.timeout, 8)),
+               "-dr", "-jc", "-silent", "-timeout", str(max(self.timeout, 8)),
                "-c", str(min(self.concurrency, 25)),
                "-ef", "png,jpg,jpeg,gif,svg,css,ico,woff,woff2,mp4,pdf"]
         for h in getattr(self, "_auth_cmd", []):
@@ -5507,6 +5682,8 @@ class WebsiteRecon:
         ext_count = 0
         if lf_exe and js_urls:
             for u in js_urls[:6]:
+                if not self._in_scope_url(u, redirect=True):
+                    continue
                 try:
                     proc = await asyncio.create_subprocess_exec(
                         lf_exe, "-i", u, "-o", "json",
@@ -7773,9 +7950,11 @@ class WebsiteRecon:
             return (p if p.startswith('http')
                     else self.base_url.rstrip('/') + (p if p.startswith('/') else '/' + p))
 
-        bare = httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, verify=False,
-                                 headers={"User-Agent": self.client.headers.get(
-                                     "User-Agent", f"NULLVEIL-Recon/{__version__}")})
+        bare = ScopedAsyncClient(
+            httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, verify=False,
+                              headers={"User-Agent": self.client.headers.get(
+                                  "User-Agent", f"NULLVEIL-Recon/{__version__}")}),
+            self._in_scope_url, rps=getattr(self, "rps", 25))
         diffs, role_matrix, gated = [], {}, []
 
         async def _probe(cli, path, headers=None, cookies=None):
@@ -7866,9 +8045,11 @@ class WebsiteRecon:
         # a no-auth client is needed for the "session-only" comparison
         own_bare = False
         if bare is None:
-            bare = httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, verify=False,
-                                     headers={"User-Agent": self.client.headers.get(
-                                         "User-Agent", f"NULLVEIL-Recon/{__version__}")})
+            bare = ScopedAsyncClient(
+                httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, verify=False,
+                                  headers={"User-Agent": self.client.headers.get(
+                                      "User-Agent", f"NULLVEIL-Recon/{__version__}")}),
+                self._in_scope_url, rps=getattr(self, "rps", 25))
             own_bare = True
         try:
             return await self._auth_admin_audit_run(eps, bare, found, findings)
@@ -13320,6 +13501,8 @@ def main():
     parser.add_argument("-d", "--deep", action="store_true", help="Deep mode: bigger wordlists, more ports, extra path checks")
     parser.add_argument("-t", "--timeout", type=int, default=10, help="HTTP/DNS timeout in seconds (default: 10)")
     parser.add_argument("-c", "--concurrency", type=int, default=100, help="Max concurrent requests (default: 100)")
+    parser.add_argument("--rps", type=float, default=25, metavar="N",
+                        help="Max requests/second across the shared client (default: 25; 0 disables)")
     parser.add_argument("-o", "--output", metavar="FILE", help="Save JSON report to file")
     parser.add_argument("-H", "--html", metavar="FILE", help="Save standalone HTML report to file (e.g. report.html)")
     parser.add_argument("-w", "--wordlist", metavar="FILE", help="Custom subdomain wordlist file (one per line)")
@@ -13361,6 +13544,9 @@ def main():
                            "CIDR blocks are expanded to host IPs (capped by --max-hosts).")
     advg.add_argument("--max-hosts", type=int, metavar="N", default=1024,
                       help="Safety cap on how many hosts a CIDR expands to in batch mode (default: 1024)")
+    advg.add_argument("--allow-host", action="append", metavar="HOST", default=None,
+                      help="Explicitly allow an extra in-scope hostname (repeatable). Default scope is the "
+                           "target host plus its subdomains; redirects to any other host are blocked.")
     advg.add_argument("--evade", choices=["none", "light", "stealth"], default="none",
                       help="WAF-evasion profile (default: none). 'light' rotates a coherent real-browser header "
                            "profile per request + small jitter; 'stealth' adds wider jitter. Read-only — never "
@@ -13669,6 +13855,8 @@ def _scan_target(args, attack_indices, ports, target, out_suffix=""):
         ports=ports,
         wordlist=args.wordlist,
         proxy=args.proxy or None,
+        allow_hosts=args.allow_host,
+        rps=args.rps,
     )
     recon.attack_set = attack_indices
     recon.har_files = [str(f) for f in (args.har or [])]

@@ -382,6 +382,8 @@ python3 nullveil_recon.py -l
 | `-d`, `--deep` | Deep mode: bigger wordlists, more ports & paths |
 | `-t`, `--timeout N` | HTTP/DNS timeout in seconds (default: 10) |
 | `-c`, `--concurrency N` | Max concurrent requests (default: 100) |
+| `--rps N` | Max requests/second across the shared client (default: 25; `0` disables) |
+| `--allow-host HOST` | Explicitly allow an extra in-scope hostname (repeatable); target host + subdomains are in scope by default |
 | `-p`, `--ports LIST` | Custom ports, e.g. `80,443,8080` |
 | `-o`, `--output FILE` | Save JSON report to file |
 | `-H`, `--html FILE` | Save standalone HTML report (open in browser) |
@@ -559,6 +561,8 @@ A few v3 features are **deliberately shaped** so the tool stays defensive & repo
 | Multi-tenant correlation | Correlates **domains you provide/own** (`--correlate`) or auto-derived from your cert SANs |
 
 Compliance output is **evidence-based partial mapping**, never a certification claim.
+
+**Scope-locked traffic:** the shared HTTP client follows redirects manually and blocks any hop outside the target host/subdomains; `--allow-host` adds explicit extras. The headless browser uses the same rule, optional subprocess tools have redirects disabled, and the shared client is rate-limited to **25 req/s** by default (`--rps`).
 
 ### v3.9.0 notes (mass scanning · WAF evasion · deep accuracy)
 
