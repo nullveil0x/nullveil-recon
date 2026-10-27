@@ -159,7 +159,7 @@ REPORT=$(curl -s -X POST http://127.0.0.1:8900/scan \
 SCORE=$(echo "$REPORT" | jq '.summary | .dedupe_removed')      # or any metric
 echo "$REPORT" | jq '.errors'
 # fail the build on a CRITICAL finding, for example:
-echo "$REPORT" | jq -e '[.cvss.findings[]? | select(.severity=="CRITICAL")] | length == 0'
+echo "$REPORT" | jq -e '[.findings[]? | select(.severity=="CRITICAL")] | length == 0'
 ```
 
 Combine with `--watch` (module 49) for scheduled drift scans, or with the

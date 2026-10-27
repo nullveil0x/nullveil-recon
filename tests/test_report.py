@@ -54,6 +54,29 @@ def test_compute_diff_first_scan(nv, recon):
     assert "baseline" in d.get("note", "").lower()
 
 
+def test_compliance_tls_evidence_names_only_accepted_versions(nv, recon):
+    import asyncio
+    recon.results["tls_matrix"] = [
+        ("TLS 1.0", "yes", "ECDHE-RSA-AES128-SHA", "128"),
+        ("TLS 1.1", "no", "-", "-"),
+        ("TLS 1.2", "yes", "ECDHE-RSA-AES128-GCM-SHA256", "128"),
+        ("TLS 1.3", "no", "-", "-"),
+    ]
+    recon.results["tls_findings"] = [
+        ("HIGH", "TLS 1.0 enabled", "TLS 1.0 handshake accepted"),
+        ("LOW", "No TLS 1.3", "TLS 1.3 not offered"),
+    ]
+    asyncio.run(nv.WebsiteRecon.compliance_map(recon))
+    controls = []
+    for fw in recon.results["compliance"]["frameworks"].values():
+        controls.extend(fw.get("controls", []))
+    tls_rows = [c for c in controls if c["ref"] in ("4.2.1", "A.8.24", "CC6.6")]
+    assert tls_rows
+    for row in tls_rows:
+        assert "TLS 1.1" not in row["evidence"], row
+        assert "TLS 1.0" in row["evidence"], row
+
+
 def test_export_canonical_risk_compliance_and_inventory(nv, recon):
     recon.results["compliance"] = {
         "coverage_pct": 80, "assessment_completeness_pct": 80,
@@ -79,6 +102,7 @@ def test_export_canonical_risk_compliance_and_inventory(nv, recon):
     assert rep["summary"]["api_endpoints"] == len(rep["endpoint_inventory"]) == 1
     # duplicate admin finding collapses; INFO is not a finding
     assert rep["summary"]["admin_api_findings"] == 1
+    assert len(rep["admin_api"]["findings"]) == 1
     # compliance keeps coverage and pass-rate as separate exported metrics
     comp = rep["compliance"]
     assert comp["pass_rate_pct"] == 75
@@ -131,6 +155,177 @@ def test_non_risk_markers_do_not_hide_real_findings(nv, recon):
     assert not recon._is_non_risk_text("Metadata service", "cloud metadata reachable")
     assert recon._is_non_risk_text("TLS 1.0", "Status: PASS — not offered")
     assert recon._is_non_risk_text("Breach monitoring", "Status: NOT_CONFIGURED")
+
+
+def test_canonical_root_findings_carry_child_metadata(nv, recon):
+    detail = ("TLS 1.0 handshake accepted at https://example.com:443 — "
+              "disable TLS 1.0 (CWE-326)")
+    recon.results["tls_findings"] = [
+        ("INFO", "TLS 1.0 not offered", "Status: PASS — not offered (CVSS N/A)"),
+        ("HIGH", "TLS 1.0 enabled", detail),
+    ]
+    recon.results["diff_findings"] = [
+        ("INFO", "new open port observed", "Status: OBSERVED — 1 new port: 8080"),
+    ]
+    recon.results["breach"] = {"findings": [
+        ("INFO", "Breach Monitoring Not Configured",
+         "Status: NOT_CONFIGURED — set HIBP_API_KEY"),
+    ]}
+    fp = recon._finding_fingerprint("HIGH", "TLS 1.0 enabled", detail, "tls")
+    recon.results["patch"] = {"patches": [{
+        "severity": "HIGH", "check": "TLS 1.0 enabled", "source": "tls",
+        "finding": detail, "title": "Modernise TLS configuration",
+        "remediation": "Disable TLS 1.0 and 1.1.", "fingerprint": fp,
+    }]}
+    recon.results["poc"] = {"pocs": [{
+        "severity": "HIGH", "check": "TLS 1.0 enabled", "source": "tls",
+        "finding": detail, "fingerprint": fp,
+        "commands": [{"desc": "Read certificate", "cmd": "openssl s_client -connect example.com:443"}],
+    }]}
+    recon.results["cvss"] = {"count": 1, "register": [{
+        "severity": "HIGH", "cvss_severity": "HIGH", "source_severity": "HIGH",
+        "check": "TLS 1.0 enabled", "source": "tls", "detail": detail,
+        "cvss4_score": 8.2, "cvss31_score": 7.4,
+        "cvss4_vector": "CVSS:4.0/AV:N/AC:H/AT:P/PR:N/UI:N/VC:H/VI:N/VA:N",
+        "cvss31_vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        "score": 8.2, "category": "tls_legacy", "cwe": "CWE-326",
+        "cwe_name": "Inadequate Encryption Strength", "rebanded": None,
+        "fingerprint": fp,
+    }]}
+    recon.results["attack_map"] = {"techniques": [{
+        "id": "T1040", "name": "Network Sniffing", "tactic": "Credential Access",
+        "examples": [{"check": "TLS 1.0 enabled", "severity": "HIGH",
+                      "detail": detail, "fingerprint": fp}],
+    }]}
+
+    rep = nv.WebsiteRecon.export_dict(recon)
+    # PASS/NOT_CONFIGURED/OBSERVED stay in their module evidence, not counters.
+    assert rep["findings_total"] == 1
+    assert rep["severity_counts"]["HIGH"] == 1
+    assert rep["severity_counts"]["INFO"] == 0
+    assert rep["finding_index"]["count"] == len(rep["findings"]) == 1
+    assert rep["root_findings"]
+    f = rep["findings"][0]
+    for field in ("title", "category", "status", "severity", "confidence", "cvss",
+                  "evidence", "affected_assets", "poc", "remediation", "cwe",
+                  "attack", "finding_id", "fingerprint"):
+        assert field in f, field
+    assert f["status"] == f["lifecycle"] == "OBSERVED"
+    assert f["cvss"]["score"] == 8.2
+    assert f["cvss"]["cwe"] == "CWE-326"
+    assert f["cwe"] == "CWE-326"
+    assert any("example.com" in a for a in f["affected_assets"])
+    assert f["poc"] and "openssl" in f["poc"][0]["cmd"]
+    assert f["remediation"]["title"] == "Modernise TLS configuration"
+    assert f["attack"][0]["id"] == "T1040"
+    assert not any(x["title"] in ("TLS 1.0 not offered", "new open port observed",
+                                  "Breach Monitoring Not Configured")
+                   for x in rep["findings"])
+
+
+def test_regular_html_has_canonical_findings_and_counts(nv, recon):
+    recon.results["tls_findings"] = [
+        ("HIGH", "TLS 1.0 enabled", "TLS 1.0 handshake accepted at https://example.com:443"),
+        ("INFO", "TLS 1.1 not offered", "Status: PASS — not offered (CVSS N/A)"),
+    ]
+    rep = nv.WebsiteRecon.export_dict(recon)
+    html = nv.WebsiteRecon._render_html(rep)
+    assert "EXPOSURE RISK" in html
+    assert "Root Findings (1)" in html
+    assert "TLS 1.0 enabled" in html
+    assert "TLS 1.1 not offered" not in html
+    assert "INFO: 0" in html
+    assert "HIGH: 1" in html
+    assert "TOTAL: 1" in html
+
+
+def test_email_finding_triples_export_without_unpacking_error(nv, recon):
+    recon.results["email_findings"] = [
+        ("HIGH", "SPF uses '+all'", "Replace with -all and validate DMARC alignment"),
+    ]
+    rep = nv.WebsiteRecon.export_dict(recon)
+    row = rep["email_security"]["findings"][0]
+    assert row == {
+        "severity": "HIGH",
+        "check": "SPF uses '+all'",
+        "detail": "Replace with -all and validate DMARC alignment",
+    }
+    assert rep["findings_total"] == 1
+    assert rep["findings"][0]["title"] == "SPF uses '+all'"
+    assert "Replace with -all" in rep["findings"][0]["evidence"]
+
+
+def test_empty_canonical_list_suppresses_module_observations(nv, recon):
+    recon.results["tls_findings"] = [
+        ("INFO", "TLS 1.0 not offered", "Status: PASS — TLS 1.0 is not offered (CVSS N/A)"),
+    ]
+    rep = nv.WebsiteRecon.export_dict(recon)
+    assert rep["findings_total"] == 0
+    assert rep["findings"] == []
+    html = nv.WebsiteRecon._render_html(rep)
+    assert "TLS 1.0 not offered" not in html
+    assert "INFO: 0" in html
+    assert "TOTAL: 0" in html
+    exec_html = recon.build_executive_html(rep)
+    assert "TLS 1.0 not offered" not in exec_html
+
+
+def test_enrichment_sections_are_not_finding_lists(nv, recon):
+    recon.results["tls_findings"] = [
+        ("HIGH", "TLS 1.0 enabled", "TLS 1.0 handshake accepted"),
+    ]
+    recon.results["cvss"] = {"count": 1, "register": [], "examples": [{"check": "x"}]}
+    recon.results["attack_map"] = {"techniques": [], "examples": [{"check": "x"}]}
+    rep = nv.WebsiteRecon.export_dict(recon)
+    assert "findings" not in rep["cvss"]
+    assert "findings" not in rep["mitre_attack"]
+    assert rep["findings_total"] == len(rep["findings"]) == 1
+
+
+def test_tls13_not_offered_remains_low_config_gap(nv, recon):
+    recon.results["tls_findings"] = [
+        ("LOW", "No TLS 1.3", "TLS 1.3 not offered — consider enabling modern TLS"),
+    ]
+    rep = nv.WebsiteRecon.export_dict(recon)
+    assert rep["findings_total"] == 1
+    assert rep["findings"][0]["title"] == "No TLS 1.3"
+    assert rep["findings"][0]["severity"] == "LOW"
+
+
+def test_cvss_does_not_autoraise_config_gaps(nv, recon):
+    import asyncio
+
+    recon.results["email_findings"] = [
+        ("HIGH", "SPF uses '+all'", "Explicit permissive policy"),
+        ("MEDIUM", "No DMARC record", "Publish a DMARC policy"),
+        ("LOW", "No MTA-STS record", "Publish MTA-STS"),
+    ]
+    asyncio.run(nv.WebsiteRecon.cvss_score_findings(recon))
+    rows = recon.results["cvss"]["register"]
+    assert rows
+    rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    for row in rows:
+        assert row["score"] < 9.0
+        assert row["cvss_severity"] != "CRITICAL"
+        assert rank[row["cvss_severity"]] <= rank[row["source_severity"]]
+
+
+def test_threat_intel_match_keeps_low_requires_validation(nv, recon):
+    recon.results["intel"] = {"findings": [(
+        "LOW", "Threat Intelligence Match",
+        "example.com appears in 2 OTX pulses · Status: REQUIRES_VALIDATION · "
+        "confidence: MEDIUM · external third-party match, not evidence of compromise",
+    )]}
+    rep = nv.WebsiteRecon.export_dict(recon)
+    assert rep["findings_total"] == 1
+    assert rep["severity_counts"]["LOW"] == 1
+    f = rep["findings"][0]
+    assert f["severity"] == "LOW"
+    assert f["status"] == "REQUIRES_VALIDATION"
+    assert f["confidence"] == "MEDIUM"
+    # A third-party listing is not scored/treated as a confirmed vulnerability.
+    assert f["cvss"]["status"] == "N/A"
+    assert f["cvss"]["score"] is None
 
 
 def test_secret_redaction_is_idempotent_and_keeps_context(nv):

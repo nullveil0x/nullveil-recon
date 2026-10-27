@@ -69,6 +69,7 @@ Usage:
 """
 
 import asyncio
+import copy
 import ssl
 import socket
 import re
@@ -1902,13 +1903,23 @@ class WebsiteRecon:
         # produced by the discovery pass (incl. the Tier-1 modules 40-44). Sort the
         # deferred pass by execution rank. 50 vulnverify runs in the deferred pass
         # (it needs the API pool) but BEFORE the reporting modules.
-        _LATE = {35, 36, 37, 39, 45, 46, 47, 49}
+        _LATE = {35, 36, 37, 45, 46, 47, 49, 39}
+        # Enrichment must happen before the executive report consumes it:
+        # patch/PoC -> CVSS/ATT&CK/CVE intel -> watch -> exec. Keeping 39 last
+        # prevents the executive PDF from showing CVSS/CWE/ATT&CK as N/A when
+        # those modules are selected in the same scan.
+        _LATE_ORDER = {35: 10, 36: 20, 37: 30, 45: 40, 46: 50, 47: 60, 49: 70, 39: 80}
         modules = []
         deferred = []
         for name, fn, idx in all_modules:
             if idx in self.attack_set:
                 (deferred if idx in DEFERRED else modules).append((name, fn(), idx))
-        deferred.sort(key=lambda t: (t[2] in _LATE, t[2]))
+        def _deferred_rank(t):
+            idx = t[2]
+            if idx in _LATE:
+                return (1, _LATE_ORDER.get(idx, idx))
+            return (0, idx)
+        deferred.sort(key=_deferred_rank)
 
         scan_start = datetime.now()
         progress = Progress(
@@ -2868,15 +2879,24 @@ class WebsiteRecon:
         if spf_record:
             includes = re.findall(r'(?:include|redirect):([\w.\-]+)', spf_record)
             if re.search(r'(?:^|\s)\+all(?:\s|$)', spf_record):
-                findings.append(("CRITICAL", "SPF uses '+all' — ANY server can send mail as this domain (open relay risk)"))
+                # An explicit +all policy is worse than a missing SPF record,
+                # but it is still a configuration weakness — not a validated
+                # CRITICAL compromise. Keep it HIGH and require review.
+                findings.append(("HIGH", "SPF uses '+all' — any host can send mail as this domain",
+                                 "Explicit permissive SPF policy (open spoofing surface); "
+                                 "replace with -all and validate DMARC alignment [Configuration Gap]"))
             elif re.search(r'(?:^|\s)~all(?:\s|$)', spf_record):
-                findings.append(("MEDIUM", "SPF uses '~all' (softfail) — prefer '-all' (hardfail) for stricter policy"))
+                findings.append(("MEDIUM", "SPF uses '~all' (softfail)",
+                                 "Prefer '-all' (hardfail) for a stricter policy [Configuration Gap]"))
             elif not re.search(r'(?:^|\s)-(?:all)(?:\s|$)', spf_record):
-                findings.append(("LOW", "SPF has no '-all' terminator — policy is ambiguous"))
+                findings.append(("LOW", "SPF has no '-all' terminator",
+                                 "SPF policy is ambiguous; add an explicit -all terminator [Configuration Gap]"))
             if len(includes) > 10:
-                findings.append(("LOW", f"SPF has {len(includes)} includes — DNS lookup limit is 10, may break"))
+                findings.append(("LOW", "SPF DNS lookup limit exceeded",
+                                 f"{len(includes)} include/redirect terms may exceed the 10-lookup SPF limit [Configuration Gap]"))
         else:
-            findings.append(("MEDIUM", "No SPF record — domain spoofing possible for phishing [Configuration Gap]"))
+            findings.append(("MEDIUM", "No SPF record",
+                             "Domain spoofing is possible for phishing; publish an SPF policy [Configuration Gap]"))
         self.results['spf'] = spf_record or ""
         self.results['spf_includes'] = sorted(set(re.findall(r'(?:include|redirect):([\w.\-]+)', spf_record))) if spf_record else []
 
@@ -2896,8 +2916,9 @@ class WebsiteRecon:
         await asyncio.gather(*[try_dkim(s) for s in dkim_selectors])
         self.results['dkim'] = {k: v for k, v in dkim_found.items()}
         if not dkim_found:
-            findings.append(("LOW", f"DKIM not detected on {len(dkim_selectors)} common selectors "
-                                       f"(NOT_PROVEN — custom selector possible) [Configuration Gap]"))
+            findings.append(("LOW", "DKIM not detected",
+                             f"No DKIM key found on {len(dkim_selectors)} common selectors; "
+                             "a custom selector may still exist (NOT_PROVEN) [Configuration Gap]"))
 
         # ---------- DMARC ----------
         dmarc_record = next((t for t in dmarc_txt if t.lower().startswith('v=dmarc1')), None)
@@ -2907,24 +2928,35 @@ class WebsiteRecon:
             policy = policy_m.group(1).lower() if policy_m else "none"
             self.results['dmarc_policy'] = policy
             if policy == "none":
-                findings.append(("MEDIUM", "DMARC policy is 'p=none' — monitoring only, spoofing not blocked [Configuration Gap]"))
+                findings.append(("MEDIUM", "DMARC policy is 'p=none'",
+                                 "Monitoring only; spoofing is not blocked. Move to quarantine/reject "
+                                 "[Configuration Gap]"))
             elif policy == "quarantine":
-                findings.append(("LOW", "DMARC policy 'p=quarantine' — consider 'p=reject' for full protection [Configuration Gap]"))
+                findings.append(("LOW", "DMARC policy 'p=quarantine'",
+                                 "Consider 'p=reject' for full protection [Configuration Gap]"))
             else:
-                findings.append(("INFO", "DMARC policy 'p=reject' — strongest anti-spoofing policy [OK]"))
+                findings.append(("INFO", "DMARC policy 'p=reject'",
+                                 "Strongest anti-spoofing policy [OK]"))
             if not re.search(r'rua\s*=', dmarc_record):
-                findings.append(("LOW", "DMARC has no 'rua=' aggregate report address — you won't see abuse reports [Configuration Gap]"))
+                findings.append(("LOW", "DMARC has no aggregate report address",
+                                 "Add 'rua=' to receive abuse reports [Configuration Gap]"))
             sp_m = re.search(r'(?:^|;)\s*sp\s*=\s*(\w+)', dmarc_record)
             if sp_m and sp_m.group(1).lower() == "none":
-                findings.append(("MEDIUM", "DMARC subdomain policy 'sp=none' — subdomains are unprotected [Configuration Gap]"))
+                findings.append(("MEDIUM", "DMARC subdomain policy is 'sp=none'",
+                                 "Subdomains are unprotected; align 'sp' with the main policy "
+                                 "[Configuration Gap]"))
         else:
-            findings.append(("MEDIUM", "No DMARC record — domain can be spoofed for phishing [Configuration Gap]"))
+            findings.append(("MEDIUM", "No DMARC record",
+                             "Domain can be spoofed for phishing; publish a DMARC policy "
+                             "[Configuration Gap]"))
 
         # ---------- MTA-STS ----------
         mtasts_record = next((t for t in mtasts_txt if 'v=STSv1' in t), None)
         self.results['mta_sts'] = mtasts_record or ""
         if not mtasts_record:
-            findings.append(("LOW", "No MTA-STS — SMTP TLS downgrade attacks possible [Configuration Gap]"))
+            findings.append(("LOW", "No MTA-STS record",
+                             "SMTP TLS downgrade attacks are possible; publish MTA-STS "
+                             "[Configuration Gap]"))
 
         # ---------- BIMI ----------
         bimi_record = next((t for t in bimi_txt if 'v=BIMI1' in t), None)
@@ -2946,7 +2978,9 @@ class WebsiteRecon:
                 break
         self.results['mail_provider'] = provider
         if not mx:
-            findings.append(("INFO", "No MX records — domain may not receive email"))
+            findings.append(("INFO", "No MX records",
+                             "Status: OBSERVED — domain may not receive email; "
+                             "verify whether this is intentional"))
 
         # ---------- Extra suspicious TXT (BIMI/other) ----------
         self.results['email_findings'] = sorted(findings, key=lambda x: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}.get(x[0], 5))
@@ -4558,8 +4592,13 @@ class WebsiteRecon:
                                 "status": "listed" if hits else "clean",
                                 "detail": f"{total} active phishing URLs scanned"})
                 if hits:
-                    findings.append(("CRITICAL", "Active phishing",
-                                     f"{len(hits)} open phish URL(s) targeting this domain: {hits[0][:90]}"))
+                    # A public phishing feed is third-party intelligence, not
+                    # proof that the target is compromised. Keep it LOW and
+                    # require validation before any incident claim.
+                    findings.append(("LOW", "Threat Intelligence Match — OpenPhish",
+                                     f"{len(hits)} phishing URL(s) in the OpenPhish feed mention this domain: "
+                                     f"{hits[0][:90]} · Status: REQUIRES_VALIDATION · confidence: MEDIUM · "
+                                     f"external third-party feed, not evidence of compromise"))
         except Exception:
             sources.append({"source": "OpenPhish", "target": "-", "status": "unavailable",
                             "detail": "feed download failed"})
@@ -4578,9 +4617,11 @@ class WebsiteRecon:
                                     "detail": "SSL cert blacklist scan"})
                     for ip in hits:
                         m = re.search(rf'"{re.escape(ip)}",\s*"([^"]+)"', text)
-                        findings.append(("HIGH", "SSLBL listed IP",
-                                         f"{ip} is on abuse.ch SSLBL as botnet C2"
-                                         + (f" ({m.group(1)})" if m else "")))
+                        findings.append(("LOW", "Threat Intelligence Match — SSLBL",
+                                         f"{ip} is listed on abuse.ch SSLBL as a possible botnet C2"
+                                         + (f" ({m.group(1)})" if m else "")
+                                         + " · Status: REQUIRES_VALIDATION · confidence: MEDIUM · "
+                                           "external third-party listing, not evidence of compromise"))
             except Exception:
                 sources.append({"source": "SSLBL", "target": "-", "status": "unavailable",
                                 "detail": "blacklist download failed"})
@@ -4609,9 +4650,11 @@ class WebsiteRecon:
                     reasons = {"2": "explicit drop zone", "3": "CBL", "4": "DSBL",
                                "6": "systems compromised", "7": "house", "8": "SOULL",
                                "9": "CSS prefix/proxy", "10": "missing PTR"}
-                    findings.append(("HIGH", "Spamhaus listed",
+                    findings.append(("LOW", "Threat Intelligence Match — Spamhaus",
                                      f"{ip} listed in Spamhaus Zen (127.0.0.{code}"
-                                     + (f": {reasons.get(code, 'listed')}" if code in reasons else "") + ")"))
+                                     + (f": {reasons.get(code, 'listed')}" if code in reasons else "")
+                                     + ")" + " · Status: REQUIRES_VALIDATION · confidence: MEDIUM · "
+                                       "external third-party listing, not evidence of compromise"))
                     sources.append({"source": "Spamhaus Zen", "target": ip, "status": "listed",
                                     "detail": data})
                 else:
@@ -4635,9 +4678,10 @@ class WebsiteRecon:
                 sources.append({"source": "AbuseIPDB", "target": ips[0], "status": "listed" if score else "clean",
                                 "detail": f"{score}% confidence, {d.get('totalReports', 0)} reports"})
                 if score >= 25:
-                    findings.append(("HIGH", "AbuseIPDB reports",
+                    findings.append(("LOW", "Threat Intelligence Match — AbuseIPDB",
                                      f"{ips[0]} has {score}% abuse confidence ({d.get('totalReports', 0)} reports, "
-                                     f"usage: {d.get('usageType', '?')})"))
+                                     f"usage: {d.get('usageType', '?')}) · Status: REQUIRES_VALIDATION · "
+                                     f"confidence: MEDIUM · external third-party report, not evidence of compromise"))
             except Exception:
                 sources.append({"source": "AbuseIPDB", "target": ips[0], "status": "unavailable",
                                 "detail": "check failed"})
@@ -4727,9 +4771,13 @@ class WebsiteRecon:
 
         # 3) keyless: re-surface phishing exposure from threat intel if present
         for f in self.results.get('intel', {}).get('findings', []):
-            if isinstance(f, (list, tuple)) and len(f) == 3 and f[1] == "Active phishing":
-                findings.append(f)      # (severity, check, detail) — same shape as ours
-        if not key and not findings:
+            if (isinstance(f, (list, tuple)) and len(f) == 3
+                    and str(f[1]).startswith("Threat Intelligence Match — OpenPhish")):
+                findings.append(f)      # same shape as ours; dedupe collapses it
+        if not key:
+            # Always state that monitoring is unavailable, even when unrelated
+            # threat-intel rows exist. INFO/NOT_CONFIGURED is not a finding and
+            # is excluded from root counters/risk/CVSS.
             findings.append(("INFO", "Breach Monitoring Not Configured",
                              "Status: NOT_CONFIGURED — breach/credential monitoring needs a free "
                              "HIBP_API_KEY; no breach or leaked-secret claim is made (CVSS N/A). "
@@ -4808,6 +4856,14 @@ class WebsiteRecon:
         def run(key):
             return key in ran
 
+        def legacy_tls(e):
+            versions = []
+            if e.get('tls10'):
+                versions.append('TLS 1.0')
+            if e.get('tls11'):
+                versions.append('TLS 1.1')
+            return " and ".join(versions) if versions else "legacy TLS"
+
         # (framework, ref, title, fn(ev)->(status, evidence))
         CONTROLS = [
             # ---------------- PCI-DSS v4.0 ----------------
@@ -4817,7 +4873,7 @@ class WebsiteRecon:
              (PART, f"{e['hdr_missing']} security headers missing") if run('http') and e['hdr_missing'] else
              (YES, "no exposed debug/config surfaces in probe scope") if e['cve_run'] else (NEED, "run -a cve,http")),
             ("PCI-DSS v4.0", "4.2.1", "Strong cryptography protects cardholder data in transit",
-             lambda e: (NO, "legacy TLS 1.0/1.1 accepted") if e['tls10'] or e['tls11'] else
+             lambda e: (NO, f"legacy {legacy_tls(e)} accepted") if e['tls10'] or e['tls11'] else
              (NO, "weak crypto negotiated") if e['weak_crypto'] else
              (YES, "TLS 1.2+ only, modern ciphers") if e['tls_run'] else (NEED, "run -a tls")),
             ("PCI-DSS v4.0", "6.2.4", "Secure coding techniques mitigate common software attacks",
@@ -4872,7 +4928,10 @@ class WebsiteRecon:
              lambda e: (PART, f"soft-404 masking {'present' if e['soft404'] else 'absent'} in probe baseline")
              if e['anom_run'] else (NEED, "run -a anom")),
             ("ISO 27001:2022", "A.8.24", "Use of cryptography",
-             lambda e: (NO, "legacy TLS/weak ciphers enabled") if (e['tls10'] or e['tls11'] or e['weak_crypto']) else
+             lambda e: (NO, f"legacy {legacy_tls(e)} accepted; weak ciphers enabled")
+             if (e['weak_crypto'] and (e['tls10'] or e['tls11'])) else
+             (NO, "weak ciphers enabled") if e['weak_crypto'] else
+             (NO, f"legacy {legacy_tls(e)} accepted") if (e['tls10'] or e['tls11']) else
              (YES, "TLS 1.2+ with modern cipher suites") if e['tls_run'] else (NEED, "run -a tls")),
             ("ISO 27001:2022", "A.8.26", "Application security requirements",
              lambda e: (PART, f"security headers present: {e['hdr_present']}, missing: {e['hdr_missing']}")
@@ -4886,7 +4945,7 @@ class WebsiteRecon:
              lambda e: (NO, f"{e['audit_high']} unprotected/weak-auth API endpoints") if e['audit_high'] else
              (PART, "external API posture only") if e['audit_run'] else (NEED, "run -a audit")),
             ("SOC 2 TSC", "CC6.6", "Threats outside system boundaries",
-             lambda e: (NO, "legacy TLS accepted — boundary encryption weakened") if (e['tls10'] or e['tls11']) else
+             lambda e: (NO, f"{legacy_tls(e)} accepted — boundary encryption weakened") if (e['tls10'] or e['tls11']) else
              (YES, "modern TLS baseline") if e['tls_run'] else (NEED, "run -a tls")),
             ("SOC 2 TSC", "CC6.7", "Transmission and movement of data",
              lambda e: (NO, "cleartext (http) third-party form action") if
@@ -6576,6 +6635,7 @@ class WebsiteRecon:
         try:
             fi = self.results.get('finding_index') or {}
             roots = self.results.get('root_findings') or {}
+            maps = self._finding_metadata_maps()
             out = []
             for f in fi.get('findings', []):
                 sev = f.get('severity','INFO')
@@ -6593,6 +6653,10 @@ class WebsiteRecon:
                     conf = 'VERIFIED'
                 if any(x in text for x in ['informational', 'banner', 'version only']):
                     conf = 'LOW'
+                # Third-party intelligence is explicitly medium-confidence
+                # until an operator validates it, regardless of LOW severity.
+                if any(x in text for x in ['requires_validation', 'requires validation']):
+                    conf = 'MEDIUM'
                 # Status is evidence-based, never inferred from severity. A
                 # HIGH finding that was merely observed is OBSERVED, not
                 # VALIDATED/VERIFIED.
@@ -6614,7 +6678,15 @@ class WebsiteRecon:
                     lifecycle = 'VALIDATED'
                 else:
                     lifecycle = 'OBSERVED'
-                out.append({**f, 'lifecycle': lifecycle, 'confidence': conf, 'root_finding_id': roots.get(f.get('fingerprint'))})
+                row = {**f, 'lifecycle': lifecycle, 'status': lifecycle,
+                       'confidence': conf, 'root_finding_id': roots.get(f.get('fingerprint'))}
+                # One root finding carries its CVSS/CWE/PoC/remediation/ATT&CK
+                # metadata as child fields, never as separate finding rows.
+                try:
+                    row.update(self._finding_metadata(row, maps))
+                except Exception:
+                    pass
+                out.append(row)
             self.results['finding_lifecycle'] = {'findings': out, 'count': len(out)}
         except Exception:
             pass
@@ -6660,7 +6732,23 @@ class WebsiteRecon:
                 cat, self.CVSS_PROFILES["generic"])
             s4 = self._cvss4_score(macro)
             s31 = self._cvss31_score(vec31)
-            # combined risk = max of the two standards
+            # Do not let the scoring engine auto-escalate a finding above the
+            # evidence-based source severity. A LOW TLS/config gap must not be
+            # shown as CVSS HIGH/CRITICAL, and a missing SPF/DMARC/MTA-STS or
+            # third-party SRI header must never receive an automatic 9.3.
+            # Configuration gaps are capped at MEDIUM even when the generic
+            # category vector has a high integrity impact.
+            cap = {"CRITICAL": 10.0, "HIGH": 8.9,
+                   "MEDIUM": 6.9, "LOW": 3.9}.get(sev_u, 0.0)
+            config_gap = (
+                cat in ("email_spoof", "security_headers", "supply_chain")
+                or self._is_config_gap_text(check, detail)
+            )
+            if config_gap:
+                cap = min(cap, 6.9)
+            s4 = min(s4, cap)
+            s31 = min(s31, cap)
+            # combined risk = max of the capped standards
             score = max(s4, s31)
             band = ("CRITICAL" if score >= 9.0 else "HIGH" if score >= 7.0
                     else "MEDIUM" if score >= 4.0 else "LOW")
@@ -6680,6 +6768,8 @@ class WebsiteRecon:
                 "cvss4_score": s4, "cvss31_vector": vec31, "cvss31_score": s31,
                 "score": score, "category": cat,
                 "cwe": cwe, "cwe_name": cwe_name, "rebanded": delta,
+                "score_cap": cap if score < max(self._cvss4_score(macro),
+                                                self._cvss31_score(vec31)) else None,
             })
         entries.sort(key=lambda e: -e["score"])
         dist = {b: len([e for e in entries if e["severity"] == b])
@@ -6716,9 +6806,14 @@ class WebsiteRecon:
             "top": top,
             "register": entries[:400],
             "skipped": skipped[:200],
-            "findings": findings,
+            # Child metadata only. ``top``/``register`` are scored views of
+            # root findings; this legacy example list must not be counted as
+            # additional findings by downstream consumers.
+            "examples": findings,
             "method": ("Heuristic CVSS 4.0 macro-vector + CVSS 3.1 base score + CWE mapping. "
-                       "Not an authoritative NVD assessment — use for prioritisation only."),
+                       "Configuration gaps are capped at MEDIUM and CVSS never raises a "
+                       "finding above its evidence-based source severity. Not an authoritative "
+                       "NVD assessment — use for prioritisation only."),
         }
         try:
             self._apply_finding_lifecycle()
@@ -6882,7 +6977,9 @@ class WebsiteRecon:
             "available": True, "technique_count": len(tlist),
             "tactic_count": len(tactics), "techniques": tlist, "tactics": tactics,
             "layer": layer,
-            "findings": findings[:200],
+            # ATT&CK is child metadata, never a finding list. The examples are
+            # evidence links only; they must not be counted as root findings.
+            "examples": findings[:200],
             "note": ("Read-only mapping for defensive coverage. No techniques are executed. "
                      "Import the layer into MITRE ATT&CK Navigator (JSON)."),
         }
@@ -8197,7 +8294,7 @@ class WebsiteRecon:
             F.append((sev_u, chk_s, det, src, fid, fp))
 
         # generic (sev, check, detail) triples used across modules
-        # (email_findings uses (sev, message) 2-tuples, so handle both shapes)
+        # (email_findings is now triples; keep 2-tuple compatibility for old reports)
         for key, src in (("email_findings", "email"), ("api_audit_findings", "audit"),
                          ("ext_findings", "ext"), ("tls_findings", "tls"),
                          ("admin_findings", "auth"), ("proxy_findings", "burp"),
@@ -8208,7 +8305,7 @@ class WebsiteRecon:
                 if isinstance(t, (list, tuple)) and len(t) >= 3:
                     add(t[0], t[1], t[2], src)
                 elif isinstance(t, (list, tuple)) and len(t) == 2:
-                    add(t[0], src, t[1], src)
+                    add(t[0], t[1], t[1], src)
         # dict-grouped findings {severity, check/id, detail}
         # NOTE: "cvss" and "attack_map" are deliberately NOT collected here —
         # they are *derived* views over the findings below (scores / ATT&CK
@@ -8232,7 +8329,7 @@ class WebsiteRecon:
                 elif isinstance(f, (list, tuple)) and len(f) >= 3:
                     add(f[0], f[1], f[2], src)
                 elif isinstance(f, (list, tuple)) and len(f) == 2:
-                    add(f[0], src, f[1], src)
+                    add(f[0], f[1], f[1], src)
         # cve / ffuf / katana style
         for f in (r.get("cve_findings") or []):
             if isinstance(f, (list, tuple)) and len(f) >= 3:
@@ -8274,11 +8371,29 @@ class WebsiteRecon:
     # Derived / informational states that must never create exposure or CVSS.
     NON_RISK_MARKERS = (
         "not configured", "not_configured", "not proven", "not_proven",
-        "not detected", "not_detected", "not offered", "not_offered",
+        "not detected", "not_detected",
+        "not found", "not_found",
         "informational", "information only", "metadata only",
         "requires_validation", "requires validation", "not testable", "not_testable",
         "status: pass", "status: passed", "pass —", "pass -", "pass (",
-        "no issues", "no finding", "timed out", "request timeout",
+        "status: observed", "[ok]", "✅", "strong ec key", "strong key",
+        "ocsp stapling", "clean 404s", "no issues", "no finding", "timed out",
+        "request timeout", "connection timeout", "error contacting", "scan error",
+    )
+
+    # Rows with these explicit states are still useful in their module section
+    # (e.g. TLS "not offered" -> PASS), but they are NOT root findings. This is
+    # deliberately narrower than NON_RISK_MARKERS: REQUIRES_VALIDATION stays a
+    # LOW/INFO finding with its status attached, while PASS / NOT_CONFIGURED /
+    # NOT_PROVEN / OBSERVED are observations and must not inflate counters.
+    CANONICAL_EXCLUDED_MARKERS = (
+        "not configured", "not_configured", "not proven", "not_proven",
+        "not detected", "not_detected",
+        "not found", "not_found", "informational", "information only",
+        "metadata only", "not testable", "not_testable", "status: pass",
+        "status: passed", "pass —", "pass -", "pass (", "status: observed",
+        "[ok]", "✅", "strong ec key", "strong key", "ocsp stapling",
+        "clean 404s", "no issues", "no finding", "timed out", "request timeout",
         "connection timeout", "error contacting", "scan error",
     )
     CONFIG_GAP_MARKERS = (
@@ -8297,6 +8412,240 @@ class WebsiteRecon:
     def _is_non_risk_text(cls, check, detail):
         text = f"{check} {detail}".lower()
         return any(m in text for m in cls.NON_RISK_MARKERS)
+
+    @classmethod
+    def _is_canonical_excluded(cls, check, detail):
+        """True for observations that must not become root findings/counters."""
+        text = f"{check} {detail}".lower()
+        if str(detail or "").strip().lower() in ("observed", "observation", "info"):
+            return True
+        return any(m in text for m in cls.CANONICAL_EXCLUDED_MARKERS)
+
+    def _canonical_findings(self):
+        """Return the deduplicated, counter-eligible root-finding rows.
+
+        Module sections keep their observations (PASS, NOT_CONFIGURED,
+        NOT_PROVEN, OBSERVED, etc.), but those rows are not vulnerabilities and
+        must not appear in ``root_findings``/``severity_counts``. Keeping this
+        filter separate from :meth:`_collect_findings` also preserves the raw
+        evidence used by CVSS/patch/PoC regression checks.
+        """
+        try:
+            rows = self._dedupe_findings(self._collect_findings())
+        except Exception:
+            rows = []
+        out = []
+        for f in rows or []:
+            if not isinstance(f, (list, tuple)) or len(f) < 3:
+                continue
+            sev, chk, det = str(f[0] or "INFO").upper(), str(f[1] or ""), str(f[2] or "")
+            src = f[3] if len(f) > 3 else ""
+            if self._is_canonical_excluded(chk, det):
+                continue
+            out.append((sev, chk, det, src))
+        return out
+
+    def _sync_finding_index(self, findings):
+        """Rebuild finding_index/root_findings from the canonical rows.
+
+        ``_collect_findings`` builds an index before near-duplicate removal, so
+        exporting that index directly can make ``len(findings)`` disagree with
+        ``findings_total``. The export path calls this after dedupe/filtering;
+        every output then sees exactly one row per root cause.
+        """
+        idx, roots = [], {}
+        for f in findings or []:
+            if not isinstance(f, (list, tuple)) or len(f) < 3:
+                continue
+            sev, chk, det = str(f[0] or "INFO").upper(), str(f[1] or ""), str(f[2] or "")
+            src = f[3] if len(f) > 3 else ""
+            fp = self._finding_fingerprint(sev, chk, det, src)
+            fid = f"NVF-{fp.upper()}"
+            idx.append({
+                "finding_id": fid, "fingerprint": fp, "severity": sev,
+                "check": chk, "detail": det, "source": src,
+            })
+            roots[fp] = fid
+        self.results["finding_index"] = {"count": len(idx), "findings": idx}
+        self.results["root_findings"] = roots
+        return idx
+
+    def _affected_assets_for(self, check, detail):
+        """Extract concrete affected assets from a finding's evidence.
+
+        Never invent endpoint/port values. Falls back to the scanned base URL
+        only when no more specific asset is present in the evidence.
+        """
+        text = f"{check} {detail}"
+        assets = []
+        for url in re.findall(r"https?://[^\s|,;)\]'\"]+", text):
+            assets.append(url.split("?", 1)[0].rstrip(".:"))
+        if not assets:
+            for path in re.findall(r"(?<![\w.])/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{2,}", text):
+                if path.startswith("//"):
+                    continue
+                try:
+                    assets.append(urljoin(getattr(self, "base_url", "") or "", path))
+                except Exception:
+                    assets.append(path)
+        if not assets:
+            host = getattr(self, "domain", "") or ""
+            base = getattr(self, "base_url", "") or ""
+            if base:
+                assets.append(base)
+            elif host:
+                assets.append(host)
+        out = []
+        for a in assets:
+            a = str(a).strip()
+            if a and a not in out:
+                out.append(a)
+        return out[:10]
+
+    def _finding_metadata_maps(self):
+        """Build lookup maps for child metadata (CVSS/PoC/remediation/ATT&CK)."""
+        r = getattr(self, "results", {}) or {}
+        cvss_fp, cvss_key = {}, {}
+        for e in ((r.get("cvss") or {}).get("register") or []):
+            if not isinstance(e, dict):
+                continue
+            try:
+                if e.get("fingerprint"):
+                    cvss_fp[e["fingerprint"]] = e
+                cvss_key[(str(e.get("check", "")), str(e.get("detail", ""))[:80])] = e
+            except Exception:
+                continue
+        patch_fp, patch_key = {}, {}
+        for p in ((r.get("patch") or {}).get("patches") or []):
+            if not isinstance(p, dict):
+                continue
+            try:
+                if p.get("fingerprint"):
+                    patch_fp[p["fingerprint"]] = p
+                patch_key[(str(p.get("check", "")), str(p.get("finding", ""))[:80])] = p
+            except Exception:
+                continue
+        poc_fp, poc_key = {}, {}
+        for p in ((r.get("poc") or {}).get("pocs") or []):
+            if not isinstance(p, dict):
+                continue
+            try:
+                if p.get("fingerprint"):
+                    poc_fp[p["fingerprint"]] = p
+                poc_key[(str(p.get("check", "")), str(p.get("finding", ""))[:80])] = p
+            except Exception:
+                continue
+        attack_fp, attack_key = {}, {}
+        for t in ((r.get("attack_map") or {}).get("techniques") or []):
+            if not isinstance(t, dict):
+                continue
+            tech = {"id": t.get("id"), "name": t.get("name"), "tactic": t.get("tactic")}
+            for ex in (t.get("examples") or []):
+                try:
+                    fp = ex.get("fingerprint")
+                    key = (str(ex.get("check", "")), str(ex.get("detail", ""))[:80])
+                    if fp:
+                        attack_fp.setdefault(fp, []).append(tech)
+                    attack_key.setdefault(key, []).append(tech)
+                except Exception:
+                    continue
+        return {
+            "cvss_fp": cvss_fp, "cvss_key": cvss_key,
+            "patch_fp": patch_fp, "patch_key": patch_key,
+            "poc_fp": poc_fp, "poc_key": poc_key,
+            "attack_fp": attack_fp, "attack_key": attack_key,
+        }
+
+    def _finding_metadata(self, finding, maps):
+        """Attach all child fields required for one canonical root finding."""
+        sev = str(finding.get("severity") or "INFO").upper()
+        check = str(finding.get("check") or "")
+        detail = str(finding.get("detail") or "")
+        fp = finding.get("fingerprint") or self._finding_fingerprint(
+            sev, check, detail, finding.get("source", ""))
+        key = (check, detail[:80])
+
+        def lookup(fp_map, key_map):
+            hit = fp_map.get(fp) or key_map.get(key)
+            if hit:
+                return hit
+            # A near-duplicate merge appends "(×N)" to the canonical detail;
+            # fall back to a same-check prefix match so child metadata still
+            # links to the surviving root finding.
+            for (c, d), v in key_map.items():
+                if c == check and (detail.startswith(d) or d.startswith(detail[:80])):
+                    return v
+            return {}
+
+        e = lookup(maps["cvss_fp"], maps["cvss_key"])
+        p = lookup(maps["patch_fp"], maps["patch_key"])
+        poc = lookup(maps["poc_fp"], maps["poc_key"])
+        techniques = (maps["attack_fp"].get(fp) or maps["attack_key"].get(key) or [])
+        if not techniques:
+            for (c, d), v in maps["attack_key"].items():
+                if c == check and (detail.startswith(d) or d.startswith(detail[:80])):
+                    techniques = v
+                    break
+        cat = str(e.get("category") or self._cvss_category(check, detail))
+        profile = self.CVSS_PROFILES.get(cat, self.CVSS_PROFILES["generic"])
+        cwe = e.get("cwe") or profile[2]
+        cwe_name = e.get("cwe_name") or profile[3]
+        if e and e.get("score") is not None:
+            cvss = {
+                "status": "SCORED",
+                "score": e.get("score"),
+                "cvss4_score": e.get("cvss4_score"),
+                "cvss31_score": e.get("cvss31_score"),
+                "cvss4_vector": e.get("cvss4_vector"),
+                "cvss31_vector": e.get("cvss31_vector"),
+                "severity": e.get("cvss_severity"),
+                "rebanded": e.get("rebanded"),
+                "cwe": cwe, "cwe_name": cwe_name,
+            }
+        else:
+            cvss = {
+                "status": "N/A", "score": None,
+                "cvss4_score": None, "cvss31_score": None,
+                "cvss4_vector": None, "cvss31_vector": None,
+                "severity": None, "rebanded": None,
+                "cwe": cwe, "cwe_name": cwe_name,
+            }
+        remediation = None
+        if p:
+            remediation = {
+                "title": p.get("title") or "",
+                "markdown": p.get("remediation") or "",
+            }
+        poc_commands = []
+        if isinstance(poc.get("commands"), list):
+            poc_commands = [dict(c) for c in poc["commands"] if isinstance(c, dict)]
+        # de-duplicate techniques by id
+        atk, seen = [], set()
+        for t in techniques:
+            tid = t.get("id")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            atk.append({"id": tid, "name": t.get("name") or "", "tactic": t.get("tactic") or ""})
+        return {
+            "title": check,
+            "category": cat,
+            "status": finding.get("status") or finding.get("lifecycle") or "OBSERVED",
+            "severity": sev,
+            "confidence": finding.get("confidence") or "LOW",
+            "cvss": cvss,
+            "evidence": finding.get("evidence") or detail,
+            "affected_assets": self._affected_assets_for(check, detail),
+            "poc": poc_commands,
+            "remediation": remediation,
+            "cwe": cwe,
+            "cwe_name": cwe_name,
+            "attack": atk,
+            "source": finding.get("source"),
+            "fingerprint": fp,
+            "finding_id": finding.get("finding_id") or finding.get("root_finding_id") or f"NVF-{fp.upper()}",
+            "root_finding_id": finding.get("root_finding_id") or f"NVF-{fp.upper()}",
+        }
 
     def calculate_risk_score(self, findings=None):
         """THE canonical 0-100 exposure risk score.
@@ -8884,7 +9233,16 @@ class WebsiteRecon:
 
         def add(sev, chk, det, src):
             det = re.sub(r"\s+", " ", str(det or "")).strip()[:400]
-            F.append((str(sev or "INFO").upper(), str(chk or ""), det, src))
+            chk = str(chk or "")
+            # Legacy report imports must obey the same observation filter as
+            # the canonical export (PASS/NOT_CONFIGURED/OBSERVED are not root
+            # findings and must not inflate counters).
+            try:
+                if self._is_canonical_excluded(chk, det):
+                    return
+            except Exception:
+                pass
+            F.append((str(sev or "INFO").upper(), chk, det, src))
 
         # dict sections that carry a "findings" list of {severity, message|detail, ...}
         for key, src in (("email_security", "email"), ("external_intel", "ext"),
@@ -8911,7 +9269,7 @@ class WebsiteRecon:
                 elif isinstance(f, (list, tuple)) and len(f) >= 3:
                     add(f[0], f[1], f[2], src)
                 elif isinstance(f, (list, tuple)) and len(f) == 2:
-                    add(f[0], src, f[1], src)
+                    add(f[0], f[1], f[1], src)
         F.sort(key=lambda t: {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2,
                               "LOW": 3, "INFO": 4}.get(t[0], 5) if isinstance(t,(list,tuple)) and t else 5)
         out=[]
@@ -8924,17 +9282,20 @@ class WebsiteRecon:
 
     def _exec_metrics(self, report):
         s = report.get("summary", {})
-        live = self._collect_findings() if getattr(self, "results", None) else []
+        live = self._canonical_findings() if getattr(self, "results", None) else []
         if not live:
             # Prefer the canonical root-finding array embedded in the report
             # (dashboard/PDF-from-history path) over re-deriving from module
             # sections, which can re-introduce duplicates or metadata.
-            canon = report.get("findings") or \
+            # An empty canonical list is still authoritative: do not fall
+            # back to module rows and resurrect PASS/observation entries.
+            has_canon = isinstance(report.get("findings"), list)
+            canon = report.get("findings") if has_canon else \
                 (report.get("finding_lifecycle") or {}).get("findings") or []
             if canon:
                 live = [(f.get("severity"), f.get("check"), f.get("detail"), f.get("source"))
                         for f in canon if isinstance(f, dict)]
-            if not live:
+            if not live and not has_canon:
                 live = self._collect_findings_from_report(report)
         F = self._dedupe_findings(live)
         # Zero-noise policy: executive shows only actionable findings
@@ -9038,17 +9399,36 @@ class WebsiteRecon:
         for s, c, d, _src in m["top_risks"]:
             e = cvss_map.get((str(c), str(d)[:80])) or {}
             lf = life_map.get((str(c), str(d)[:80])) or {}
+            # Prefer the root-finding's attached CVSS object when the legacy
+            # cvss register lookup misses (e.g. report rendered from history).
+            if e.get('score') is None and isinstance(lf.get('cvss'), dict):
+                if lf['cvss'].get('score') is not None:
+                    e = lf['cvss']
             cvss_txt = (f"{e.get('score')} · {_e(str(e.get('cwe') or 'N/A'))}"
                         if e.get('score') is not None else "N/A")
             state = (f"{_e(str(lf.get('lifecycle', 'OBSERVED')))} / "
                      f"{_e(str(lf.get('confidence', 'LOW')))}") if lf else "DISCOVERED / LOW"
             chip = "#ef4444" if s == "CRITICAL" else "#f97316" if s == "HIGH" else "#eab308"
             fix = remed_map.get(str(c)) or {}
+            if not fix and isinstance(lf.get('remediation'), dict):
+                fix = lf['remediation']
             fix_txt = (f"<div class='det'><b>Remediation:</b> "
                        f"{_e(str(fix.get('title') or ''))}</div>") if fix else ""
+            assets = lf.get('affected_assets') or []
+            assets_txt = (f"<div class='det'><b>Affected assets:</b> "
+                          f"{_e(', '.join(str(a) for a in assets[:6]))}</div>") if assets else ""
+            atk = lf.get('attack') or []
+            atk_txt = (f"<div class='det'><b>ATT&amp;CK:</b> "
+                       f"{_e(', '.join(str(t.get('id') or '') for t in atk if isinstance(t, dict)))}</div>") if atk else ""
+            pocs = lf.get('poc') or []
+            poc_txt = ""
+            if pocs and isinstance(pocs[0], dict):
+                poc_txt = (f"<div class='det'><b>PoC:</b> "
+                           f"<code>{_e(str(pocs[0].get('cmd') or '')[:180])}</code></div>")
             risk_rows.append(
                 f"<tr><td><span class='chip' style='background:{chip}'>{_e(s)}</span></td>"
-                f"<td><b>{_e(c)}</b><div class='det'>{_e(d)}</div>{fix_txt}</td>"
+                f"<td><b>{_e(c)}</b><div class='det'>{_e(d)}</div>"
+                f"{assets_txt}{fix_txt}{atk_txt}{poc_txt}</td>"
                 f"<td>{cvss_txt}</td><td>{state}</td></tr>")
         risks = "".join(risk_rows) or "<tr><td colspan='4'>No high-severity findings 🎉</td></tr>"
         comp = m["compliance"]
@@ -9090,8 +9470,8 @@ class WebsiteRecon:
         if int(comp.get("total_controls", 0) or 0) > 0:
             comp_block = (
                 "<p class=\"det\">Evidence-based technical control mapping observed during "
-                "this assessment — not a certification or audit attestation. Coverage / "
-                "assessment completeness measures how many controls could be assessed, "
+                f"this assessment — {_e(str(comp.get('disclaimer') or 'not a certification or audit attestation').rstrip('.'))}. "
+                "Coverage / assessment completeness measures how many controls could be assessed, "
                 "while PASS RATE measures how many assessed controls passed.</p>"
                 "<table><tbody>"
                 f"<tr><td>Assessment completeness (coverage)</td><td><b>{_e(str(comp.get('coverage_pct', 0)))}%</b> of controls assessable</td></tr>"
@@ -10268,8 +10648,14 @@ class WebsiteRecon:
                 cmds = [f"echo | openssl s_client -connect {self.domain}:443 2>/dev/null | openssl x509 -noout -text | grep -E 'Public-Key|Signature Algorithm'"]
             sec(fid, sev, f"tls:{fid}", detail, cmds,
                 "re-run the same handshake after remediation: legacy protocol/weak cipher should refuse.")
-        # DNS / email
-        for sev, msg in self.results.get('email_findings', []):
+        # DNS / email (newer email findings are (sev, check, detail) triples;
+        # keep accepting the legacy (sev, message) shape)
+        for f in self.results.get('email_findings', []):
+            if not isinstance(f, (list, tuple)) or len(f) < 2:
+                continue
+            sev = f[0]
+            msg = f[1]
+            detail = f[2] if len(f) >= 3 else f[1]
             dig = f"dig TXT {self.domain} +short"
             if "DMARC" in msg:
                 dig = f"dig TXT _dmarc.{self.domain} +short"
@@ -10277,7 +10663,7 @@ class WebsiteRecon:
                 dig = dig
             elif "DKIM" in msg:
                 dig = "dig TXT <selector>._domainkey." + self.domain + " +short"
-            sec(msg, sev, "email-auth", msg, [dig],
+            sec(msg, sev, "email-auth", detail, [dig],
                 "record absent → finding confirmed; publish the record to remediate.")
         # takeover
         for t in self.results.get('takeover', []):
@@ -10488,7 +10874,16 @@ class WebsiteRecon:
             findings = self.results.get('email_findings', [])
             if findings:
                 sev_col = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "cyan", "INFO": "dim"}
-                fb = "\n".join(f"  [{sev_col.get(s, 'white')}]{'◈ ' + s:<11}[/] {m}" for s, m in findings)
+                def _email_line(f):
+                    if not isinstance(f, (list, tuple)) or not f:
+                        return ""
+                    s = f[0]
+                    msg = f[1] if len(f) > 1 else ""
+                    detail = f[2] if len(f) > 2 else ""
+                    body = f"{msg} — {detail}" if detail and detail != msg else msg
+                    return (f"  [{sev_col.get(s, 'white')}]"
+                            f"{'◈ ' + str(s):<11}[/] {body}")
+                fb = "\n".join(_email_line(f) for f in findings)
                 console.print(Panel(fb, title="[bold magenta]◈ EMAIL SECURITY FINDINGS ◈[/]",
                                     border_style="magenta", box=rbox.ROUNDED))
 
@@ -11467,9 +11862,16 @@ class WebsiteRecon:
             pass
         # ---- canonical root-finding dataset (single source of truth) ----
         try:
-            canonical = self._dedupe_findings(self._collect_findings())
+            canonical = self._canonical_findings()
         except Exception:
             canonical = []
+        # _collect_findings indexes rows before near-duplicate removal; rebuild
+        # the index from the canonical rows so findings/finding_index/counters
+        # can never disagree.
+        try:
+            self._sync_finding_index(canonical)
+        except Exception:
+            pass
         try:
             self._apply_finding_lifecycle()
         except Exception:
@@ -11645,7 +12047,11 @@ class WebsiteRecon:
                 "dmarc_policy": self.results.get('dmarc_policy', ''),
                 "mta_sts": self.results.get('mta_sts', ''),
                 "bimi": self.results.get('bimi', ''),
-                "findings": [{"severity": s, "message": m} for s, m in self.results.get('email_findings', [])],
+                "findings": [({"severity": f[0], "check": f[1], "detail": f[2]}
+                              if isinstance(f, (list, tuple)) and len(f) >= 3 else
+                              {"severity": f[0], "message": f[1]})
+                             for f in self.results.get('email_findings', [])
+                             if isinstance(f, (list, tuple)) and len(f) >= 2],
             },
             "api_audit": {
                 "findings": [{"severity": s, "check": c, "detail": d}
@@ -11818,7 +12224,7 @@ class WebsiteRecon:
             "authscan": self.results.get('authscan', {}),
             "admin_api": {
                 "findings": [{"severity": s, "check": c, "detail": d}
-                             for s, c, d in self.results.get('admin_findings', [])],
+                             for s, c, d in admin_findings],
             },
             "ssrf": self.results.get('ssrf', {}),
             "vuln_verify": self.results.get('vuln_verify', {}),
@@ -11884,6 +12290,32 @@ class WebsiteRecon:
 
         if isinstance(d, dict) and isinstance(d.get("report"), dict):
             d = d["report"]          # unwrap history entry
+        # Keep the root-finding table as the only findings list in the PDF/HTML.
+        # Module evidence tables are useful for context, but repeating their
+        # individual "findings" rows duplicates the canonical roots. Preserve
+        # the canonical dataset, strip nested finding lists from a copy, then
+        # put the canonical roots back at the top level.
+        has_canonical = isinstance(d.get('findings'), list)
+        canonical_findings = d.get('findings') or []
+        canonical_counts = dict(d.get('severity_counts') or {})
+        canonical_total = d.get('findings_total', len(canonical_findings))
+        if has_canonical:
+            try:
+                d = copy.deepcopy(d)
+                def _strip_module_findings(obj):
+                    if isinstance(obj, dict):
+                        obj.pop('findings', None)
+                        for v in obj.values():
+                            _strip_module_findings(v)
+                    elif isinstance(obj, list):
+                        for v in obj:
+                            _strip_module_findings(v)
+                _strip_module_findings(d)
+            except Exception:
+                pass
+            d['findings'] = canonical_findings
+            d['severity_counts'] = canonical_counts
+            d['findings_total'] = canonical_total
         s = d['summary']
         # Use the canonical exposure-risk score when present (JSON/PDF/HTML all
         # agree). Legacy exports fall back to the old meter.
@@ -11918,6 +12350,81 @@ class WebsiteRecon:
             return "<ul>" + "".join(f"<li>{_e(str(i))}</li>" for i in items[:limit]) + "</ul>"
 
         parts = []
+        # ===== canonical root findings (single source of truth) =====
+        # Every report surface consumes this array, not the module-specific
+        # evidence tables. CVSS / PoC / remediation / ATT&CK are child fields.
+        canonical = d.get('findings') or []
+        sev_counts = d.get('severity_counts') or {}
+        if not sev_counts and canonical:
+            sev_counts = {k: len([f for f in canonical
+                                  if str(f.get('severity', '')).upper() == k])
+                          for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+        total_findings = int(d.get('findings_total') or len(canonical) or 0)
+        count_chips = "".join(
+            f"<span class='chip {cls}'>{_e(k)}: {_e(str(sev_counts.get(k, 0)))}</span>"
+            for k, cls in (("CRITICAL", "red"), ("HIGH", "red"),
+                           ("MEDIUM", "yellow"), ("LOW", "cyan"), ("INFO", "info")))
+        count_chips += f"<span class='chip info'>TOTAL: {_e(str(total_findings))}</span>"
+
+        def _root_finding_html(f):
+            sev = str(f.get('severity') or 'INFO').upper()
+            chip = "red" if sev in ("CRITICAL", "HIGH") else \
+                   "yellow" if sev == "MEDIUM" else "cyan" if sev == "LOW" else "info"
+            title = f.get('title') or f.get('check') or 'Finding'
+            status = f.get('status') or f.get('lifecycle') or 'OBSERVED'
+            conf = f.get('confidence') or 'LOW'
+            category = f.get('category') or 'uncategorised'
+            cvss = f.get('cvss') if isinstance(f.get('cvss'), dict) else {}
+            score = cvss.get('score')
+            cwe = cvss.get('cwe') or f.get('cwe') or 'N/A'
+            cvss_txt = (f"CVSS {_e(str(score))}" if score is not None else "CVSS N/A")
+            if cvss.get('cvss4_vector'):
+                cvss_txt += f" · {_e(str(cvss.get('cvss4_vector')))}"
+            assets = f.get('affected_assets') or []
+            assets_html = ""
+            if assets:
+                assets_html = ("<div class='rfrow'><b>Affected assets:</b> "
+                               + ", ".join(f"<code>{_e(str(a))}</code>" for a in assets[:10])
+                               + "</div>")
+            rem = f.get('remediation') if isinstance(f.get('remediation'), dict) else {}
+            rem_html = ""
+            if rem:
+                rem_html = ("<div class='rfrow'><b>Remediation:</b> "
+                            + _e(str(rem.get('title') or 'Review and fix'))
+                            + (f"<pre>{_e(str(rem.get('markdown') or ''))}</pre>"
+                               if rem.get('markdown') else "") + "</div>")
+            pocs = f.get('poc') or []
+            poc_html = ""
+            if pocs:
+                poc_html = ("<div class='rfrow'><b>Read-only PoC</b> "
+                            f"({len(pocs)}):"
+                            + "".join(f"<pre># {_e(str(c.get('desc') or ''))}\n"
+                                      f"{_e(str(c.get('cmd') or ''))}</pre>"
+                                      for c in pocs if isinstance(c, dict))
+                            + "</div>")
+            atk = f.get('attack') or []
+            atk_html = ""
+            if atk:
+                atk_html = ("<div class='rfrow'><b>ATT&amp;CK metadata:</b> "
+                            + ", ".join(f"<code>{_e(str(t.get('id') or ''))}</code> "
+                                        f"{_e(str(t.get('name') or ''))}"
+                                        for t in atk if isinstance(t, dict))
+                            + "</div>")
+            fid = f.get('finding_id') or f.get('root_finding_id') or ''
+            return (f"<article class='rootfinding'>"
+                    f"<div class='rfhead'><span class='chip {chip}'>{_e(sev)}</span> "
+                    f"<b>{_e(str(title))}</b> "
+                    f"<span class='muted'>{_e(str(fid))} · {_e(str(category))}</span></div>"
+                    f"<div class='rfmeta'>Status: <b>{_e(str(status))}</b> · "
+                    f"Confidence: <b>{_e(str(conf))}</b> · {cvss_txt} · CWE: "
+                    f"<code>{_e(str(cwe))}</code></div>"
+                    f"<div class='rfrow'><b>Evidence:</b> {_e(str(f.get('evidence') or f.get('detail') or ''))}</div>"
+                    f"{assets_html}{rem_html}{poc_html}{atk_html}"
+                    f"</article>")
+
+        root_html = "".join(_root_finding_html(f) for f in canonical[:200])
+        if canonical:
+            parts.append(sec(f"Root Findings ({total_findings})", root_html, "#ef4444"))
         # DNS / subdomains / ports
         parts.append(sec("DNS Records", li(d.get('dns', [])), "#06b6d4"))
         parts.append(sec("Subdomains", li(d.get('subdomains', [])), "#06b6d4"))
@@ -12117,9 +12624,10 @@ class WebsiteRecon:
             if live:
                 parts.append(sec("Live API Endpoints",
                                  tbl(["Path", "Status", "Type", "Auth"],
-                                     [[_e(str(e['path'])), e['status'], _e(str(e.get('type',''))),
+                                     [[_e(str(e.get('path', ''))), _e(str(e.get('status', ''))),
+                                       _e(str(e.get('type', ''))),
                                        "<span class='chip yellow'>YES</span>" if e.get('auth_required') else "no"]
-                                      for e in live[:100]]), "#22d3ee"))
+                                      for e in live[:100] if isinstance(e, dict)]), "#22d3ee"))
             found = api.get('paths_in_source', [])
             if found:
                 parts.append(sec(f"API Paths in Source ({len(found)})", li(found, 120), "#22d3ee"))
@@ -12505,7 +13013,13 @@ class WebsiteRecon:
   .chip {{ padding:3px 11px; border-radius:20px; font-size:.78rem; font-weight:600; }}
   .chip.green {{ background:#22c55e22; color:#22c55e; }} .chip.red {{ background:#ef444422; color:#ef4444; }}
   .chip.yellow {{ background:#eab30822; color:#eab308; }} .chip.cyan {{ background:#06b6d422; color:#06b6d4; }}
-  .chip.purple {{ background:#8b5cf622; color:#a78bfa; }}
+  .chip.purple {{ background:#8b5cf622; color:#a78bfa; }} .chip.info {{ background:#64748b22; color:#94a3b8; }}
+  .rootfinding {{ border:1px solid #1f2937; border-radius:10px; padding:12px 14px; margin:10px 0; background:#0b1220; }}
+  .rfhead {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+  .rfmeta {{ color:var(--muted); font-size:.82rem; margin-top:5px; }}
+  .rfrow {{ margin-top:7px; font-size:.86rem; }}
+  .rootfinding pre {{ white-space:pre-wrap; overflow-wrap:anywhere; background:#070b13; padding:8px; border-radius:6px; font-size:.78rem; }}
+  .rootfinding summary {{ cursor:pointer; }}
   .muted {{ color:var(--muted); }}
   footer {{ text-align:center; color:var(--muted); padding:30px; font-size:.82rem; border-top:1px solid #1f2937; margin-top:40px; }}
 </style>
@@ -12521,10 +13035,12 @@ class WebsiteRecon:
 </header>
 <main>
   <div class="meter">
-    <div class="muted">EXPOSURE LEVEL</div>
+    <div class="muted">EXPOSURE RISK</div>
     <div class="bar"><div style="width:{score}%"></div></div>
     <div class="score">{score}/100 — {verdict}</div>
+    <div class="chips" style="justify-content:center;margin-top:10px">{count_chips}</div>
     <div class="muted">Exposure risk: {level} · Secret patterns: {s.get('secrets',0)} ·
+      API endpoints: {s.get('api_endpoints',0)} · Admin/API findings: {s.get('admin_api_findings',0)} ·
       Missing headers: {len(d.get('missing_security_headers', []))} ·
       Flagged paths: {len([p for p in d.get('paths', []) if str(p.get('status')) in ('200','403')])}</div>
   </div>
@@ -12713,10 +13229,21 @@ function findCount(s){ s=s||{}; const keys=['cve_issues','audit_issues','supply_
 function findings(d){
   // Prefer the canonical root-finding dataset embedded by export_dict so the
   // dashboard severity mix/counters match the PDF/JSON exactly.
-  if(Array.isArray(d.findings)&&d.findings.length){
-    return d.findings.map(f=>({section:(f.source||'root'),sev:(f.severity||'INFO').toUpperCase(),
-      id:f.check||'',detail:f.detail||'',evidence:f.evidence||'',
-      status:f.lifecycle||'',confidence:f.confidence||'',fid:f.finding_id||''}))
+  if(Array.isArray(d.findings)){
+    return d.findings.map(f=>{
+      const cv=(f.cvss&&typeof f.cvss==='object')?f.cvss:{};
+      const rem=(f.remediation&&typeof f.remediation==='object')?f.remediation:{};
+      const pocs=Array.isArray(f.poc)?f.poc:[];
+      const atk=Array.isArray(f.attack)?f.attack:[];
+      const assets=Array.isArray(f.affected_assets)?f.affected_assets:[];
+      return {section:(f.source||'root'),sev:(f.severity||'INFO').toUpperCase(),
+        id:f.title||f.check||'',detail:f.detail||'',evidence:f.evidence||'',
+        status:f.status||f.lifecycle||'',confidence:f.confidence||'',fid:f.finding_id||'',
+        category:f.category||'',cvss:(cv.score!=null?cv.score:'N/A'),
+        cwe:cv.cwe||f.cwe||'N/A',assets:assets.join(', '),
+        remediation:(rem.title||''),attack:atk.map(t=>((t.id||'')+' '+(t.name||'')).trim()).join(', '),
+        poc:pocs.length?((pocs[0].cmd||'')):''};
+    })
       .sort((a,b)=>SEV_ORDER.indexOf(a.sev)-SEV_ORDER.indexOf(b.sev));
   }
   const out=[];
@@ -12773,7 +13300,7 @@ function render(d){
 
   let html=`
   <div class="meter">
-    <div class="top"><div><div class="tag">Exposure level</div>
+    <div class="top"><div><div class="tag">Exposure risk</div>
       <div class="score" style="color:${color}">${score}<span class="mut" style="font-size:16px">/100</span></div></div>
       <div style="text-align:right"><div class="tag">Target</div>
         <div style="font-weight:700;font-size:16px">${e(d.target)}</div>
@@ -12788,6 +13315,7 @@ function render(d){
   <div class="kpis">
     ${kpi(crit,'Critical','var(--cri)')}${kpi(high,'High','var(--hig)')}${kpi(med,'Medium','var(--med)')}
     ${kpi(s.secrets||0,'Secret patterns','var(--cri)')}${kpi(s.subdomains||0,'Subdomains')}
+    ${kpi(s.api_endpoints||0,'API endpoints')}${kpi(s.admin_api_findings||0,'Admin/API findings')}
     ${kpi(s.open_ports||0,'Open ports')}${kpi(s.takeover_risks||0,'Takeover risks')}
     ${kpi(chains.length,'Attack chains')}${kpi(shots.length,'Screenshots')}
     ${kpi((s.diff_new_assets||0),'New since last scan',(s.diff_score>=40?'var(--hig)':''))}
@@ -12958,8 +13486,15 @@ function renderFindings(F){
     <th>Sev</th><th>Status / confidence</th><th>Section</th><th>Finding</th><th>Detail</th></tr></thead><tbody>${
     rows.slice(0,500).map(f=>`<tr><td><span class="chip ${f.sev}">${e(f.sev)}</span></td>
       <td class="mut">${e(f.status||'OBSERVED')}<div style="font-size:11px">${e(f.confidence||'')}</div></td>
-      <td class="mut">${e(f.section)}</td><td>${e(f.id)}</td>
-      <td>${e(f.detail)}${f.evidence?`<div class="mut" style="font-size:11px">${e(f.evidence)}</div>`:''}</td></tr>`).join('')
+      <td class="mut">${e(f.section)}<div style="font-size:11px">${e(f.category||'')}</div></td><td>${e(f.id)}</td>
+      <td>${e(f.detail)}
+        ${f.evidence?`<div class="mut" style="font-size:11px">${e(f.evidence)}</div>`:''}
+        ${f.assets?`<div class="mut" style="font-size:11px">Assets: ${e(f.assets)}</div>`:''}
+        ${(f.cvss&&f.cvss!=='N/A')||f.cwe?`<div class="mut" style="font-size:11px">CVSS ${e(String(f.cvss||'N/A'))} · ${e(f.cwe||'N/A')}</div>`:''}
+        ${f.remediation?`<div class="mut" style="font-size:11px">Remediation: ${e(f.remediation)}</div>`:''}
+        ${f.attack?`<div class="mut" style="font-size:11px">ATT&amp;CK: ${e(f.attack)}</div>`:''}
+        ${f.poc?`<div class="mut" style="font-size:11px">PoC: <code>${e(f.poc)}</code></div>`:''}
+      </td></tr>`).join('')
     ||'<tr><td colspan="5" class="mut">no findings</td></tr>'}</tbody></table></div>`;
 }
 document.getElementById('refresh').onclick=loadScans;
